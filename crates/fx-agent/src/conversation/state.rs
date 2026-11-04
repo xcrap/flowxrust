@@ -795,6 +795,20 @@ impl Conversation {
         self.touch();
     }
 
+    /// The provider stopped waiting on a request it asked. Whatever else is
+    /// still asked stays, and the phase follows what is left.
+    ///
+    /// An id this conversation does not hold changes nothing: the provider
+    /// withdraws requests that were already answered, or never shown.
+    pub fn withdraw_interaction(&mut self, id: &str) {
+        if self.remove_approval(id).is_some() {
+            return;
+        }
+        if self.pending_questions.iter().any(|q| q.id == id) {
+            self.remove_question(id);
+        }
+    }
+
     // ── Usage ──────────────────────────────────────────────────────────────
 
     pub fn usage(&self) -> UsageTotals {
@@ -1239,6 +1253,7 @@ impl Conversation {
                     is_other: request.questions.first().is_some_and(|q| q.is_other),
                 });
             }
+            ProviderEvent::InteractionWithdrawn { id } => self.withdraw_interaction(&id),
             ProviderEvent::PlanUpdated(plan) => self.record_plan(&plan),
             ProviderEvent::Usage(usage) => self.record_usage(usage),
             ProviderEvent::CumulativeUsage(usage) => self.record_cumulative_usage(usage),
@@ -1800,6 +1815,45 @@ mod tests {
         assert_eq!(c.phase(), Phase::WaitingForApproval);
 
         c.remove_approval("a1");
+        assert_eq!(c.phase(), Phase::Running);
+    }
+
+    #[test]
+    fn a_withdrawn_request_goes_and_the_wait_follows_what_is_left() {
+        let mut c = Conversation::new(Uuid::nil());
+        c.add_approval(PendingApproval {
+            id: "a1".into(),
+            tool_name: "Bash".into(),
+            input: serde_json::Value::Null,
+            risk: RiskLevelSerde::Moderate,
+        });
+        c.add_question(PendingQuestion {
+            id: "q1".into(),
+            question: "Which database?".into(),
+            header: "Scope".into(),
+            options: Vec::new(),
+            is_other: true,
+        });
+
+        // One the provider withdraws that this thread never held is no change.
+        let revision = c.revision();
+        c.apply(ProviderEvent::InteractionWithdrawn {
+            id: "elsewhere".into(),
+        });
+        assert_eq!(c.revision(), revision);
+        assert_eq!(c.pending_approvals().len(), 1);
+        assert_eq!(c.pending_questions().len(), 1);
+
+        c.apply(ProviderEvent::InteractionWithdrawn { id: "a1".into() });
+        assert!(c.pending_approvals().is_empty());
+        assert_eq!(
+            c.phase(),
+            Phase::WaitingForInput,
+            "the question is still asked"
+        );
+
+        c.apply(ProviderEvent::InteractionWithdrawn { id: "q1".into() });
+        assert!(c.pending_questions().is_empty());
         assert_eq!(c.phase(), Phase::Running);
     }
 

@@ -2396,6 +2396,68 @@ mod process {
     }
 
     #[tokio::test]
+    async fn a_request_claude_withdraws_goes_and_a_late_answer_sends_nothing() {
+        let Some(server) = FakeClaude::new() else {
+            return;
+        };
+        let mut transport = connect(&server).await.expect("started");
+        let reader = transport.reader().await;
+        transport
+            .send_prompt("!ask-withdrawn", &[] as &[&Path])
+            .await
+            .expect("written");
+        let Control::Approval(id) = next_control(&reader).await else {
+            panic!("expected an approval");
+        };
+
+        // A cancel for a request FlowX does not hold leaves this one open.
+        server.release("release-elsewhere");
+        let events = next_matching(&reader, |event| {
+            matches!(event, ProviderEvent::TextDelta(_))
+        })
+        .await;
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, ProviderEvent::InteractionWithdrawn { .. })),
+            "{events:?}"
+        );
+        assert_eq!(transport.pending_controls().await, vec![id.clone()]);
+
+        server.release("release-withdraw");
+        let events = next_matching(&reader, |event| {
+            matches!(event, ProviderEvent::InteractionWithdrawn { .. })
+        })
+        .await;
+        assert_eq!(
+            events.last(),
+            Some(&ProviderEvent::InteractionWithdrawn { id: id.clone() })
+        );
+        assert!(transport.pending_controls().await.is_empty());
+        let error = transport
+            .approve(&id, true)
+            .await
+            .expect_err("Claude reads no answer to a withdrawn request");
+        assert!(
+            matches!(error, TransportError::UnknownControl { .. }),
+            "{error:?}"
+        );
+
+        server.release("release-result");
+        let end = tokio::time::timeout(Duration::from_secs(5), reader.wait_for_end())
+            .await
+            .expect("the turn ended");
+        assert!(end.is_completed(), "{end:?}");
+        // The fake exits only at the end of its input, so by then it has
+        // recorded everything FlowX wrote.
+        assert!(
+            server.exited_within(Duration::from_secs(5)).await.is_some(),
+            "the process did not end when its input closed"
+        );
+        assert_eq!(control_responses_now(&server), Vec::<Value>::new());
+    }
+
+    #[tokio::test]
     async fn cancelling_refuses_the_open_requests_before_closing_input() {
         // The order is the whole point: Claude blocks on every control request,
         // so closing its input first would leave two replies that can never be

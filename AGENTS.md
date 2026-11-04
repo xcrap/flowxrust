@@ -639,6 +639,7 @@ given.
 | Claude | `can_use_tool` (any tool, MCP tools `mcp__server__tool` included, `ExitPlanMode`, a sandbox's network ask) | Approval card. Full Access and a non-`Ask` policy answer it. |
 | Claude | `can_use_tool` for `AskUserQuestion` | Question dialog. Never answered by policy. |
 | Claude | `elicitation` (an MCP server's form, confirmation or link) | Question dialog. Never answered by policy. |
+| Claude | `control_cancel_request` (a request withdrawn: its call aborted, or another client answered) | The card or dialog is removed and nothing is sent; Claude reads no answer to it. An id FlowX does not hold is ignored. |
 | Claude | `request_user_dialog` | Refused. Sent only for `dialog_kind`s the host declared in `initialize.supportedDialogKinds`; FlowX sends no `initialize`, so the CLI falls back to its no-dialog path. |
 | Claude | `hook_callback`, `mcp_message` | Refused. Sent only for hooks and SDK MCP servers a host registers at `initialize`; FlowX registers none. |
 | Claude | `oauth_token_refresh`, `host_auth_token_refresh`, `remote_control_work_secret`, device-hook requests | Refused. Host-managed auth and remote control, which FlowX does not enable. |

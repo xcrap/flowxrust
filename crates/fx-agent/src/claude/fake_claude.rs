@@ -120,6 +120,32 @@ def start_background():
     workers.append(worker)
     emit_result("started")
 
+# Requests Claude withdrew. Claude Code 2.1.283 reads no answer to one: a
+# reply that quotes it is logged as unknown and dropped, as here.
+withdrawn = []
+
+def withdraw_later():
+    # Two parallel calls ask; the other one fails, so Claude aborts this call
+    # and withdraws its permission (`sendRequest`'s abort handler writes
+    # `control_cancel_request`). Run beside the main loop, which keeps reading
+    # and recording whatever FlowX writes in the meantime.
+    wait_for("release-elsewhere")
+    # A cancel for a request FlowX does not hold: Claude retires the hook
+    # callbacks and device requests FlowX refused the same way.
+    send({"type": "control_cancel_request", "request_id": "req-elsewhere"})
+    send({"type": "stream_event", "event": {"type": "content_block_delta",
+         "delta": {"type": "text_delta", "text": "still asking"}}})
+    wait_for("release-withdraw")
+    if "req-w" in waiting:
+        waiting.remove("req-w")
+        withdrawn.append("req-w")
+    send({"type": "control_cancel_request", "request_id": "req-w"})
+    send({"type": "user", "message": {"content": [{"type": "tool_result",
+          "tool_use_id": "tool-w", "is_error": True,
+          "content": "Cancelled: parallel tool call Bash(false) errored"}]}})
+    wait_for("release-result")
+    emit_result("carried on")
+
 def settled(how):
     # Background work that ends inside the turn and that nothing answers after
     # the turn's `result`: a task the agent stopped itself (Claude marks it
@@ -231,6 +257,13 @@ for line in sys.stdin:
                                   "agree": {"type": "boolean", "title": "Agree"}},
                                   "required": ["name"]}}})
             waiting.append("req-e")
+        elif behaviour == "ask-withdrawn":
+            emit_init()
+            request_control("req-w", "Bash", "tool-w", {"command": "cargo test"})
+            waiting.append("req-w")
+            worker = threading.Thread(target=withdraw_later)
+            worker.start()
+            workers.append(worker)
         elif behaviour == "ask-two":
             emit_init()
             request_control("req-a", "Bash", "tool-a", {"command": "ls"})
@@ -281,6 +314,8 @@ for line in sys.stdin:
     elif message.get("type") == "control_response":
         request_id = (message.get("response") or {}).get("request_id")
         decision = (message.get("response") or {}).get("response") or {}
+        if request_id in withdrawn:
+            continue
         if request_id == "req-2" and decision.get("behavior") == "allow":
             # Claude 2.1.283 validates updatedInput before calling the tool.
             # AskUserQuestion accepts a question-text -> answer-string record,

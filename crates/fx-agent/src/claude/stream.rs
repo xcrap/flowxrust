@@ -23,6 +23,8 @@
 //!   forever. Anything unrecognised gets an explicit refusal instead. An MCP
 //!   server's `elicitation` is not refused: it is the reader's to answer,
 //!   and a refusal reached the server as a cancel it had never been shown.
+//!   Claude may withdraw one with `control_cancel_request`, after which it
+//!   reads no answer, so the request is dropped rather than left on screen.
 //!
 //! Background tasks are the fifth. `task_started`, `task_progress` and
 //! `task_notification` are `system` frames, so a subagent's `parent_tool_use_id`
@@ -239,6 +241,15 @@ impl PendingControl {
         }
     }
 
+    /// Claude's own id for this request, which a reply or a cancel quotes.
+    fn request_id(&self) -> &str {
+        match self {
+            Self::Approval { request_id, .. }
+            | Self::UserInput { request_id, .. }
+            | Self::Elicitation { request_id, .. } => request_id,
+        }
+    }
+
     /// How it is answered.
     fn kind(&self) -> PendingKind {
         match self {
@@ -294,6 +305,7 @@ impl ClaudeStreamParser {
 
         match kind {
             "control_request" => self.control_request(&envelope),
+            "control_cancel_request" => self.control_cancel_request(&envelope),
             "system" => self.system(&envelope),
             "stream_event" => self.stream_event(&envelope),
             "assistant" => self.assistant(&envelope),
@@ -432,6 +444,34 @@ impl ClaudeStreamParser {
             input: input.clone(),
             risk: risk_for(&tool_name, &input),
         })]
+    }
+
+    /// Claude withdrew a control request it was blocked on.
+    ///
+    /// It does when the call that asked is aborted — a parallel call failed, a
+    /// background agent waiting on a permission was stopped — and when another
+    /// client answered first. Either way Claude no longer reads an answer, so
+    /// the request is dropped and the reader is told it is gone. Left pending,
+    /// the card stayed up until the turn ended, and answering it wrote a reply
+    /// nothing was waiting for.
+    ///
+    /// An id this parser does not hold is ignored: a request it refused, one
+    /// FlowX answered as Claude withdrew it, or one no reader was ever shown.
+    fn control_cancel_request(&mut self, envelope: &Value) -> Vec<ProviderEvent> {
+        let Some(request_id) = non_empty(envelope.get("request_id")) else {
+            return Vec::new();
+        };
+        let Some(index) = self
+            .pending
+            .iter()
+            .position(|pending| pending.request_id() == request_id)
+        else {
+            return Vec::new();
+        };
+        let withdrawn = self.pending.remove(index);
+        vec![ProviderEvent::InteractionWithdrawn {
+            id: withdrawn.id().to_owned(),
+        }]
     }
 
     /// Lifecycle, session-init and task frames.
@@ -2279,6 +2319,79 @@ mod tests {
         assert_eq!(parser.kind_of(&kinds[0].0), Some(PendingKind::Approval));
         assert_eq!(parser.kind_of(&kinds[1].0), Some(PendingKind::UserInput));
         assert_eq!(parser.kind_of("nonsense"), None);
+    }
+
+    /// The line Claude Code 2.1.283 writes to withdraw a control request:
+    /// `enqueueCancelRequest` in its stream-JSON I/O.
+    fn cancel(request_id: &str) -> String {
+        line(json!({ "type": "control_cancel_request", "request_id": request_id }))
+    }
+
+    #[test]
+    fn a_withdrawn_request_is_dropped_and_reported_under_flowxs_own_id() {
+        // An approval, a question and an MCP server's form: every kind Claude
+        // can block on, each withdrawn by Claude's own id for it.
+        let mut parser = ClaudeStreamParser::new();
+        parser.events(&line(json!({
+            "type": "control_request", "request_id": "r1",
+            "request": { "subtype": "can_use_tool", "tool_name": "Bash", "tool_use_id": "t1",
+                         "input": { "command": "cargo test" } }
+        })));
+        parser.events(&line(json!({
+            "type": "control_request", "request_id": "r2",
+            "request": {
+                "subtype": "can_use_tool", "tool_name": "AskUserQuestion", "tool_use_id": "t2",
+                "input": { "questions": [{ "question": "Which?" }] }
+            }
+        })));
+        parser.events(&line(live_elicitation()));
+        let [approval, question, form] = parser.pending_ids().try_into().expect("three open");
+
+        for (request_id, id) in [
+            ("r2", &question),
+            ("28f189a4-fb71-46b2-b78a-a44e6a78a79d", &form),
+            ("r1", &approval),
+        ] {
+            assert_eq!(
+                parser.events(&cancel(request_id)),
+                vec![ProviderEvent::InteractionWithdrawn { id: id.clone() }],
+                "{request_id}"
+            );
+            assert_eq!(parser.kind_of(id), None, "{request_id} is still held");
+        }
+        assert!(parser.pending_ids().is_empty());
+
+        // Claude reads no answer to a withdrawn request, so none is built.
+        assert_eq!(parser.approve(&approval, true), None);
+        assert_eq!(parser.answer_questions(&question, &[]), None);
+        assert_eq!(parser.decline_questions(&form), None);
+        assert_eq!(parser.take_refusal(), None);
+    }
+
+    #[test]
+    fn a_cancel_for_a_request_flowx_does_not_hold_changes_nothing() {
+        let mut parser = ClaudeStreamParser::new();
+        parser.events(&line(json!({
+            "type": "control_request", "request_id": "r1",
+            "request": { "subtype": "can_use_tool", "tool_name": "Bash", "tool_use_id": "t1",
+                         "input": {} }
+        })));
+        let id = parser.pending_ids()[0].clone();
+
+        // A request this parser refused or never saw, and lines with no id.
+        for line in [
+            cancel("r-elsewhere"),
+            cancel(""),
+            line(json!({ "type": "control_cancel_request" })),
+        ] {
+            assert!(parser.events(&line).is_empty(), "{line}");
+        }
+        assert_eq!(parser.pending_ids(), vec![id.clone()]);
+
+        let reply = parser.approve(&id, true).expect("still answerable");
+        assert_eq!(reply["response"]["request_id"], "r1");
+        // Withdrawn while the answer was on its way: the answer settled it.
+        assert!(parser.events(&cancel("r1")).is_empty());
     }
 
     #[test]

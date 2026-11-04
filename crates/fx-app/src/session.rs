@@ -969,8 +969,11 @@ impl Job {
                                     (self.access == AgentAccess::FullAccess).then_some(true)
                                 } else { Some(self.approvals.allows_claude_tool(&request.tool_name, &request.input)) };
                                 if let Some(approved) = auto {
-                                    if let Err(error) = transport.approve(&request.id, approved).await {
-                                        break TurnOutcome::Failed { thread_id, reason: error.to_string() };
+                                    match transport.approve(&request.id, approved).await {
+                                        // Claude withdrew it before the policy
+                                        // answered: nothing is waiting for a reply.
+                                        Ok(()) | Err(ClaudeTransportError::UnknownControl { .. }) => {}
+                                        Err(error) => break TurnOutcome::Failed { thread_id, reason: error.to_string() },
                                     }
                                     continue;
                                 }
@@ -996,6 +999,15 @@ impl Job {
                                 ProviderEvent::Task(update) => {
                                     background.task(&update);
                                     self.apply(ProviderEvent::Task(update));
+                                }
+                                // Claude stopped waiting on a request: its call was
+                                // aborted, or another client answered. The card or
+                                // dialog goes, and a late answer finds nothing to
+                                // send. One the policy answered was never shown.
+                                ProviderEvent::InteractionWithdrawn { id } => {
+                                    if waiting.remove(&id) {
+                                        self.resolve(id);
+                                    }
                                 }
                                 // `init` opens every turn, an acknowledgement
                                 // that asks the model nothing included, so it is
@@ -2420,6 +2432,8 @@ def turn():
 # The origin of the turn a permission's answer completes, when it is a
 # follow-up's.
 ANSWER_ORIGIN=[]
+# Requests Claude withdrew; an answer quoting one is dropped, as Claude does.
+WITHDRAWN=[]
 def task_ended():
     send({"type":"system","subtype":"task_progress","task_id":"task-1","tool_use_id":"tool-bg","description":"review the transport","subagent_type":"general-purpose","usage":{"total_tokens":900,"tool_uses":3,"duration_ms":40},"last_tool_name":"Grep"})
     send({"type":"system","subtype":"task_notification","task_id":"task-1","tool_use_id":"tool-bg","status":"completed","output_file":"/tmp/task-1","summary":"Agent \"review the transport\" completed","usage":{"total_tokens":1200,"tool_uses":4,"duration_ms":60}})
@@ -2555,6 +2569,24 @@ for line in sys.stdin:
                 send({"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"long-tool","content":"Build finished"}]}})
             finish("finished after quiet work")
             continue
+        if prompt in ("withdrawn", "withdrawn-at-once"):
+            # A permission Claude withdraws, as Claude Code 2.1.283 does when
+            # the call that asked is aborted: a parallel call failed. Claude
+            # reads no answer to it afterwards.
+            WITHDRAWN.append("control-w")
+            send({"type":"control_request","request_id":"control-w","request":{"subtype":"can_use_tool","tool_name":"Bash","tool_use_id":"tool-w","input":{"command":"cargo test"}}})
+            def later(gated):
+                if gated:
+                    while not Path("release-withdraw").exists(): time.sleep(0.005)
+                send({"type":"control_cancel_request","request_id":"control-w"})
+                send({"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"tool-w","is_error":True,"content":"Cancelled: parallel tool call Bash(false) errored"}]}})
+                if gated:
+                    while not Path("release-result").exists(): time.sleep(0.005)
+                finish("carried on")
+            worker=threading.Thread(target=later, args=(prompt=="withdrawn",))
+            worker.start()
+            workers.append(worker)
+            continue
         if prompt=="elicitation":
             # An MCP server's form, relayed as Claude Code 2.1.283 does.
             send({"type":"control_request","request_id":"control-e","request":{"subtype":"elicitation","mcp_server_name":"probe","message":"Who is asking?","mode":"form","requested_schema":{"type":"object","properties":{"name":{"type":"string","title":"Name"}},"required":["name"]}}})
@@ -2567,6 +2599,7 @@ for line in sys.stdin:
             send({"type":"control_request","request_id":"control-1","request":{"subtype":"can_use_tool","tool_name":tool,"tool_use_id":"tool-1","input":data}})
         else: finish(prompt)
     elif message.get("type")=="control_response":
+        if message["response"].get("request_id") in WITHDRAWN: continue
         finish("answered", ANSWER_ORIGIN.pop() if ANSWER_ORIGIN else None)
 # A closed input still waits for running tasks, as Claude's print mode does.
 for worker in workers: worker.join()
@@ -2897,6 +2930,79 @@ for worker in workers: worker.join()
             .find(|item| item["type"] == "control_response")
             .unwrap();
         assert_eq!(response["response"]["response"]["behavior"], "deny");
+        assert!(lock(&conversation).pending_approvals().is_empty());
+    }
+
+    #[test]
+    fn claude_withdrawing_a_permission_takes_it_off_screen_and_a_late_answer_sends_nothing() {
+        let Some(server) = ClaudeFixture::new() else {
+            return;
+        };
+        let conversation = conversation();
+        let (runner, recorder) = server.start(&conversation, "withdrawn", AgentAccess::Supervised);
+        let ProviderEvent::Approval(request) = wait_for_interaction(&recorder) else {
+            panic!("approval expected")
+        };
+        assert_eq!(lock(&conversation).phase(), Phase::WaitingForApproval);
+
+        std::fs::write(server.dir.path().join("release-withdraw"), "go").unwrap();
+        let resolved = SessionUpdate::InteractionResolved {
+            id: request.id.clone(),
+        };
+        wait_until(&recorder, "the withdrawal", || {
+            recorder.updates().contains(&resolved)
+        });
+        assert!(lock(&conversation).pending_approvals().is_empty());
+        assert_eq!(lock(&conversation).phase(), Phase::Running);
+
+        // A click that raced the withdrawal reaches the runner and goes no
+        // further.
+        assert!(runner.respond(UserResponse::Approval {
+            id: request.id,
+            approved: true
+        }));
+        std::fs::write(server.dir.path().join("release-result"), "go").unwrap();
+        let updates = recorder.wait_for_end(TURN_BUDGET);
+        assert!(
+            matches!(updates.last(), Some(SessionUpdate::Finished { outcome }) if outcome.is_completed()),
+            "{updates:?}"
+        );
+        assert_eq!(
+            updates.iter().filter(|update| **update == resolved).count(),
+            1,
+            "{updates:?}"
+        );
+        assert!(
+            !server
+                .received()
+                .iter()
+                .any(|item| item["type"] == "control_response"),
+            "an answer to a withdrawn request was written"
+        );
+    }
+
+    #[test]
+    fn claude_withdrawing_a_permission_the_access_level_answers_does_not_fail_the_turn() {
+        // The cancel can be parsed before the policy's answer is built, which
+        // then finds nothing to answer. That is Claude moving on, not a
+        // failure to deliver.
+        let Some(server) = ClaudeFixture::new() else {
+            return;
+        };
+        let conversation = conversation();
+        let (_runner, recorder) =
+            server.start(&conversation, "withdrawn-at-once", AgentAccess::FullAccess);
+        let updates = recorder.wait_for_end(TURN_BUDGET);
+        assert!(
+            matches!(updates.last(), Some(SessionUpdate::Finished { outcome }) if outcome.is_completed()),
+            "{updates:?}"
+        );
+        assert!(
+            !updates
+                .iter()
+                .any(|update| matches!(update, SessionUpdate::Interaction { .. })),
+            "{updates:?}"
+        );
         assert!(lock(&conversation).pending_approvals().is_empty());
     }
 

@@ -104,6 +104,13 @@ pub enum ProviderEvent {
     },
     Approval(ApprovalRequest),
     UserInput(UserInputRequest),
+    /// The provider stopped waiting on the approval or question it asked
+    /// under this id: the call was aborted, or another client answered it.
+    /// Nothing is to be sent for it any more, and the request is no longer
+    /// the reader's to answer.
+    InteractionWithdrawn {
+        id: String,
+    },
     /// The agent rewrote its task list. Codex reports its `update_plan` calls
     /// this way rather than as a tool item; Claude's `TodoWrite` arrives as an
     /// ordinary tool call instead.
