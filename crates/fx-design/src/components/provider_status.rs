@@ -1,6 +1,7 @@
 //! Provider identity and live activity in one compact sidebar tile.
 
-use std::time::Instant;
+use std::sync::OnceLock;
+use std::time::{Duration, Instant};
 
 use gpui::prelude::*;
 use gpui::{AnyElement, App, IntoElement, Rgba, SharedString, Window, div, px};
@@ -74,6 +75,17 @@ pub fn provider_status_palette(
     }
 }
 
+/// How long from `now` until the next multiple of `frame`, counted from one
+/// process-wide origin, so timers started at different moments fire together
+/// and their refreshes land in one frame.
+fn delay_to_next_beat(now: Instant, frame: Duration) -> Duration {
+    static ORIGIN: OnceLock<Instant> = OnceLock::new();
+    let origin = *ORIGIN.get_or_init(|| now);
+    let frame_ns = frame.as_nanos().max(1);
+    let into = now.saturating_duration_since(origin).as_nanos() % frame_ns;
+    Duration::from_nanos((frame_ns - into) as u64)
+}
+
 pub fn provider_status(
     id: impl Into<SharedString>,
     provider: ProviderIdentity,
@@ -112,12 +124,19 @@ impl RenderOnce for ProviderStatus {
         // tiles schedule nothing, so motion ends as soon as the state does.
         if (running || waiting) && !*scheduled.read(cx) {
             scheduled.update(cx, |scheduled, _| *scheduled = true);
+            let frame = if waiting || !window.is_window_active() {
+                FxAnimation::QUIET_ACTIVITY_FRAME
+            } else {
+                FxAnimation::ACTIVITY_FRAME
+            };
+            // Every tile wakes on the same beat. Each one counting from its
+            // own last paint, three running threads refreshed the window at
+            // three unrelated phases, close to the display's full rate.
+            let delay = delay_to_next_beat(cx.background_executor().now(), frame);
             window
                 .spawn(cx, async move |cx| {
                     // The platform's timer, which a test clock can advance.
-                    cx.background_executor()
-                        .timer(FxAnimation::ACTIVITY_FRAME)
-                        .await;
+                    cx.background_executor().timer(delay).await;
                     let _ = cx.update(|window, cx| {
                         scheduled.update(cx, |scheduled, _| *scheduled = false);
                         window.refresh();
@@ -177,5 +196,29 @@ impl RenderOnce for ProviderStatus {
             .bg(palette.fill)
             .tooltip(move |window, cx| super::tooltip(detail.clone(), window, cx))
             .child(glyph)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tiles_started_apart_wake_on_the_same_beat() {
+        let frame = FxAnimation::ACTIVITY_FRAME;
+        let start = Instant::now();
+        let first = delay_to_next_beat(start, frame);
+        assert!(first > Duration::ZERO && first <= frame);
+        for offset_ms in [1, 7, 20, 32, 45, 101] {
+            let later = start + Duration::from_millis(offset_ms);
+            let next = later + delay_to_next_beat(later, frame);
+            let beat = start + first;
+            let apart = next.saturating_duration_since(beat).as_nanos() % frame.as_nanos();
+            assert_eq!(
+                apart, 0,
+                "a tile started {offset_ms} ms later woke off the beat"
+            );
+            assert!(next > later, "a beat is never in the past");
+        }
     }
 }

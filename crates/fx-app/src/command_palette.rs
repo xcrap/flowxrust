@@ -19,6 +19,7 @@
 //! refuse, the way every modal refuses to open over another.
 
 use std::cmp::Reverse;
+use std::collections::HashMap;
 
 use fx_design::components::{
     MenuItem, MenuModel, MenuSection, PaletteRow, empty_state, palette_panel, palette_row,
@@ -241,13 +242,23 @@ pub fn commands(state: &AppState) -> Vec<PaletteCommand> {
             continue;
         };
         let active = Some(project.id) == active_id;
-        let visible = project.agent_order.iter().filter(|id| {
-            !record.archived_agent_ids.contains(id) && !record.missing_native_agent_ids.contains(id)
-        });
-        for (index, id) in visible.enumerate() {
-            let Some(agent) = record.agents.iter().find(|agent| agent.id == *id) else {
-                continue;
-            };
+        let agents: HashMap<Uuid, &fx_core::Agent> = record
+            .agents
+            .iter()
+            .map(|agent| (agent.id, agent))
+            .collect();
+        // Resolved before counting, as `active_agents` does for ⌘1–⌘9: an id
+        // kept for an entry this build cannot read has no agent, and counted
+        // here it labelled every later thread one number too high.
+        let visible = project
+            .agent_order
+            .iter()
+            .filter(|id| {
+                !record.archived_agent_ids.contains(id)
+                    && !record.missing_native_agent_ids.contains(id)
+            })
+            .filter_map(|id| agents.get(id).map(|agent| (id, *agent)));
+        for (index, (id, agent)) in visible.enumerate() {
             let title = if agent.title.is_empty() {
                 "Untitled thread"
             } else {

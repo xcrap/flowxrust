@@ -14,7 +14,7 @@
 //!   `failed` may replace that phase, so a late completion cannot report success
 //!   for work the user already stopped.
 
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -368,8 +368,12 @@ pub struct Conversation {
     usage: UsageTotals,
     unsent: Option<UnsentPrompt>,
     /// Ids of tool calls already reported, so a repeated notification does not
-    /// duplicate a row.
+    /// duplicate a row. Oldest first, for eviction.
     completed_tool_ids: VecDeque<String>,
+    /// The same ids, for lookup. The transcript asks about every call in the
+    /// running turn on every pass, under this conversation's lock; scanning
+    /// the queue for each was up to 512 comparisons a call.
+    completed_tool_lookup: HashSet<String>,
     activities: VecDeque<RuntimeActivity>,
     /// Background work the latest turn started, oldest first.
     tasks: Vec<BackgroundTask>,
@@ -1078,24 +1082,20 @@ impl Conversation {
     /// Providers can replay an `item/completed` after a resume, which would
     /// otherwise append the same result twice.
     pub fn claim_tool_id(&mut self, id: &str) -> bool {
-        if self
-            .completed_tool_ids
-            .iter()
-            .any(|existing| existing == id)
-        {
+        if !self.completed_tool_lookup.insert(id.to_string()) {
             return false;
         }
         self.completed_tool_ids.push_back(id.to_string());
         while self.completed_tool_ids.len() > MAX_COMPLETED_TOOL_IDS {
-            self.completed_tool_ids.pop_front();
+            if let Some(evicted) = self.completed_tool_ids.pop_front() {
+                self.completed_tool_lookup.remove(&evicted);
+            }
         }
         true
     }
 
     pub fn has_completed_tool(&self, id: &str) -> bool {
-        self.completed_tool_ids
-            .iter()
-            .any(|existing| existing == id)
+        self.completed_tool_lookup.contains(id)
     }
 
     // ── Events ─────────────────────────────────────────────────────────────

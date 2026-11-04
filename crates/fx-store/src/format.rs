@@ -163,6 +163,11 @@ or_field_default! {
     deserialize_panel_width: f32 = default_panel_width;
     deserialize_min_panel_width: f32 = default_min_panel_width;
     deserialize_max_panel_width: f32 = default_max_panel_width;
+    deserialize_appearance: String = || PersistedPreferences::default().appearance;
+    deserialize_base_tone: String = || PersistedPreferences::default().base_tone;
+    deserialize_accent: String = || PersistedPreferences::default().accent;
+    deserialize_text_size: String = || PersistedPreferences::default().text_size;
+    deserialize_follow_up_mode: String = || PersistedPreferences::default().follow_up_mode;
 }
 
 /// List elements that did not decode, kept verbatim for the next save.
@@ -301,9 +306,17 @@ impl Serialize for PersistedProject {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct PersistedPreferences {
+    // Each read on its own, so one malformed value (`null`, a number) costs
+    // that value. Read strictly, it failed the whole file and its backup,
+    // which hold the same bytes, and the next save wrote every default over
+    // the reader's provider defaults and title choices.
+    #[serde(deserialize_with = "deserialize_appearance")]
     pub appearance: String,
+    #[serde(deserialize_with = "deserialize_base_tone")]
     pub base_tone: String,
+    #[serde(deserialize_with = "deserialize_accent")]
     pub accent: String,
+    #[serde(deserialize_with = "deserialize_text_size")]
     pub text_size: String,
     #[serde(deserialize_with = "deserialize_or_default")]
     pub codex_defaults: ProviderDefaults,
@@ -313,6 +326,7 @@ pub struct PersistedPreferences {
     pub auto_titles: AutoTitlePreferences,
     /// What a prompt sent while a turn runs does: `"steer"` guides the running
     /// turn, `"queue"` waits for it. Steering by default, as the original.
+    #[serde(deserialize_with = "deserialize_follow_up_mode")]
     pub follow_up_mode: String,
 }
 
@@ -916,6 +930,25 @@ mod tests {
 
     fn workspace() -> PersistedWorkspace {
         PersistedWorkspace::default()
+    }
+
+    #[test]
+    fn one_malformed_preference_costs_only_that_preference() {
+        let decoded: PersistedPreferences = serde_json::from_str(
+            r#"{"appearance":null,"base_tone":"slate","accent":7,"text_size":"large",
+                "follow_up_mode":false,"auto_titles":{"enabled":false}}"#,
+        )
+        .unwrap();
+        let defaults = PersistedPreferences::default();
+        assert_eq!(decoded.appearance, defaults.appearance);
+        assert_eq!(decoded.base_tone, "slate");
+        assert_eq!(decoded.accent, defaults.accent);
+        assert_eq!(decoded.text_size, "large");
+        assert_eq!(decoded.follow_up_mode, defaults.follow_up_mode);
+        assert_ne!(
+            decoded.auto_titles, defaults.auto_titles,
+            "the rest is kept"
+        );
     }
 
     #[test]

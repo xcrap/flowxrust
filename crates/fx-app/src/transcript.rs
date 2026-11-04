@@ -256,7 +256,7 @@ struct ThreadMemory {
     /// The content revisions the disclosure maps were last pruned at. Without
     /// this, a long-lived thread accumulates one entry per group it has ever
     /// shown.
-    pruned_at: Option<(u64, u64)>,
+    pruned_at: Option<(u64, bool)>,
     /// The blink phase the last caret frame was requested for.
     blink_requested_at: Option<u32>,
     /// Whether a clock tick is already scheduled, so a running turn has one
@@ -593,17 +593,19 @@ fn reveal_earlier_actions(key: &str) {
 
 /// Forget the groups a conversation no longer has.
 ///
-/// Keyed on the revisions rather than run every pass: pruning is a map rebuild,
-/// and a stream produces a revision on every delta. `live` names every group
-/// the conversation has, and is asked for only when a prune runs.
+/// Keyed on what the row plan is keyed on rather than run every pass:
+/// pruning is a map rebuild, and groups change only with the messages and
+/// whether the thread is busy. Keyed on the streaming revision too, it ran on
+/// every delta for nothing. `live` names every group the conversation has,
+/// and is asked for only when a prune runs.
 fn prune_disclosures(
     conversation: Uuid,
     message_revision: u64,
-    streaming_revision: u64,
+    busy: bool,
     live: impl FnOnce() -> HashSet<String>,
 ) {
     let due = with_thread(conversation, |thread| {
-        thread.pruned_at != Some((message_revision, streaming_revision))
+        thread.pruned_at != Some((message_revision, busy))
     });
     if !due {
         return;
@@ -613,7 +615,7 @@ fn prune_disclosures(
     MEMORY.with(|memory| {
         let mut memory = memory.borrow_mut();
         let thread = memory.thread(conversation);
-        thread.pruned_at = Some((message_revision, streaming_revision));
+        thread.pruned_at = Some((message_revision, busy));
         // Only this conversation's keys are judged, so another thread's open
         // groups survive being filtered.
         memory
@@ -641,6 +643,8 @@ enum RowPlan {
     /// it covers, and its position in its turn, which its key is built from.
     Activity {
         messages: Range<usize>,
+        /// How many earlier groups began with the same message, which is what
+        /// tells two such groups' keys apart. Zero whenever ids are unique.
         index: usize,
         /// Whether this is the tail of a turn that is still running.
         is_active: bool,
@@ -1009,16 +1013,18 @@ struct ActivitySummary {
 /// a prompt are not one reply.
 fn plan_rows(messages: &[&ConversationMessage], turn_is_running: bool) -> Vec<RowPlan> {
     let mut rows = Vec::new();
+    let mut starts = HashMap::new();
     let mut turn_start = 0;
     for (index, message) in messages.iter().enumerate() {
         if message.role == MessageRole::User {
-            plan_turn(&mut rows, messages, turn_start..index, false);
+            plan_turn(&mut rows, &mut starts, messages, turn_start..index, false);
             rows.push(RowPlan::Message(index));
             turn_start = index + 1;
         }
     }
     plan_turn(
         &mut rows,
+        &mut starts,
         messages,
         turn_start..messages.len(),
         turn_is_running,
@@ -1029,6 +1035,7 @@ fn plan_rows(messages: &[&ConversationMessage], turn_is_running: bool) -> Vec<Ro
 /// Hand one assistant turn to the grouping policy and take the rows it names.
 fn plan_turn(
     rows: &mut Vec<RowPlan>,
+    starts: &mut HashMap<Uuid, usize>,
     messages: &[&ConversationMessage],
     turn: Range<usize>,
     is_running: bool,
@@ -1046,7 +1053,7 @@ fn plan_turn(
     // is the end of the transcript while the turn runs, and stays put when the
     // final answer lands below it.
     let mut plan_at = None;
-    for (index, (range, is_activity)) in runs.into_iter().enumerate() {
+    for (run, (range, is_activity)) in runs.into_iter().enumerate() {
         let range = turn.start + range.start..turn.start + range.end;
         if !is_activity {
             rows.extend(range.map(RowPlan::Message));
@@ -1055,13 +1062,20 @@ fn plan_turn(
         // A burst that only rewrote the plan is drawn as the plan, not as a
         // group with nothing in it.
         if !is_plan_only(&messages[range.clone()]) {
+            // Not the run's position in its turn: a thread capped at its last
+            // messages drops them from the front, and in a long turn every
+            // drop renumbered every group after it, closing the one being
+            // read and resetting its paging every few calls.
+            let seen = starts.entry(messages[range.start].id).or_insert(0);
+            let index = *seen;
+            *seen += 1;
             // Only the last segment of a running turn is live. Anything else
             // has already been overtaken by what follows it, and holding it
             // open would leave a spinner running on settled work.
             rows.push(RowPlan::Activity {
                 messages: range,
                 index,
-                is_active: is_running && index == last,
+                is_active: is_running && run == last,
             });
         }
         plan_at = Some(rows.len());
@@ -1192,11 +1206,13 @@ fn build_rows<'a>(
         .collect()
 }
 
-/// A key that survives the transcript growing above the group.
+/// A key that survives the transcript growing above the group, and losing
+/// messages from its front.
 ///
-/// The conversation, the first message's id, and the group's position inside the
-/// turn. The id alone would collide when one turn produced two groups of the
-/// same tool; the conversation keeps one thread's groups from closing another's.
+/// The conversation, the first message's id, and how many earlier groups
+/// began with that same id. The id alone would collide where two groups'
+/// first messages share one; the conversation keeps one thread's groups from
+/// closing another's.
 fn activity_key(conversation: Uuid, messages: &[&ConversationMessage], index: usize) -> String {
     let first = messages
         .first()
@@ -1602,7 +1618,7 @@ fn render(mut snapshot: Snapshot, window: &mut Window, cx: &mut App) -> AnyEleme
     prune_disclosures(
         snapshot.id,
         snapshot.message_revision,
-        snapshot.streaming_revision,
+        snapshot.busy,
         || live_groups(&rows.plan, &snapshot),
     );
 
@@ -5144,10 +5160,63 @@ mod tests {
         toggle_disclosure(&stale);
         toggle_disclosure(&other);
 
-        prune_disclosures(conversation, 1, 0, || HashSet::from([live.clone()]));
+        prune_disclosures(conversation, 1, false, || HashSet::from([live.clone()]));
         assert!(!is_disclosed(&stale), "a group that went away was kept");
         assert!(is_disclosed(&live), "a live group was pruned");
         assert!(is_disclosed(&other), "another thread's group was pruned");
+    }
+
+    #[test]
+    fn a_group_keeps_its_key_when_its_turn_loses_messages_from_the_front() {
+        // A thread created this session keeps its last messages, so a long
+        // turn sheds its oldest ones on every append. Keyed by position in
+        // the turn, every later group was renamed each time a run left the
+        // front, which closed the live group the reader had opened.
+        let source = vec![
+            text(MessageRole::User, "Go"),
+            tool_use("a", "Read", r#"{"file_path":"a.rs"}"#),
+            tool_result("a", "first", false),
+            text(MessageRole::Assistant, "Now the second file."),
+            tool_use("b", "Read", r#"{"file_path":"b.rs"}"#),
+            tool_result("b", "second", false),
+        ];
+        let keys = |messages: &[&ConversationMessage]| -> Vec<(Uuid, String)> {
+            plan_rows(messages, true)
+                .iter()
+                .filter_map(|row| match row {
+                    RowPlan::Activity {
+                        messages: range,
+                        index,
+                        ..
+                    } => Some((
+                        messages[range.start].id,
+                        activity_key(CONVERSATION, &[messages[range.start]], *index),
+                    )),
+                    _ => None,
+                })
+                .collect()
+        };
+        let whole = borrowed(&source);
+        let before = keys(&whole);
+        assert_eq!(before.len(), 2);
+        // The prompt and the first group trimmed away.
+        let after = keys(&whole[3..]);
+        assert_eq!(after.len(), 1);
+        assert_eq!(after[0], before[1], "the surviving group was renamed");
+
+        // Two groups opening on the same id still get keys of their own.
+        let mut twin = tool_use("c", "Read", r#"{"file_path":"c.rs"}"#);
+        twin.id = source[1].id;
+        let repeated = vec![
+            source[1].clone(),
+            source[2].clone(),
+            text(MessageRole::Assistant, "Again."),
+            twin,
+            tool_result("c", "third", false),
+        ];
+        let repeated = keys(&borrowed(&repeated));
+        assert_eq!(repeated.len(), 2);
+        assert_ne!(repeated[0].1, repeated[1].1);
     }
 
     #[test]
@@ -5156,13 +5225,13 @@ mod tests {
         // rebuild, so running it unconditionally would cost more than it saves.
         let conversation = Uuid::from_u128(0xbeef);
         let stale = group_key(conversation, 1);
-        prune_disclosures(conversation, 7, 0, HashSet::new);
+        prune_disclosures(conversation, 7, false, HashSet::new);
         toggle_disclosure(&stale);
         // Same revision: the pass is skipped, so the entry survives.
-        prune_disclosures(conversation, 7, 0, HashSet::new);
+        prune_disclosures(conversation, 7, false, HashSet::new);
         assert!(is_disclosed(&stale));
         // Next revision: the group really is gone.
-        prune_disclosures(conversation, 8, 0, HashSet::new);
+        prune_disclosures(conversation, 8, false, HashSet::new);
         assert!(!is_disclosed(&stale));
     }
 
@@ -7436,7 +7505,7 @@ mod tests {
                 RowPlan::Message(4),
                 RowPlan::Activity {
                     messages: 5..7,
-                    index: 3,
+                    index: 0,
                     is_active: true,
                 },
                 RowPlan::Plan {
@@ -7458,7 +7527,7 @@ mod tests {
                 RowPlan::Message(4),
                 RowPlan::Activity {
                     messages: 5..7,
-                    index: 3,
+                    index: 0,
                     is_active: false,
                 },
                 RowPlan::Plan {

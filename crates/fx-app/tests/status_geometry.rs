@@ -231,7 +231,17 @@ fn a_moving_status_tile_repaints_on_a_bounded_clock_and_a_settled_one_stops() {
             renders,
         }
     });
+    // The key window: test windows start in the background.
+    window
+        .update(&mut test, |_, window, _| window.activate_window())
+        .unwrap();
+    test.run_until_parked();
     test.refresh().unwrap();
+    test.run_until_parked();
+    // The first tick was asked for before activation landed, on the slow
+    // clock, and ticks fall on a shared beat, so the next may land early.
+    test.executor()
+        .advance_clock(FxAnimation::QUIET_ACTIVITY_FRAME + FxAnimation::ACTIVITY_FRAME);
     test.run_until_parked();
 
     // One repaint per tick keeps the spinner moving.
@@ -247,7 +257,33 @@ fn a_moving_status_tile_repaints_on_a_bounded_clock_and_a_settled_one_stops() {
     test.executor()
         .advance_clock(FxAnimation::ACTIVITY_FRAME / 2 - Duration::from_millis(1));
     test.run_until_parked();
-    assert_eq!(renders.get(), before, "no repaint before the interval");
+    assert!(
+        renders.get() - before <= 1,
+        "more than the beat's own repaint before the interval"
+    );
+
+    // Waiting can last all day, so it breathes on the slower clock.
+    window
+        .update(&mut test, |probe, _, cx| {
+            probe.activity = ActivityState::Waiting;
+            cx.notify();
+        })
+        .unwrap();
+    test.run_until_parked();
+    test.executor()
+        .advance_clock(FxAnimation::QUIET_ACTIVITY_FRAME);
+    test.run_until_parked();
+    let waiting = renders.get();
+    for _ in 0..10 {
+        test.executor()
+            .advance_clock(FxAnimation::QUIET_ACTIVITY_FRAME);
+        test.run_until_parked();
+    }
+    let quiet = renders.get() - waiting;
+    assert!(
+        (10..=11).contains(&quiet),
+        "waiting repainted {quiet} times in ten slow intervals"
+    );
 
     // Settled: the pending tick lands once, then nothing.
     for activity in [ActivityState::Waiting, ActivityState::Idle] {

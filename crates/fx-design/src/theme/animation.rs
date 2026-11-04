@@ -82,6 +82,13 @@ impl FxAnimation {
     /// window at 60–120 Hz for as long as a turn runs, since the sidebar is drawn
     /// by the root view. Neither needs more than this to read as motion.
     pub const ACTIVITY_FRAME: Duration = Duration::from_millis(33);
+    /// How often motion that may last for hours repaints: the waiting pulse,
+    /// which can sit on a thread waiting in another app all day, and any
+    /// motion in a window that is not the key window.
+    ///
+    /// The pulse is a slow tint over 1.6 s, so ten steps a second still read
+    /// as a breath, and a third of the whole-window redraws.
+    pub const QUIET_ACTIVITY_FRAME: Duration = Duration::from_millis(100);
     /// One step of the three-dot typing indicator.
     pub const TYPING_STEP: Duration = Duration::from_millis(350);
     /// How often a running clock repaints. Elapsed times are shown in whole

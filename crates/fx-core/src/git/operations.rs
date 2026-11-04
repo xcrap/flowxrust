@@ -296,7 +296,13 @@ pub async fn push(root: &Path) -> Result<String, String> {
 }
 
 async fn push_context(root: &Path) -> PushContext {
-    let branch = read(root, &["symbolic-ref", "--quiet", "--short", "HEAD"]).await;
+    // The full ref with `refs/heads/` taken off, not `--short`: that one
+    // disambiguates, so with a tag named like the branch it says
+    // `heads/main`, the `branch.heads/main.*` lookups miss, and the push
+    // replaced the configured upstream with `--set-upstream`.
+    let branch = read(root, &["symbolic-ref", "--quiet", "HEAD"])
+        .await
+        .and_then(|full| full.strip_prefix("refs/heads/").map(str::to_owned));
     let config = |key: String| async move { read(root, &["config", "--get", &key]).await };
     let (merge_ref, branch_push_remote) = match &branch {
         Some(branch) => (
@@ -966,6 +972,27 @@ mod tests {
             git(remote.path(), &["rev-parse", "main"]),
             git(root, &["rev-parse", "HEAD"])
         );
+    }
+
+    #[test]
+    fn a_tag_named_like_the_branch_does_not_hide_its_upstream() {
+        // `symbolic-ref --short` says `heads/main` once a tag `main` exists,
+        // so the upstream lookups missed and the push set a new upstream.
+        let temp = tempfile::tempdir().unwrap();
+        let clone = temp.path().join("clone");
+        git(
+            temp.path(),
+            &["init", "-q", "--bare", "-b", "main", "remote.git"],
+        );
+        git(temp.path(), &["clone", "-q", "remote.git", "clone"]);
+        identify(&clone);
+        std::fs::write(clone.join("a.txt"), "first\n").unwrap();
+        git(&clone, &["add", "."]);
+        git(&clone, &["commit", "-qm", "first"]);
+        git(&clone, &["tag", "main"]);
+        let context = run(push_context(&clone));
+        assert_eq!(context.branch.as_deref(), Some("main"));
+        assert_eq!(context.merge_ref.as_deref(), Some("refs/heads/main"));
     }
 
     #[test]

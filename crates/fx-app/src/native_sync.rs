@@ -276,5 +276,9 @@ pub(crate) fn same_project(left: &str, right: &str) -> bool {
     fn canonical(path: &str) -> std::path::PathBuf {
         std::fs::canonicalize(path).unwrap_or_else(|_| std::path::PathBuf::from(path))
     }
-    canonical(left) == canonical(right)
+    // The same text resolves to the same place, and nearly every thread
+    // records its project's root exactly as the project does. Resolving both
+    // anyway was two `realpath` calls per thread at each of four checks, on
+    // every index pass, on the UI thread.
+    left == right || canonical(left) == canonical(right)
 }

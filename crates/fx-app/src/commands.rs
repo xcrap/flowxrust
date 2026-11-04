@@ -292,14 +292,13 @@ impl MenuContext {
     pub fn from_state(state: &AppState) -> Self {
         Self {
             threads: state
-                .active_agents()
-                .into_iter()
+                .visible_active_agents()
                 .take(NUMBERED_THREADS)
                 .map(|agent| {
                     if agent.title.is_empty() {
                         "Untitled thread".to_string()
                     } else {
-                        agent.title
+                        agent.title.clone()
                     }
                 })
                 .collect(),

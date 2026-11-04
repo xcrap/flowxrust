@@ -4,6 +4,7 @@
 //! are written is behind it, so the app never touches a path.
 
 use std::collections::BTreeMap;
+use std::sync::{Arc, Mutex};
 
 use fx_core::Conversation;
 use uuid::Uuid;
@@ -40,11 +41,58 @@ pub enum SaveError {
 #[derive(Debug, Clone)]
 pub struct Store {
     paths: AppPaths,
+    /// The workspace file this store last wrote, shared by its clones.
+    last_app_write: Arc<Mutex<Option<LastWrite>>>,
+}
+
+/// Bytes written to a file, and the identity the file had right after.
+///
+/// A save of the same bytes is skipped only while the file still has that
+/// identity, so one another instance or a person replaced is written again.
+struct LastWrite {
+    bytes: Vec<u8>,
+    stamp: FileStamp,
+}
+
+impl std::fmt::Debug for LastWrite {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LastWrite")
+            .field("bytes", &self.bytes.len())
+            .field("stamp", &self.stamp)
+            .finish()
+    }
+}
+
+/// What changes whenever a file is replaced: every atomic write renames a new
+/// inode into place.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FileStamp {
+    device: u64,
+    inode: u64,
+    len: u64,
+    modified_ns: i128,
+}
+
+impl FileStamp {
+    fn of(path: &std::path::Path) -> Option<Self> {
+        use std::os::unix::fs::MetadataExt;
+        let metadata = std::fs::metadata(path).ok()?;
+        Some(Self {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+            len: metadata.len(),
+            modified_ns: i128::from(metadata.mtime()) * 1_000_000_000
+                + i128::from(metadata.mtime_nsec()),
+        })
+    }
 }
 
 impl Store {
     pub fn new(paths: AppPaths) -> Self {
-        Self { paths }
+        Self {
+            paths,
+            last_app_write: Arc::default(),
+        }
     }
 
     pub fn paths(&self) -> &AppPaths {
@@ -78,7 +126,24 @@ impl Store {
         if bytes.len() as u64 > limit {
             return Err(SaveError::TooLarge { limit });
         }
-        write::write_atomically(&self.paths.projects_file(), &bytes)?;
+        let path = self.paths.projects_file();
+        // The app saves after every pause in typing and several times a turn,
+        // mostly with nothing in the workspace changed. Each write is two
+        // files and three full flushes on the UI thread, so the same bytes
+        // over the same file are not written again.
+        let mut last = self
+            .last_app_write
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if last
+            .as_ref()
+            .is_some_and(|last| last.bytes == bytes && Some(last.stamp) == FileStamp::of(&path))
+        {
+            return Ok(());
+        }
+        *last = None;
+        write::write_atomically(&path, &bytes)?;
+        *last = FileStamp::of(&path).map(|stamp| LastWrite { bytes, stamp });
         Ok(())
     }
 
@@ -324,6 +389,38 @@ mod tests {
     /// A user message, so tests do not each repeat the constructor.
     fn message(text: &str) -> ConversationMessage {
         ConversationMessage::text(MessageRole::User, text)
+    }
+
+    #[test]
+    fn an_unchanged_workspace_is_not_written_again_unless_the_file_was_replaced() {
+        use std::os::unix::fs::MetadataExt;
+        let (store, _temp) = store();
+        let app = populated();
+        let path = store.paths().projects_file();
+        store.save_app(&app).unwrap();
+        let first = std::fs::metadata(&path).unwrap().ino();
+        // Every write renames a new file into place, so the same inode is
+        // the same write.
+        store.save_app(&app).unwrap();
+        store.clone().save_app(&app).unwrap();
+        assert_eq!(std::fs::metadata(&path).unwrap().ino(), first);
+
+        // Replaced from outside, it is written back.
+        std::fs::write(&path, b"{}").unwrap();
+        store.save_app(&app).unwrap();
+        assert_eq!(store.load_app().unwrap(), {
+            let mut expected = app.clone();
+            expected.normalize();
+            expected.drop_unusable_projects();
+            expected
+        });
+
+        // And a real change is always written.
+        let before = std::fs::metadata(&path).unwrap().ino();
+        let mut changed = app.clone();
+        changed.sidebar_visible = !changed.sidebar_visible;
+        store.save_app(&changed).unwrap();
+        assert_ne!(std::fs::metadata(&path).unwrap().ino(), before);
     }
 
     fn populated() -> PersistedApp {

@@ -621,27 +621,35 @@ impl AppState {
 
     /// Threads of the active project, in sidebar order.
     pub fn active_agents(&self) -> Vec<Agent> {
-        let Some(project) = self.active_project() else {
-            return Vec::new();
-        };
-        let record = match self.snapshot.projects.iter().find(|p| {
-            p.project
-                .as_ref()
-                .is_some_and(|inner| inner.id == project.id)
-        }) {
-            Some(record) => record,
-            None => return Vec::new(),
-        };
-        let by_id: HashMap<Uuid, &Agent> = record.agents.iter().map(|a| (a.id, a)).collect();
-        project
-            .agent_order
-            .iter()
-            .filter(|id| {
-                !record.archived_agent_ids.contains(id)
-                    && !record.missing_native_agent_ids.contains(id)
+        self.visible_active_agents().cloned().collect()
+    }
+
+    /// The active project's threads in sidebar order, borrowed, so a caller
+    /// that wants a few of them pays for those. The menu bar is rebuilt on
+    /// every render and wants nine titles; it copied every thread for them.
+    pub fn visible_active_agents(&self) -> impl Iterator<Item = &Agent> {
+        let record = self.active_project().and_then(|project| {
+            self.snapshot.projects.iter().find(|p| {
+                p.project
+                    .as_ref()
+                    .is_some_and(|inner| inner.id == project.id)
             })
-            .filter_map(|id| by_id.get(id).map(|a| (*a).clone()))
-            .collect()
+        });
+        let by_id: HashMap<Uuid, &Agent> = record
+            .map(|record| record.agents.iter().map(|a| (a.id, a)).collect())
+            .unwrap_or_default();
+        let order: &[Uuid] = record
+            .and_then(|record| record.project.as_ref())
+            .map_or(&[], |project| project.agent_order.as_slice());
+        order
+            .iter()
+            .filter(move |id| {
+                record.is_some_and(|record| {
+                    !record.archived_agent_ids.contains(id)
+                        && !record.missing_native_agent_ids.contains(id)
+                })
+            })
+            .filter_map(move |id| by_id.get(id).copied())
     }
 
     pub fn active_agent(&self) -> Option<Agent> {
@@ -2884,18 +2892,20 @@ impl AppState {
                         .configuration
                         .provider_id
                         .get_or_insert(identity.provider_id.clone());
-                    record.archived_agent_ids.retain(|agent| *agent != id);
-                    if archived {
+                    // Updated in place. Removed and pushed back, every entry
+                    // moved to the end, so a project with threads from both
+                    // providers swapped their order on every pass, and the
+                    // comparison below rewrote the workspace each time.
+                    if !archived {
+                        record.archived_agent_ids.retain(|agent| *agent != id);
+                    } else if !record.archived_agent_ids.contains(&id) {
                         record.archived_agent_ids.push(id);
                     }
-                    let previous = record
+                    let position = record
                         .native_bindings
                         .iter()
-                        .find(|binding| binding.agent_id == id)
-                        .cloned();
-                    record
-                        .native_bindings
-                        .retain(|binding| binding.agent_id != id);
+                        .position(|binding| binding.agent_id == id);
+                    let previous = position.map(|index| record.native_bindings[index].clone());
                     let mut binding = native_binding(id, &entry);
                     if let Some(previous) = previous {
                         binding.local_history_pending = previous.local_history_pending;
@@ -2908,7 +2918,16 @@ impl AppState {
                         binding.context_window_size =
                             binding.context_window_size.or(previous.context_window_size);
                     }
-                    record.native_bindings.push(binding);
+                    match position {
+                        Some(index) => record.native_bindings[index] = binding,
+                        None => record.native_bindings.push(binding),
+                    }
+                    // A second binding for the same thread, which the old
+                    // remove-all kept from accumulating, is still dropped.
+                    let mut seen = false;
+                    record.native_bindings.retain(|binding| {
+                        binding.agent_id != id || !std::mem::replace(&mut seen, true)
+                    });
                 }
                 if warnings.is_empty() {
                     for binding in record.native_bindings.iter().filter(|binding| {
@@ -8677,6 +8696,59 @@ mod native_sync_tests {
     }
 
     #[test]
+    fn repeated_passes_over_both_providers_leave_the_workspace_as_it_was() {
+        // Each pass took its threads' bindings and archive marks out and
+        // pushed them back at the end, so with both providers in one project
+        // the order swapped on every pass and the workspace was rewritten,
+        // with three full flushes, every few seconds forever.
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().to_string_lossy().to_string();
+        let test = gpui::TestAppContext::single();
+        let (state, project) =
+            test.update(|cx| setup(cx, AppPaths::at(temp.path().join("store")), &root));
+        test.update(|cx| {
+            state.update(cx, |state, _| {
+                let archived = |provider: &str, session: &str| {
+                    let mut entry = entry(&root, provider, session, session);
+                    entry.summary.is_archived = true;
+                    entry
+                };
+                let codex = vec![
+                    entry(&root, "codex", "codex-1", "Codex one"),
+                    archived("codex", "codex-2"),
+                ];
+                let claude = vec![
+                    entry(&root, "claude", "claude-1", "Claude one"),
+                    archived("claude", "claude-2"),
+                ];
+                index(state, project, "codex", codex.clone(), Vec::new());
+                index(state, project, "claude", claude.clone(), Vec::new());
+                let settled = serde_json::to_vec(&state.snapshot).unwrap();
+                // Checked after every pass: a full round of both put the old
+                // order back, so only the passes in between differed.
+                for _ in 0..2 {
+                    for (provider, entries) in [("codex", &codex), ("claude", &claude)] {
+                        index(state, project, provider, entries.clone(), Vec::new());
+                        assert_eq!(
+                            serde_json::to_vec(&state.snapshot).unwrap(),
+                            settled,
+                            "an unchanged {provider} pass changed the workspace"
+                        );
+                    }
+                }
+                let record = state
+                    .snapshot
+                    .projects
+                    .iter()
+                    .find(|record| record.project.as_ref().is_some_and(|p| p.id == project))
+                    .unwrap();
+                assert_eq!(record.native_bindings.len(), 4);
+                assert_eq!(record.archived_agent_ids.len(), 2);
+            })
+        });
+    }
+
+    #[test]
     fn an_earlier_identical_turn_cannot_clear_the_pending_local_history_guard() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().to_string_lossy().to_string();
@@ -9400,6 +9472,9 @@ mod reset_tests {
             assert!(state.attachments(first).is_empty());
             assert_eq!(state.active_agents().len(), 2, "no thread was added");
         });
+        // The writer deletes it, so wait for the writer: read straight away,
+        // this failed whenever the full suite kept that thread busy.
+        test.update(|cx| state.update(cx, |state, _| state.flush_saves()));
         assert!(
             store.load_conversation(project, first).unwrap().is_none(),
             "an empty transcript is deleted, not written as a stub"

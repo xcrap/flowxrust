@@ -621,12 +621,20 @@ impl Inspector {
         let Some(agent) = self.context_target(cx) else {
             return;
         };
-        let Some(root) = &self.project else {
+        // The repository's root, as `open_path` uses: a diff's paths are
+        // relative to it, and a project may be one of its subfolders. Joined
+        // onto the project, `apps/web` in a monorepo named
+        // `apps/web/apps/web/src/a.ts`.
+        let Some(root) = self
+            .monitor
+            .read(cx)
+            .snapshot()
+            .map(|snapshot| snapshot.root.clone())
+        else {
             return;
         };
-        let text = fx_core::policy::prompt_context::file_reference(
-            &std::path::Path::new(root).join(path).to_string_lossy(),
-        );
+        let text =
+            fx_core::policy::prompt_context::file_reference(&root.join(path).to_string_lossy());
         crate::prompt_context::add(&self.state, agent, &text, window, cx);
     }
 

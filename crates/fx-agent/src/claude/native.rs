@@ -635,6 +635,10 @@ fn parse_file(
     let mut cwd_seen = false;
     // Whether the first record naming a directory has been checked.
     let mut started = false;
+    // Whether a record has named this file's own session, and whether any
+    // before it named the session it was forked from.
+    let mut own_session_seen = false;
+    let mut ancestry_seen = false;
     let mut line = Vec::new();
     let mut line_number = 0;
     loop {
@@ -682,12 +686,22 @@ fn parse_file(
         if object["isSidechain"].as_bool() == Some(true) {
             continue;
         }
-        if let Some(session) = object["sessionId"].as_str()
-            && safe_session_id(session).as_deref() != Some(id)
-        {
-            return Err(protocol(
-                "Transcript session ID does not match its filename",
-            ));
+        // A forked session's file opens with its parent's records, copied
+        // with the parent's id, and only then its own. So another valid id is
+        // ancestry until this file's own id first appears, and a mismatch
+        // after that. Refused at the first record, every fork was hidden
+        // behind a sync warning, and that warning stopped the project's
+        // deleted threads being hidden.
+        if let Some(session) = object["sessionId"].as_str() {
+            match safe_session_id(session) {
+                Some(session) if session == id => own_session_seen = true,
+                Some(_) if !own_session_seen => ancestry_seen = true,
+                _ => {
+                    return Err(protocol(
+                        "Transcript session ID does not match its filename",
+                    ));
+                }
+            }
         }
         // Where a session started decides whose it is, which is also what
         // keeps a workspace whose name encodes the same from claiming it.
@@ -835,6 +849,12 @@ fn parse_file(
     }
     if !cwd_seen {
         return Err(protocol("Transcript has no verifiable workspace identity"));
+    }
+    // Ancestry with nothing of its own is another session's file.
+    if ancestry_seen && !own_session_seen {
+        return Err(protocol(
+            "Transcript session ID does not match its filename",
+        ));
     }
     // A concurrent append, replacement, or rewrite must be retried instead of
     // publishing an older prefix as the history for a newer fingerprint.
@@ -1850,6 +1870,30 @@ mod tests {
         fixture.write(&[record]);
         assert!(fixture.store().read(fixture.root(), SESSION).is_err());
         fixture.write(&[json!({"type":"user","message":{"content":"No cwd"}})]);
+        assert!(fixture.store().read(fixture.root(), SESSION).is_err());
+    }
+
+    #[test]
+    fn a_forked_session_keeps_the_history_it_was_forked_with() {
+        // Claude writes a fork's file starting with its parent's records,
+        // which keep the parent's session id. Two real threads on the machine
+        // this was found on, one with 10,375 such records, were refused whole.
+        let fixture = Fixture::new();
+        let parent = Uuid::new_v4();
+        let mut question = fixture.record("user", "Asked in the parent", Uuid::new_v4());
+        question["sessionId"] = json!(parent);
+        let mut answer = fixture.record("assistant", "Answered in the parent", Uuid::new_v4());
+        answer["sessionId"] = json!(parent);
+        let own = fixture.record("user", "Asked in the fork", Uuid::new_v4());
+        fixture.write(&[question.clone(), answer.clone(), own.clone()]);
+        let read = fixture.store().read(fixture.root(), SESSION).unwrap();
+        assert_eq!(read.messages.len(), 3);
+
+        // Once the fork's own id has appeared, another is a mismatch again.
+        fixture.write(&[question.clone(), own.clone(), answer.clone()]);
+        assert!(fixture.store().read(fixture.root(), SESSION).is_err());
+        // And a parent's records with nothing of the fork's are not its file.
+        fixture.write(&[question, answer]);
         assert!(fixture.store().read(fixture.root(), SESSION).is_err());
     }
 

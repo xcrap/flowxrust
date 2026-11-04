@@ -42,10 +42,11 @@ fn realistic_status_output(file_count: usize) -> String {
 fn realistic_numstat_output(file_count: usize) -> String {
     let mut records = Vec::new();
     for i in 0..file_count {
-        // Every seventh file is binary, which shifts its path into a third record.
+        // Every seventh file is binary. Git writes `-\t-\tpath` as one
+        // record; an empty path field followed by two more records is the
+        // layout of a rename, which this used to measure instead.
         if i % 7 == 6 {
-            records.push("-\t-\t".to_string());
-            records.push(format!("assets/binary_{i}.png"));
+            records.push(format!("-\t-\tassets/binary_{i}.png"));
         } else {
             records.push(format!("{}\t{}\tsrc/module_{i}.rs", i % 23 + 1, i % 11));
         }

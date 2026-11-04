@@ -329,14 +329,17 @@ impl Memory {
             cost,
             queued_attachments,
         } = job;
-        // The clone happens under the lock and nothing else does: encoding a
-        // large transcript while holding it would stall the runner and the view.
-        let mut persisted = {
-            let conversation = conversation
-                .lock()
-                .unwrap_or_else(|error| error.into_inner());
-            crate::state::persisted_from(&conversation)
-        };
+        // Only a shallow clone happens under the lock: the messages are shared,
+        // so it copies pointers. Copying every message there, image bytes and
+        // tool output included, held the lock for as long as a large
+        // transcript took to copy, once a second while a turn streamed, and
+        // the runner and the view both waited on it.
+        let captured = conversation
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone();
+        let mut persisted = crate::state::persisted_from(&captured);
+        drop(captured);
         persisted.total_cost_usd = cost;
         persisted.draft_text = draft;
         persisted.draft_attachments = draft_attachments.map(Arc::unwrap_or_clone);

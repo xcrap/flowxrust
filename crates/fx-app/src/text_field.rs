@@ -96,7 +96,7 @@ const MARKED_UNDERLINE: f32 = BorderWidth::REGULAR;
 /// One half of a blink cycle: long enough not to read as a flicker, short
 /// enough that the caret still reads as present.
 const CARET_BLINK_INTERVAL: Duration = Duration::from_millis(530);
-/// How far the caret's row may run past the bottom of the field before it
+/// How far the caret's row may run past either edge of the field before it
 /// scrolls. Layout rounds the field to device pixels, which can leave it up to
 /// a pixel short of its whole rows, and scrolling for that would nudge every
 /// row by the fraction each time the caret reached the last one. A point is
@@ -244,6 +244,9 @@ pub struct TextField {
     /// Held so the blink task is not detached.
     blink: Option<Task<()>>,
     blinking: bool,
+    /// Whether the window was the key window at the last render, which is
+    /// the only time a caret blinks.
+    window_active: bool,
     geometry: Rc<RefCell<FieldGeometry>>,
     history: UndoHistory,
 }
@@ -268,6 +271,7 @@ impl TextField {
             dragging: false,
             blink: None,
             blinking: false,
+            window_active: false,
             geometry: Rc::default(),
             history: UndoHistory::default(),
         }
@@ -875,6 +879,7 @@ impl TextField {
             self.display_index(self.selection.head),
             color,
             None,
+            scroll,
         );
         self.source_index(layout.index_at(point(
             at.x - content.origin.x + scroll.x,
@@ -936,8 +941,9 @@ impl TextField {
                 Timer::after(CARET_BLINK_INTERVAL).await;
                 let keep_going = this
                     .update(cx, |field, cx| {
-                        if !field.focused || !field.enabled {
+                        if !field.focused || !field.enabled || !field.window_active {
                             field.blinking = false;
+                            field.caret_on = true;
                             return false;
                         }
                         field.caret_on = !field.caret_on;
@@ -1024,17 +1030,25 @@ impl Render for TextField {
         let theme = global::current();
         let focused = self.focus_handle.is_focused(window);
         self.focused = focused;
+        // A window in the background holds a steady caret. Blinking there
+        // re-rendered the whole window twice a second for as long as FlowX
+        // sat behind another app; activation refreshes the window, which
+        // starts the blink again.
+        self.window_active = window.is_window_active();
         // The caret is only a phase while the field has focus; unfocusing must
         // not leave it frozen mid-blink when the field is focused again.
-        self.caret_on = self.caret_on && focused;
-        if focused {
+        self.caret_on = (self.caret_on || !self.window_active) && focused;
+        if focused && self.window_active {
             self.ensure_blink(cx);
         }
 
         let metrics = self.metrics(&theme, focused);
         // The measured width is last frame's: this render produces the
         // measurement, so a first frame simply has nothing to wrap against yet.
-        let visible_width = px(self.geometry.borrow().content_width);
+        let (visible_width, painted_scroll) = {
+            let geometry = self.geometry.borrow();
+            (px(geometry.content_width), geometry.painted_scroll)
+        };
         let text_color = if self.enabled {
             Colors::fg(&theme)
         } else {
@@ -1049,6 +1063,7 @@ impl Render for TextField {
             text_color,
             // A secret field draws bullets, whose offsets are not the value's.
             self.marked.clone().filter(|_| !self.secret),
+            painted_scroll,
         );
         let visible_rows = layout
             .rows
@@ -1223,10 +1238,12 @@ impl Element for TextFieldElement {
         // frame that width is zero, so its scroll offset would hide the entire
         // prefilled value. Resolve scrolling from this frame's real viewport
         // before any text, selection, or caret is painted.
+        let previous = self.geometry.borrow().painted_scroll;
         self.layout.scroll_to_caret(
             self.snapshot.selection.head,
             content.size.width,
             content.size.height,
+            previous,
         );
         {
             let mut geometry = self.geometry.borrow_mut();
@@ -1623,7 +1640,13 @@ struct TextLayout {
 }
 
 impl TextLayout {
-    fn scroll_to_caret(&mut self, caret: usize, visible_width: Pixels, visible_height: Pixels) {
+    fn scroll_to_caret(
+        &mut self,
+        caret: usize,
+        visible_width: Pixels,
+        visible_height: Pixels,
+        previous: Point<Pixels>,
+    ) {
         let text_width = self
             .rows
             .iter()
@@ -1636,8 +1659,9 @@ impl TextLayout {
                     row.x_for(caret, &self.lines[row.line].shape),
                     text_width,
                     visible_width,
+                    previous.x,
                 ),
-                Self::vertical_scroll(row.top, row.height, text_height, visible_height),
+                Self::vertical_scroll(row.top, row.height, text_height, visible_height, previous.y),
             ),
             None => (px(0.0), px(0.0)),
         };
@@ -1703,28 +1727,36 @@ impl TextLayout {
     }
 
     /// The horizontal offset that keeps `caret_x` inside `visible_width` of a
-    /// `text_width`-wide text area.
+    /// `text_width`-wide text area, moving `previous` no further than that.
     ///
-    /// Recomputed from scratch every frame rather than accumulated: a value that
-    /// depended on the previous scroll would have to be reset whenever the text
-    /// shrank, and one reset is one bug.
-    fn horizontal_scroll(caret_x: Pixels, text_width: Pixels, visible_width: Pixels) -> Pixels {
+    /// Starts from the scroll last painted. Derived from the caret alone, a
+    /// click on text left of the right edge scrolled it there, so the text
+    /// jumped under the pointer and a drag chased its own scroll to the start.
+    /// The clamp is what a shrinking text needs; nothing has to be reset.
+    fn horizontal_scroll(
+        caret_x: Pixels,
+        text_width: Pixels,
+        visible_width: Pixels,
+        previous: Pixels,
+    ) -> Pixels {
         let max_scroll = (text_width - visible_width).max(px(0.0));
         if max_scroll <= px(0.0) {
             return px(0.0);
         }
         let margin = px(CARET_WIDTH).min(visible_width);
-        let scroll = if caret_x > visible_width - margin {
+        let scroll = if caret_x < previous {
+            caret_x
+        } else if caret_x > previous + visible_width - margin {
             caret_x - visible_width + margin
         } else {
-            px(0.0)
+            previous
         };
         scroll.clamp(px(0.0), max_scroll)
     }
 
     /// The vertical equivalent of [`TextLayout::horizontal_scroll`]: the
     /// offset that keeps the caret's row, `caret_top` down and `row_height`
-    /// tall, inside `visible_height`.
+    /// tall, inside `visible_height`, moving `previous` no further than that.
     ///
     /// Measured to the row's bottom. A row whose top is inside the viewport is
     /// not therefore visible, and comparing the top kept the row being typed on
@@ -1734,22 +1766,31 @@ impl TextLayout {
         row_height: Pixels,
         text_height: Pixels,
         visible_height: Pixels,
+        previous: Pixels,
     ) -> Pixels {
         let max_scroll = (text_height - visible_height).max(px(0.0));
         if max_scroll <= px(0.0) {
             return px(0.0);
         }
         let caret_bottom = caret_top + row_height;
-        let scroll = if caret_bottom > visible_height + px(ROW_OVERSHOOT_TOLERANCE) {
+        // The same tolerance at the top: a field rounded short of its rows
+        // shows its first by a fraction less, and that is not off screen.
+        let scroll = if caret_top < previous - px(ROW_OVERSHOOT_TOLERANCE) {
+            caret_top
+        } else if caret_bottom > previous + visible_height + px(ROW_OVERSHOOT_TOLERANCE) {
             caret_bottom - visible_height
         } else {
-            px(0.0)
+            previous
         };
         scroll.clamp(px(0.0), max_scroll)
     }
 }
 
 /// Shape the value and work out where every visual row and the caret are.
+///
+/// The scroll last painted is an input like the rest: the layout moves it only
+/// as far as the caret needs.
+#[allow(clippy::too_many_arguments)]
 fn build_layout(
     window: &Window,
     metrics: &FieldMetrics,
@@ -1758,6 +1799,7 @@ fn build_layout(
     caret: usize,
     color: gpui::Rgba,
     marked: Option<Range<usize>>,
+    previous_scroll: Point<Pixels>,
 ) -> TextLayout {
     let shaped = shape_value(window, metrics, value, visible_width, color, marked);
 
@@ -1829,7 +1871,12 @@ fn build_layout(
         rows,
         line_height: metrics.line_height,
     };
-    layout.scroll_to_caret(snap_back(value, caret), visible_width, visible_height);
+    layout.scroll_to_caret(
+        snap_back(value, caret),
+        visible_width,
+        visible_height,
+        previous_scroll,
+    );
     layout
 }
 
@@ -2618,6 +2665,7 @@ impl EntityInputHandler for TextField {
             self.display_index(self.selection.head),
             Colors::fg(&global::current()),
             None,
+            self.geometry.borrow().painted_scroll,
         );
         let origin = point(
             content.origin.x - layout.scroll_x,
@@ -3815,7 +3863,7 @@ mod tests {
     #[test]
     fn horizontal_scroll_is_zero_while_the_text_fits() {
         assert_eq!(
-            TextLayout::horizontal_scroll(px(80.0), px(100.0), px(200.0)),
+            TextLayout::horizontal_scroll(px(80.0), px(100.0), px(200.0), px(0.0)),
             px(0.0)
         );
     }
@@ -3823,12 +3871,12 @@ mod tests {
     #[test]
     fn horizontal_scroll_follows_a_caret_that_runs_off_the_right_edge() {
         assert_eq!(
-            TextLayout::horizontal_scroll(px(250.0), px(400.0), px(200.0)),
+            TextLayout::horizontal_scroll(px(250.0), px(400.0), px(200.0), px(0.0)),
             px(250.0 - 200.0 + CARET_WIDTH)
         );
         // And never past the end of the text.
         assert_eq!(
-            TextLayout::horizontal_scroll(px(400.0), px(400.0), px(200.0)),
+            TextLayout::horizontal_scroll(px(400.0), px(400.0), px(200.0), px(0.0)),
             px(200.0)
         );
     }
@@ -3836,13 +3884,55 @@ mod tests {
     #[test]
     fn vertical_scroll_appears_only_once_the_text_is_taller_than_the_field() {
         assert_eq!(
-            TextLayout::vertical_scroll(px(0.0), px(20.0), px(40.0), px(80.0)),
+            TextLayout::vertical_scroll(px(0.0), px(20.0), px(40.0), px(80.0), px(0.0)),
             px(0.0)
         );
         // A row from 120 to 140 is drawn from 60 to 80: the last one showing.
         assert_eq!(
-            TextLayout::vertical_scroll(px(120.0), px(20.0), px(200.0), px(80.0)),
+            TextLayout::vertical_scroll(px(120.0), px(20.0), px(200.0), px(80.0), px(0.0)),
             px(60.0)
+        );
+    }
+
+    #[test]
+    fn a_caret_already_in_view_leaves_the_scroll_where_it_was_painted() {
+        // Thirty 20-point rows in a 160-point field, scrolled to the bottom
+        // (280). A click on the third row drawn puts the caret at 320: in
+        // view, so nothing moves. Derived from the caret alone, the scroll
+        // became 180 and the clicked row jumped to the bottom of the field.
+        assert_eq!(
+            TextLayout::vertical_scroll(px(320.0), px(20.0), px(600.0), px(160.0), px(280.0)),
+            px(280.0)
+        );
+        // A caret above the field brings its row to the top, not the bottom.
+        assert_eq!(
+            TextLayout::vertical_scroll(px(100.0), px(20.0), px(600.0), px(160.0), px(280.0)),
+            px(100.0)
+        );
+        // Below it, its row to the bottom.
+        assert_eq!(
+            TextLayout::vertical_scroll(px(500.0), px(20.0), px(600.0), px(160.0), px(280.0)),
+            px(360.0)
+        );
+        // Text that shrank under the old scroll is clamped, not left hanging.
+        assert_eq!(
+            TextLayout::vertical_scroll(px(60.0), px(20.0), px(200.0), px(160.0), px(280.0)),
+            px(40.0)
+        );
+    }
+
+    #[test]
+    fn a_click_inside_a_scrolled_line_does_not_scroll_it() {
+        // A 1,000-point path in a 200-point field, scrolled to its end (800).
+        // A click 50 points into what is drawn is at 850: in view.
+        assert_eq!(
+            TextLayout::horizontal_scroll(px(850.0), px(1000.0), px(200.0), px(800.0)),
+            px(800.0)
+        );
+        // Left of the field, the caret's column becomes the left edge.
+        assert_eq!(
+            TextLayout::horizontal_scroll(px(300.0), px(1000.0), px(200.0), px(800.0)),
+            px(300.0)
         );
     }
 
@@ -3852,13 +3942,13 @@ mod tests {
         // row's top, 160 is not past 160, so the ninth row was drawn just
         // below the field until a tenth pushed it one row up.
         assert_eq!(
-            TextLayout::vertical_scroll(px(160.0), px(20.0), px(180.0), px(160.0)),
+            TextLayout::vertical_scroll(px(160.0), px(20.0), px(180.0), px(160.0), px(0.0)),
             px(20.0)
         );
         // Eight 20.3-point rows in a field layout rounded 0.4 short of them
         // are all showing: the last does not nudge the text by 0.4.
         assert_eq!(
-            TextLayout::vertical_scroll(px(142.1), px(20.3), px(162.4), px(162.0)),
+            TextLayout::vertical_scroll(px(142.1), px(20.3), px(162.4), px(162.0), px(0.0)),
             px(0.0)
         );
         let value = (1..=9)
@@ -4008,6 +4098,7 @@ mod tests {
                 caret,
                 Colors::fg(&theme),
                 None,
+                Point::default(),
             );
             check(&layout);
             Probe { field }
@@ -4254,6 +4345,42 @@ mod tests {
         // one is "four", not the value's first line.
         let hit = click_at(&mut test, window, &field, point(px(0.5), px(1.0)));
         assert_eq!(hit, "one\ntwo\nthree\n".len());
+    }
+
+    #[test]
+    fn clicking_a_row_of_a_scrolled_composer_leaves_the_text_where_it_was_drawn() {
+        // The scroll used to follow the caret alone, so the clicked top row
+        // was moved to the bottom on the next frame, and a drag that started
+        // there kept hitting a row above itself and ran to the first line.
+        let mut test = gpui::TestAppContext::single();
+        let value = "one\ntwo\nthree\nfour\nfive";
+        let field = test.update(|cx| {
+            cx.new(|cx| {
+                let mut field = TextField::new(cx).multiline(2.0);
+                field.set_value(value, cx);
+                field
+            })
+        });
+        let window = mount_at_width(&mut test, &field, 300.0);
+        let scroll = |test: &mut gpui::TestAppContext| {
+            test.read(|cx| field.read(cx).geometry.borrow().painted_scroll)
+        };
+        let before = scroll(&mut test);
+        assert!(before.y > px(0.0), "the composer should show its last rows");
+
+        for _ in 0..3 {
+            let hit = click_at(&mut test, window, &field, point(px(0.5), px(1.0)));
+            assert_eq!(
+                hit,
+                "one\ntwo\nthree\n".len(),
+                "the top row is still \"four\""
+            );
+            test.update(|cx| {
+                field.update(cx, |field, _| field.selection = Selection::collapsed(hit));
+                cx.refresh_windows();
+            });
+            assert_eq!(scroll(&mut test), before, "the click moved the text");
+        }
     }
 
     #[test]
