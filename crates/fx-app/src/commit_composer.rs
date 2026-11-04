@@ -19,7 +19,8 @@ use fx_design::styled::{FxStyled, px_len};
 use fx_design::theme::{Colors, IconSize, Layout, Spacing, TextRole, global};
 use gpui::prelude::*;
 use gpui::{
-    AnyElement, ClipboardItem, Context, Entity, SharedString, Subscription, Task, Window, div, px,
+    AnyElement, ClipboardItem, Context, Entity, ListSizingBehavior, SharedString, Subscription,
+    Task, Window, div, px, uniform_list,
 };
 
 use super::Inspector;
@@ -531,30 +532,57 @@ impl Inspector {
                     )),
             );
         if choice == CommitChoice::Chosen {
-            let mut list = div()
-                .id("commit-file-list")
-                .flex()
-                .flex_col()
-                .gap(px_len(Spacing::XXS))
-                .max_h(px(Layout::DIFF_NAVIGATOR_COMPACT_HEIGHT))
-                .overflow_y_scroll();
-            for file in &repository.files {
-                let path = file.path.clone();
-                let checked = self.composer.chosen.contains(&path);
-                list = list.child(checkbox(
-                    SharedString::from(format!("commit-file:{path}")),
-                    SharedString::from(format!("{}  {}", file.status(), path)),
-                    checked,
-                    !running,
-                    cx.listener(move |this, _, _, cx| {
-                        if !this.composer.chosen.remove(&path) {
-                            this.composer.chosen.insert(path.clone());
-                        }
-                        cx.notify();
-                    }),
-                ));
-            }
-            let every: Vec<String> = repository.files.iter().map(|f| f.path.clone()).collect();
+            // Only the rows in view are built: a large change set lists up to
+            // two thousand files, and every repaint built every one of them.
+            let this = cx.entity();
+            let list = uniform_list(
+                "commit-file-list",
+                repository.files.len(),
+                move |range, _window, cx| {
+                    let inspector = this.read(cx);
+                    let Some(repository) = inspector.repository(cx) else {
+                        return Vec::new();
+                    };
+                    let running = inspector.running().is_some();
+                    range
+                        .filter_map(|position| {
+                            let file = repository.files.get(position)?;
+                            let path = file.path.clone();
+                            let checked = inspector.composer.chosen.contains(&path);
+                            let toggle = this.clone();
+                            Some(
+                                // The list's gap, carried by each row so that
+                                // every row is the same height.
+                                div()
+                                    .w_full()
+                                    .pb(px_len(Spacing::XXS))
+                                    .child(checkbox(
+                                        SharedString::from(format!("commit-file:{path}")),
+                                        SharedString::from(format!("{}  {}", file.status(), path)),
+                                        checked,
+                                        !running,
+                                        move |_, _, cx| {
+                                            toggle.update(cx, |this, cx| {
+                                                if !this.composer.chosen.remove(&path) {
+                                                    this.composer.chosen.insert(path.clone());
+                                                }
+                                                cx.notify();
+                                            });
+                                        },
+                                    ))
+                                    .into_any_element(),
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                },
+            )
+            .debug_selector(|| "commit-file-list".into())
+            .w_full()
+            .with_sizing_behavior(ListSizingBehavior::Infer)
+            // The last row's share of the gap hangs below the list, so the
+            // column lays out as it did when the gap sat between rows only.
+            .max_h(px(Layout::DIFF_NAVIGATOR_COMPACT_HEIGHT + Spacing::XXS))
+            .mb(px(-Spacing::XXS));
             view = view.child(list).child(
                 div()
                     .flex()
@@ -562,8 +590,15 @@ impl Inspector {
                     .child(compact_action_button(
                         "Select all",
                         None,
-                        cx.listener(move |this, _, _, cx| {
-                            this.composer.chosen = every.iter().cloned().collect();
+                        // Read when pressed, not copied on every repaint.
+                        cx.listener(|this, _, _, cx| {
+                            let every: BTreeSet<String> = this
+                                .repository(cx)
+                                .map(|repository| {
+                                    repository.files.iter().map(|f| f.path.clone()).collect()
+                                })
+                                .unwrap_or_default();
+                            this.composer.chosen = every;
                             cx.notify();
                         }),
                     ))

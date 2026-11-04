@@ -1,6 +1,8 @@
 //! The sidebar: projects and their threads.
 
-use std::collections::HashMap;
+use std::cell::RefCell;
+use std::collections::{HashMap, HashSet};
+use std::rc::Rc;
 
 use fx_core::{Agent, Project};
 use fx_design::components::{
@@ -19,6 +21,7 @@ use gpui::{
 };
 use uuid::Uuid;
 
+use crate::snapshot_index::{RecordIndex, SnapshotIndex};
 use crate::state::AppState;
 use crate::text_field::TextField;
 
@@ -144,9 +147,12 @@ fn header(state: Entity<AppState>, cx: &mut App) -> AnyElement {
 
 fn body(state: Entity<AppState>, cx: &mut App) -> AnyElement {
     let theme = global::current();
-    let snapshot = state.read(cx).snapshot.clone();
+    // Borrowed, never copied: the snapshot holds every thread of every
+    // project, and this runs on every repaint.
+    let cx: &App = cx;
+    let app = state.read(cx);
 
-    if snapshot.projects.is_empty() {
+    if app.snapshot.projects.is_empty() {
         return div()
             .flex_1()
             .min_h_0()
@@ -184,13 +190,20 @@ fn body(state: Entity<AppState>, cx: &mut App) -> AnyElement {
         .overflow_y_scroll()
         .p(px_len(Spacing::SM))
         .gap(px_len(Spacing::SM));
-    let query = state.read(cx).sidebar.search().read(cx).query(cx);
-    for record in &snapshot.projects {
-        let Some(project) = record.project.as_ref() else {
+    // Asked for once, here, so every row below — and the lookups the rows
+    // make through `AppState` — reads maps instead of scanning the snapshot.
+    let index = app.snapshot_index();
+    let query = app.sidebar.search().read(cx).query(cx);
+    let matches = query
+        .is_active()
+        .then(|| search_matches(app, &index, &query));
+    for (position, record) in app.snapshot.projects.iter().enumerate() {
+        let (Some(project), Some(listed)) = (record.project.as_ref(), index.records.get(position))
+        else {
             continue;
         };
         let id = project.id;
-        let selected = Some(id) == snapshot.active_project_id;
+        let selected = Some(id) == app.snapshot.active_project_id;
         // A search looks through every project, so it opens the collapsed
         // ones for as long as it runs without changing what they reopen as.
         let expanded = record.is_expanded || query.is_active();
@@ -200,12 +213,12 @@ fn body(state: Entity<AppState>, cx: &mut App) -> AnyElement {
             .flex_col()
             .flex_shrink_0()
             .child(project_row(
-                state.clone(),
-                id,
-                project.clone(),
+                &state,
+                app,
+                project,
+                project_busy(app, listed),
                 selected,
                 expanded,
-                cx,
             ));
         let mut content = div()
             .flex()
@@ -214,7 +227,7 @@ fn body(state: Entity<AppState>, cx: &mut App) -> AnyElement {
             .gap(px_len(Spacing::XXXS))
             .pt(px_len(Spacing::XXXS));
         {
-            let native_status = state.read(cx).native_status(id);
+            let native_status = app.native_status(id);
             let loading = native_status.syncing && record.agents.is_empty();
             if loading || !native_status.warnings.is_empty() {
                 let detail = native_status.warnings.join("\n");
@@ -261,25 +274,13 @@ fn body(state: Entity<AppState>, cx: &mut App) -> AnyElement {
                         }),
                 );
             }
-            let agents = project
-                .agent_order
-                .iter()
-                .filter(|id| {
-                    !record.archived_agent_ids.contains(id)
-                        && !record.missing_native_agent_ids.contains(id)
-                })
-                .filter_map(|id| record.agents.iter().find(|agent| agent.id == *id))
-                .cloned()
-                .collect();
             if !loading {
+                let matching = matches
+                    .as_ref()
+                    .and_then(|matches| matches.get(position))
+                    .map_or(&listed.visible[..], |matching| &matching[..]);
                 content = content.child(threads(
-                    &state,
-                    record,
-                    agents,
-                    &query,
-                    snapshot.active_agent_id,
-                    expanded,
-                    cx,
+                    &state, app, record, listed, matching, &query, expanded,
                 ));
             }
         }
@@ -293,29 +294,37 @@ fn body(state: Entity<AppState>, cx: &mut App) -> AnyElement {
     list.into_any_element()
 }
 
+/// Whether a thread the project lists has a turn running.
+///
+/// Only a thread with a runner or a loaded conversation can, so this asks
+/// about those rather than about every thread the project has ever had.
+fn project_busy(app: &AppState, listed: &RecordIndex) -> bool {
+    app.runners
+        .keys()
+        .chain(app.conversations.keys())
+        .any(|id| listed.ordered.contains(id) && app.is_thread_busy(*id))
+}
+
 /// One project: a disclosure triangle, its name, and a per-row menu.
 fn project_row(
-    state: Entity<AppState>,
-    id: Uuid,
-    project: Project,
+    state: &Entity<AppState>,
+    app: &AppState,
+    project: &Project,
+    busy: bool,
     selected: bool,
     expanded: bool,
-    cx: &mut App,
 ) -> AnyElement {
     let theme = global::current();
+    let id = project.id;
     let label = if project.name.trim().is_empty() {
         "Untitled project".to_string()
     } else {
         project.name.clone()
     };
-    // Built before the closures below, so neither has to borrow the project.
-    let busy = project
-        .agent_order
-        .iter()
-        .any(|id| state.read(cx).is_thread_busy(*id));
     let menu = project_menu(&project.root_path, busy);
     let context_menu = menu.clone();
-    let registry = state.read(cx).context_registry.clone();
+    let registry = app.context_registry.clone();
+    let state = state.clone();
 
     let row = div()
         .id(SharedString::from(format!("project:{id}")))
@@ -433,14 +442,19 @@ fn project_row(
 
 /// A project's threads, indented under the project name: those matching the
 /// search, one page at a time.
+///
+/// `matching` is positions in the record's threads, in sidebar order: every
+/// listed thread, or the search's matches among them. Only the page shown is
+/// built, so the work here follows the rows on screen, not the threads the
+/// project has.
 fn threads(
     state: &Entity<AppState>,
+    app: &AppState,
     record: &PersistedProject,
-    agents: Vec<Agent>,
+    listed: &RecordIndex,
+    matching: &[usize],
     query: &ThreadQuery,
-    active_agent: Option<Uuid>,
     interactive: bool,
-    cx: &mut App,
 ) -> AnyElement {
     let theme = global::current();
     let project_id = record.project.as_ref().map_or_else(Uuid::nil, |p| p.id);
@@ -450,7 +464,7 @@ fn threads(
         .flex_shrink_0()
         .gap(px_len(Spacing::XXXS))
         .pb(px_len(Spacing::XXS));
-    if agents.is_empty() {
+    if listed.visible.is_empty() {
         return column
             .child(
                 div()
@@ -462,14 +476,6 @@ fn threads(
             )
             .into_any_element();
     }
-    let matching: Vec<Agent> = if query.is_active() {
-        agents
-            .into_iter()
-            .filter(|agent| query.matches(&search_fields(state.read(cx), agent)))
-            .collect()
-    } else {
-        agents
-    };
     if matching.is_empty() {
         return column
             .child(
@@ -495,19 +501,23 @@ fn threads(
             )
             .into_any_element();
     }
-    let limit = state.read(cx).sidebar.visible_limit(project_id, query);
+    let limit = app.sidebar.visible_limit(project_id, query);
     let remaining = matching.len().saturating_sub(limit);
+    let active_agent = app.snapshot.active_agent_id;
     let mut column = column;
-    for agent in matching.into_iter().take(limit) {
-        let unseen = record.unseen_completion_ids.contains(&agent.id);
+    for agent in matching
+        .iter()
+        .take(limit)
+        .filter_map(|&slot| record.agents.get(slot))
+    {
         column = column.child(thread_row(
-            state.clone(),
+            state,
+            app,
             project_id,
-            agent.clone(),
+            agent,
             Some(agent.id) == active_agent,
-            unseen,
+            listed.unseen.contains(&agent.id),
             interactive,
-            cx,
         ));
     }
     if remaining > 0 {
@@ -522,35 +532,212 @@ fn threads(
     column.into_any_element()
 }
 
-/// What a thread search looks through.
+/// The listed threads matching `query`, per project record, as positions in
+/// each record's threads.
 ///
-/// The title, the provider's name, and the first prompt when the transcript is
-/// loaded. A transcript is never read from disk for a search: a keystroke must
-/// not parse every thread in every project.
-fn search_fields(state: &AppState, agent: &Agent) -> Vec<String> {
-    let mut fields = vec![
-        thread_title(agent),
-        crate::thread_presentation::provider(state, agent)
-            .label()
-            .to_string(),
-    ];
-    if let Some(conversation) = state.conversation_by_agent(agent.id) {
-        let conversation = conversation
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
-        if let Some(prompt) = conversation
-            .messages()
-            .find(|message| message.role == fx_core::MessageRole::User)
-        {
+/// Remembered for the query, the snapshot's generation and the revision of
+/// the folded texts, so a repaint that changed none of them — a caret blink,
+/// a streamed delta into a thread whose first prompt it does not touch —
+/// looks nothing up. What a repaint still pays is reading the revision of
+/// each *loaded* transcript, which is how a first prompt arriving or a
+/// history being replaced is noticed.
+fn search_matches(app: &AppState, index: &SnapshotIndex, query: &ThreadQuery) -> SearchHits {
+    let mut cache = app.sidebar.search_cache.borrow_mut();
+    cache.refresh_loaded(app, index);
+    let key = query.key();
+    let snapshot = app.snapshot.generation();
+    if let Some(hits) = &cache.hits
+        && hits.key == key
+        && hits.snapshot == snapshot
+        && hits.texts == cache.texts_revision
+    {
+        return hits.records.clone();
+    }
+    cache.stats.scans += 1;
+    let mut records = Vec::with_capacity(index.records.len());
+    for (record, listed) in app.snapshot.projects.iter().zip(&index.records) {
+        let mut hits = Vec::new();
+        for &slot in listed.visible.iter() {
+            let Some(agent) = record.agents.get(slot) else {
+                continue;
+            };
+            if query.matches_folded(&cache.text(app, agent).folded) {
+                hits.push(slot);
+            }
+        }
+        records.push(Rc::<[usize]>::from(hits));
+    }
+    let records: SearchHits = records.into();
+    // A thread that is gone keeps no text.
+    cache
+        .texts
+        .retain(|id, _| index.agent(&app.snapshot, *id).is_some());
+    cache.hits = Some(SearchMemo {
+        key,
+        snapshot,
+        texts: cache.texts_revision,
+        records: records.clone(),
+    });
+    records
+}
+
+/// Per record, the positions of its matching threads.
+type SearchHits = Rc<[Rc<[usize]>]>;
+
+/// What the thread search keeps between repaints.
+#[derive(Default)]
+pub(crate) struct SearchCache {
+    /// Each thread's searchable text, folded once.
+    texts: HashMap<Uuid, SearchText>,
+    /// Bumped whenever a loaded transcript changes a thread's text, which the
+    /// snapshot's generation cannot see.
+    texts_revision: u64,
+    /// Threads whose text includes a loaded transcript's first prompt.
+    from_transcripts: HashSet<Uuid>,
+    hits: Option<SearchMemo>,
+    stats: SearchStats,
+}
+
+/// How much work the search has done, for tests that pin how little a
+/// repaint does.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct SearchStats {
+    /// Threads whose text was read and folded.
+    pub folded: usize,
+    /// Times the listed threads were matched against a query.
+    pub scans: usize,
+}
+
+struct SearchMemo {
+    key: String,
+    snapshot: u64,
+    texts: u64,
+    records: SearchHits,
+}
+
+/// What a thread search looks through: the title, the provider's name, and
+/// the first prompt when the transcript is loaded, folded and joined by line
+/// breaks. A term has no whitespace, so it cannot match across two of them.
+///
+/// A transcript is never read from disk for a search: a keystroke must not
+/// parse every thread in every project.
+struct SearchText {
+    /// The title it was folded from, as saved.
+    title: String,
+    provider: &'static str,
+    /// The loaded transcript's revision it was read at, if one was loaded.
+    transcript: Option<u64>,
+    folded: String,
+}
+
+impl SearchText {
+    fn derive(app: &AppState, agent: &Agent) -> Self {
+        let conversation = app.conversations.get(&agent.id).map(|conversation| {
+            conversation
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+        });
+        let provider = crate::thread_presentation::provider(app, agent).label();
+        let mut folded = fold(&thread_title(agent));
+        folded.push('\n');
+        folded.push_str(&fold(provider));
+        if let Some(prompt) = conversation.as_ref().and_then(|conversation| {
+            conversation
+                .messages()
+                .find(|message| message.role == fx_core::MessageRole::User)
+        }) {
             let text = prompt.text_content();
-            fields.push(
-                fx_core::policy::transcript_presentation::user_prompt(&text)
-                    .text
-                    .to_owned(),
-            );
+            folded.push('\n');
+            folded.push_str(&fold(
+                fx_core::policy::transcript_presentation::user_prompt(&text).text,
+            ));
+        }
+        Self {
+            title: agent.title.clone(),
+            provider,
+            transcript: conversation.map(|conversation| conversation.revision()),
+            folded,
         }
     }
-    fields
+
+    /// Whether the snapshot's half of this text still holds. The transcript's
+    /// half is kept current by `SearchCache::refresh_loaded`.
+    fn describes(&self, app: &AppState, agent: &Agent) -> bool {
+        self.title == agent.title
+            && self.provider == crate::thread_presentation::provider(app, agent).label()
+    }
+}
+
+impl SearchCache {
+    /// Re-read the texts of threads whose loaded transcript has moved, and of
+    /// any whose transcript has been let go, bumping `texts_revision` only
+    /// when a folded text actually changed. Proportional to the loaded
+    /// transcripts, never to the threads.
+    fn refresh_loaded(&mut self, app: &AppState, index: &SnapshotIndex) {
+        let mut changed = false;
+        for (id, conversation) in &app.conversations {
+            let revision = conversation
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .revision();
+            if self
+                .texts
+                .get(id)
+                .is_some_and(|text| text.transcript == Some(revision))
+            {
+                continue;
+            }
+            let Some(agent) = index.agent(&app.snapshot, *id) else {
+                continue;
+            };
+            changed |= self.replace(*id, SearchText::derive(app, agent));
+        }
+        let released: Vec<Uuid> = self
+            .from_transcripts
+            .iter()
+            .filter(|id| !app.conversations.contains_key(id))
+            .copied()
+            .collect();
+        for id in released {
+            if let Some(agent) = index.agent(&app.snapshot, id) {
+                changed |= self.replace(id, SearchText::derive(app, agent));
+            } else {
+                self.from_transcripts.remove(&id);
+                changed |= self.texts.remove(&id).is_some();
+            }
+        }
+        if changed {
+            self.texts_revision = self.texts_revision.wrapping_add(1);
+        }
+    }
+
+    /// A thread's text, read again if its title or provider has changed.
+    fn text(&mut self, app: &AppState, agent: &Agent) -> &SearchText {
+        if !self
+            .texts
+            .get(&agent.id)
+            .is_some_and(|text| text.describes(app, agent))
+        {
+            self.replace(agent.id, SearchText::derive(app, agent));
+        }
+        &self.texts[&agent.id]
+    }
+
+    /// Store a freshly read text; returns whether matching could differ.
+    fn replace(&mut self, id: Uuid, text: SearchText) -> bool {
+        self.stats.folded += 1;
+        if text.transcript.is_some() {
+            self.from_transcripts.insert(id);
+        } else {
+            self.from_transcripts.remove(&id);
+        }
+        let changed = self
+            .texts
+            .get(&id)
+            .is_none_or(|old| old.folded != text.folded);
+        self.texts.insert(id, text);
+        changed
+    }
 }
 
 /// The row under a long list that reveals its next page.
@@ -624,26 +811,23 @@ fn show_more_row(
 }
 
 fn thread_row(
-    state: Entity<AppState>,
+    state: &Entity<AppState>,
+    app: &AppState,
     project_id: Uuid,
-    agent: Agent,
+    agent: &Agent,
     selected: bool,
     unseen: bool,
     interactive: bool,
-    cx: &mut App,
 ) -> AnyElement {
     let theme = global::current();
     let agent_id = agent.id;
-    let title = thread_title(&agent);
-    let busy = state.read(cx).is_thread_busy(agent_id);
-    let provider = crate::thread_presentation::provider(state.read(cx), &agent);
-    let conversation = state.read(cx).conversation_by_agent(agent_id);
+    let title = thread_title(agent);
+    let busy = app.is_thread_busy(agent_id);
+    let provider = crate::thread_presentation::provider(app, agent);
+    let conversation = app.conversation_by_agent(agent_id);
     // Read before the conversation is locked: it asks whether the thread is
     // busy, which locks the same conversation, and the lock is not reentrant.
-    let elsewhere = state
-        .read(cx)
-        .waiting_elsewhere(agent_id)
-        .map(str::to_owned);
+    let elsewhere = app.waiting_elsewhere(agent_id).map(str::to_owned);
     let (activity, activity_label) = {
         let conversation = conversation.as_ref().map(|conversation| {
             conversation
@@ -660,10 +844,11 @@ fn thread_row(
         )
     };
     let unseen = crate::thread_presentation::shows_unseen_completion(unseen, selected, activity);
-    let thread_id = crate::thread_presentation::provider_thread_id(state.read(cx), agent_id);
+    let thread_id = crate::thread_presentation::provider_thread_id(app, agent_id);
     let menu = thread_menu(false, busy, thread_id.as_deref());
     let context_menu = menu.clone();
-    let registry = state.read(cx).context_registry.clone();
+    let registry = app.context_registry.clone();
+    let state = state.clone();
 
     let row = div()
         .id(SharedString::from(format!("thread:{agent_id}")))
@@ -923,6 +1108,9 @@ pub struct SidebarUi {
     /// Pages revealed beyond the first, per project, for `paged_query` only.
     pages: HashMap<Uuid, usize>,
     paged_query: String,
+    /// Behind a cell because the sidebar is drawn from a shared borrow of the
+    /// state, and a search's matches are worked out while drawing.
+    search_cache: RefCell<SearchCache>,
 }
 
 impl SidebarUi {
@@ -931,11 +1119,18 @@ impl SidebarUi {
             search: cx.new(SidebarSearch::new),
             pages: HashMap::new(),
             paged_query: String::new(),
+            search_cache: RefCell::default(),
         }
     }
 
     pub fn search(&self) -> &Entity<SidebarSearch> {
         &self.search
+    }
+
+    /// The search's work so far.
+    #[cfg(test)]
+    pub(crate) fn search_stats(&self) -> SearchStats {
+        self.search_cache.borrow().stats
     }
 
     /// How many matching threads a project lists for `query`.
@@ -1102,10 +1297,14 @@ impl ThreadQuery {
 
     /// Whether every term appears in one of `fields`. An empty query matches.
     pub fn matches(&self, fields: &[String]) -> bool {
-        let fields: Vec<String> = fields.iter().map(|field| fold(field)).collect();
-        self.terms
-            .iter()
-            .all(|term| fields.iter().any(|field| field.contains(term.as_str())))
+        let folded: Vec<String> = fields.iter().map(|field| fold(field)).collect();
+        self.matches_folded(&folded.join("\n"))
+    }
+
+    /// [`Self::matches`] over fields already folded and joined by line
+    /// breaks. A term holds no whitespace, so it cannot match across two.
+    fn matches_folded(&self, folded: &str) -> bool {
+        self.terms.iter().all(|term| folded.contains(term.as_str()))
     }
 }
 
@@ -2079,5 +2278,154 @@ mod tests {
             );
             assert_eq!(thread_row_fill(false, false, &theme).a, 0.0);
         }
+    }
+
+    /// The sidebar is rebuilt on every repaint: every caret blink, streamed
+    /// delta and pointer move. It used to copy the whole workspace for it,
+    /// scan every thread per row, and with a search active lock and fold
+    /// every loaded transcript. This pins that a repaint which changes
+    /// nothing does none of that, at the 2,000-thread scale the store is
+    /// tested at, and that a change costs only what it touched.
+    #[test]
+    fn a_repaint_does_no_work_that_grows_with_the_threads() {
+        const THREADS: usize = 2_000;
+        const LOADED: usize = 200;
+        let temp = tempfile::tempdir().unwrap();
+        let mut test = TestAppContext::single();
+        let (state, ids) = seeded(&mut test, AppPaths::at(temp.path()), THREADS, false);
+        let project = test.read(|cx| state.read(cx).snapshot.active_project_id.unwrap());
+        let user =
+            |text: String| fx_core::ConversationMessage::text(fx_core::MessageRole::User, text);
+        // Loaded transcripts are what the search read on every repaint. The
+        // last one is loaded but has no prompt yet.
+        let transcripts = test.update(|cx| {
+            state.update(cx, |state, _| {
+                (0..=LOADED)
+                    .map(|i| {
+                        let conversation = state.conversation(project, ids[i]);
+                        if i < LOADED {
+                            conversation
+                                .lock()
+                                .unwrap()
+                                .append(user(format!("prompt number {i}")));
+                        }
+                        conversation
+                    })
+                    .collect::<Vec<_>>()
+            })
+        });
+        let (_window, _visual) = tall_sidebar(&mut test, &state);
+        let index = |test: &TestAppContext| test.read(|cx| state.read(cx).snapshot_index());
+        let stats = |test: &TestAppContext| test.read(|cx| state.read(cx).sidebar.search_stats());
+        let repaint = |test: &mut TestAppContext| {
+            test.update(|cx| state.update(cx, |_, cx| cx.notify()));
+            test.refresh().unwrap();
+        };
+
+        // No search: the index is built once and kept, and one page is drawn.
+        let built = index(&test);
+        repaint(&mut test);
+        repaint(&mut test);
+        assert!(
+            Rc::ptr_eq(&built, &index(&test)),
+            "a repaint rebuilt the index"
+        );
+        assert_eq!(thread_regions(&test, &state).len(), THREAD_PAGE);
+        assert_eq!(stats(&test), SearchStats::default());
+        // Nor does the rest of the window borrow the workspace mutably on a
+        // repaint, which would rebuild the index on every frame.
+        let for_shell = state.clone();
+        test.add_window(move |_, _| crate::FlowX::new(for_shell));
+        test.refresh().unwrap();
+        let shell = index(&test);
+        repaint(&mut test);
+        repaint(&mut test);
+        assert!(
+            Rc::ptr_eq(&shell, &index(&test)),
+            "the shell rebuilt the index"
+        );
+
+        // A search reads and folds each thread once, then matches.
+        let field = test.read(|cx| state.read(cx).sidebar.search().read(cx).field().clone());
+        test.update(|cx| field.update(cx, |field, cx| field.set_value("number 1", cx)));
+        test.refresh().unwrap();
+        let searched = stats(&test);
+        assert_eq!(searched.folded, THREADS);
+        assert_eq!(searched.scans, 1);
+        let shown = thread_regions(&test, &state);
+        assert!(shown.contains(&format!("thread:{}", ids[1])));
+        assert!(shown.contains(&format!("thread:{}", ids[10])));
+        assert!(!shown.contains(&format!("thread:{}", ids[2])));
+        let hits = |test: &TestAppContext| {
+            test.read(|cx| {
+                let state = state.read(cx);
+                let cache = state.sidebar.search_cache.borrow();
+                cache.hits.as_ref().unwrap().records[0].len()
+            })
+        };
+        // Every prompt whose number has a 1: 1, 10–19, 21…91 and 100–199.
+        assert_eq!(hits(&test), 119);
+
+        // Repainting under the search reads nothing and matches nothing.
+        repaint(&mut test);
+        repaint(&mut test);
+        assert_eq!(stats(&test), searched, "a repaint re-read the threads");
+        // Nor does a running turn's update, drained as the root drains it.
+        let streaming = index(&test);
+        test.update(|cx| {
+            state.update(cx, |state, cx| {
+                (state.update_sender_for(ids[5]))(crate::session::SessionUpdate::Changed);
+                state.drain_updates();
+                cx.notify();
+            })
+        });
+        test.refresh().unwrap();
+        assert!(
+            Rc::ptr_eq(&streaming, &index(&test)),
+            "an update rebuilt the index"
+        );
+        assert_eq!(stats(&test), searched);
+
+        // A delta into a loaded thread re-reads that thread alone, and its
+        // first prompt has not changed, so nothing is matched again.
+        transcripts[5]
+            .lock()
+            .unwrap()
+            .append(fx_core::ConversationMessage::text(
+                fx_core::MessageRole::Assistant,
+                "streamed reply",
+            ));
+        repaint(&mut test);
+        let streamed = stats(&test);
+        assert_eq!(streamed.folded, searched.folded + 1);
+        assert_eq!(streamed.scans, searched.scans);
+
+        // A first prompt arriving does change what matches.
+        transcripts[LOADED]
+            .lock()
+            .unwrap()
+            .append(user("a new number 1".into()));
+        repaint(&mut test);
+        let prompted = stats(&test);
+        assert_eq!(prompted.folded, streamed.folded + 1);
+        assert_eq!(prompted.scans, streamed.scans + 1);
+        assert_eq!(hits(&test), 120);
+
+        // A rename changes the workspace: the index is rebuilt, and only the
+        // renamed thread is read again.
+        let before = index(&test);
+        test.update(|cx| {
+            state.update(cx, |state, cx| {
+                assert!(state.rename_thread(ids[2], "renamed number 1"));
+                cx.notify();
+            })
+        });
+        test.refresh().unwrap();
+        assert!(!Rc::ptr_eq(&before, &index(&test)));
+        let renamed = stats(&test);
+        assert_eq!(renamed.folded, prompted.folded + 1);
+        assert_eq!(renamed.scans, prompted.scans + 1);
+        assert_eq!(hits(&test), 121);
+        assert!(thread_regions(&test, &state).contains(&format!("thread:{}", ids[2])));
     }
 }

@@ -307,6 +307,11 @@ touching that shape directly:
 - A tooltip body must be a real view (`Entity<V>` converted with `AnyView::from`),
   not an element tree.
 - `ElementId` converts from `SharedString` and `&'static str`, not from `String`.
+- **A `uniform_list` counts its own vertical padding twice**: once in where
+  its rows start and again in how far it scrolls, so a padded list scrolls
+  with everything in view. Put vertical insets on a wrapper. The list needs
+  `ListSizingBehavior::Infer` to fit its rows under a `max_h`; the default,
+  `Auto`, sizes it from its style alone, which under only a `max_h` is zero.
 
 ## Persistence
 
@@ -811,6 +816,35 @@ ancestor's actions for a target the ancestor does not own.
 `AppHandle` is a `gpui::Global` wrapping the state entity. A menu row's callback
 receives only a `Window` and an `App`, so the state has to be reachable without
 being captured.
+
+### Per-frame work
+
+No view is cached, so every notify, caret blink and streamed delta rebuilds
+the whole window. Anything a frame does once per thread is paid once per
+thread per frame, and the store is tested at 2,000 threads. The sidebar used
+to copy the whole snapshot, scan every thread for every row, and under a
+search lock and fold every loaded transcript, on every frame. Three rules keep
+that work proportional to what is on screen:
+
+- **Borrow the snapshot, never clone it, and ask the index.**
+  `AppState::snapshot` is a `Versioned<PersistedApp>`: every `&mut` access goes
+  through `DerefMut`, which moves its generation. `snapshot_index()` rebuilds
+  the per-project visible lists and the id → thread / project / binding maps
+  only when that generation has moved. `native_defaults`,
+  `native_binding` and `project_for_agent` answer from the index when it is
+  current and scan otherwise, so a loop that edits and asks on each pass never
+  rebuilds it. A plain repaint must not borrow the snapshot mutably at all.
+  `a_repaint_does_no_work_that_grows_with_the_threads` checks that across the
+  whole shell; a mutable borrow taken on every frame would rebuild the index
+  every frame.
+- **A search is remembered, not rerun.** The sidebar folds each thread's text
+  once, re-reads only threads whose loaded transcript has moved, and
+  re-matches only when the query, the snapshot's generation or a folded text
+  changes.
+- **Long lists of uniform rows are `uniform_list`s.** The palette's results
+  and the commit composer's file list build only the rows in view. Each row
+  carries the list's gap as a bottom inset so that every row is one height,
+  and the list gives the last one back.
 
 Every key binding, the menu bar, and Settings' Shortcuts page come from one
 table, `commands::key_bindings()`. Add a shortcut there, never with a separate

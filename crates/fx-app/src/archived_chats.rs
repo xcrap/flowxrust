@@ -72,33 +72,34 @@ impl Render for ArchivedChats {
         let mut count = 0;
         let mut visible = 0;
         let mut rows = Vec::new();
-        for record in &state.snapshot.projects {
+        // Archived threads from the index, rather than every thread checked
+        // against every archived id: the page repaints whenever the state
+        // does, a running turn included.
+        let index = state.snapshot_index();
+        for (record, listed) in state.snapshot.projects.iter().zip(&index.records) {
             let Some(project) = &record.project else {
                 continue;
             };
-            for agent in &record.agents {
-                if !record.archived_agent_ids.contains(&agent.id) {
-                    continue;
-                }
+            let project_matches = query.is_empty() || project.name.to_lowercase().contains(&query);
+            for agent in listed
+                .archived
+                .iter()
+                .filter_map(|&slot| record.agents.get(slot))
+            {
                 count += 1;
                 let title = if agent.title.trim().is_empty() {
                     "Untitled chat"
                 } else {
                     &agent.title
                 };
-                if !query.is_empty()
-                    && !title.to_lowercase().contains(&query)
-                    && !project.name.to_lowercase().contains(&query)
-                {
+                if !project_matches && !title.to_lowercase().contains(&query) {
                     continue;
                 }
                 let id = agent.id;
                 visible += 1;
                 let provider = match agent.configuration.provider_id.as_deref().or_else(|| {
-                    record
-                        .native_bindings
-                        .iter()
-                        .find(|binding| binding.agent_id == id)
+                    state
+                        .native_binding(id)
                         .map(|binding| binding.provider_id.as_str())
                 }) {
                     Some("claude") => "Claude",

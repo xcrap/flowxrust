@@ -153,11 +153,7 @@ pub(crate) fn provider_thread_id(state: &AppState, agent_id: uuid::Uuid) -> Opti
         })
         .or_else(|| {
             state
-                .snapshot
-                .projects
-                .iter()
-                .flat_map(|record| &record.native_bindings)
-                .find(|binding| binding.agent_id == agent_id)
+                .native_binding(agent_id)
                 .map(|binding| binding.session_id.clone())
         })
         .filter(|id| !id.trim().is_empty())

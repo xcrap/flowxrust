@@ -30,8 +30,9 @@ use fx_design::styled::{FxStyled, px_len};
 use fx_design::theme::{Colors, IconSize, Layout, Spacing, global};
 use gpui::prelude::*;
 use gpui::{
-    Action, App, Context, Entity, FocusHandle, MouseButton, Render, ScrollHandle, SharedString,
-    Subscription, Window, div,
+    Action, AnyElement, App, Context, Entity, FocusHandle, ListSizingBehavior, MouseButton, Render,
+    ScrollStrategy, SharedString, Subscription, UniformListScrollHandle, Window, div, px,
+    uniform_list,
 };
 use uuid::Uuid;
 
@@ -43,6 +44,10 @@ use crate::workspace_ui;
 
 /// The one section the palette's model holds.
 const RESULTS: &str = "results";
+
+/// The space above the first result and below the last, beyond the gap each
+/// row carries.
+const LIST_INSETS: f32 = Spacing::SM + Spacing::SM - Spacing::XXS;
 
 /// What running a command does.
 pub enum PaletteTarget {
@@ -408,7 +413,7 @@ pub struct CommandPalette {
     /// What the results were ranked against, so a repaint that changed nothing
     /// does not reset the highlight.
     ranked_query: String,
-    scroll: ScrollHandle,
+    scroll: UniformListScrollHandle,
     /// Where focus was before the palette took it, to give it back on Escape.
     previous_focus: Option<FocusHandle>,
     _query_changed: Subscription,
@@ -455,7 +460,7 @@ pub fn toggle(state: Entity<AppState>, window: &mut Window, cx: &mut App) {
             model: MenuModel::default(),
             query,
             ranked_query: String::new(),
-            scroll: ScrollHandle::new(),
+            scroll: UniformListScrollHandle::new(),
             previous_focus,
             _query_changed: query_changed,
         };
@@ -518,7 +523,7 @@ impl CommandPalette {
         self.model = MenuModel::new(vec![MenuSection::new(RESULTS, items)]);
         self.model.highlight_first();
         self.ranked_query = query;
-        self.scroll.scroll_to_item(0);
+        self.scroll.scroll_to_item(0, ScrollStrategy::Top);
     }
 
     fn search_messages(&mut self, cx: &mut Context<Self>) {
@@ -586,7 +591,7 @@ impl CommandPalette {
                 if let Some(key) = highlighted {
                     this.model.set_highlight(&key);
                     if let Some(index) = this.highlighted_index() {
-                        this.scroll.scroll_to_item(index);
+                        this.scroll.scroll_to_item(index, ScrollStrategy::Top);
                     }
                 }
                 cx.notify();
@@ -607,8 +612,17 @@ impl CommandPalette {
             && let Some(index) = self.highlighted_index()
         {
             // Keyboard movement has to keep the row in view; a hovered row
-            // already is.
-            self.scroll.scroll_to_item(index);
+            // already is. Toward the edge it moves to, so a step past the
+            // bottom scrolls one row rather than a page, as the plain list
+            // did. A wrap lands at the far end either way.
+            self.scroll.scroll_to_item(
+                index,
+                if delta > 0 {
+                    ScrollStrategy::Bottom
+                } else {
+                    ScrollStrategy::Top
+                },
+            );
         }
         cx.notify();
     }
@@ -680,33 +694,76 @@ impl CommandPalette {
                 .children((!self.search_status.is_empty()).then(|| self.search_status_element()))
                 .into_any_element();
         }
-        let highlighted = self.model.highlighted().map(str::to_string);
+        // Only the rows in view are built. With an empty query the palette
+        // lists every thread of every project, and building every row on
+        // every repaint grew with the workspace. Each row is one line of
+        // title over one of subtitle, so they share a height.
         let this = cx.entity();
-        let mut list = div()
-            .id("command-palette-results")
-            .debug_selector(|| "command-palette-results".into())
-            .w_full()
-            .max_h(px_len(Layout::COMMAND_PALETTE_MAX_LIST_HEIGHT))
-            .overflow_y_scroll()
-            .track_scroll(&self.scroll)
+        let list = uniform_list(
+            "command-palette-results",
+            self.results.len(),
+            move |range, _window, cx| {
+                let palette = this.read(cx);
+                let highlighted = palette.model.highlighted();
+                range
+                    .filter_map(|position| {
+                        let index = *palette.results.get(position)?;
+                        Some(palette.result_row(index, highlighted, &this))
+                    })
+                    .collect::<Vec<_>>()
+            },
+        )
+        .debug_selector(|| "command-palette-results".into())
+        .w_full()
+        .px(px_len(Spacing::SM))
+        .max_h(px(Layout::COMMAND_PALETTE_MAX_LIST_HEIGHT - LIST_INSETS))
+        .with_sizing_behavior(ListSizingBehavior::Infer)
+        .track_scroll(self.scroll.clone());
+        div()
             .flex()
             .flex_col()
-            .gap(px_len(Spacing::XXS))
-            .p(px_len(Spacing::SM));
-        for &index in &self.results {
-            let command = &self.commands[index];
-            let key = MenuModel::key_for(RESULTS, &command.id);
-            let for_hover = this.clone();
-            let for_choose = this.clone();
-            let hover_key = key.clone();
-            list = list.child(palette_row(
+            .child(
+                // The list's top and bottom insets sit outside it. GPUI 0.2.2's
+                // uniform list counts its own vertical padding twice — once
+                // in where the rows start and once more in how far it
+                // scrolls — so a padded list was scrollable with everything
+                // in view. The rows carry the gap between them, so the bottom
+                // inset gives one gap back and the column measures as the
+                // padded list of rows did.
+                div()
+                    .debug_selector(|| "command-palette-list".into())
+                    .w_full()
+                    .pt(px_len(Spacing::SM))
+                    .pb(px(Spacing::SM - Spacing::XXS))
+                    .child(list),
+            )
+            .children((!self.search_status.is_empty()).then(|| self.search_status_element()))
+            .into_any_element()
+    }
+
+    /// One result, with its share of the gap below it.
+    fn result_row(
+        &self,
+        index: usize,
+        highlighted: Option<&str>,
+        this: &Entity<Self>,
+    ) -> AnyElement {
+        let command = &self.commands[index];
+        let key = MenuModel::key_for(RESULTS, &command.id);
+        let for_hover = this.clone();
+        let for_choose = this.clone();
+        let hover_key = key.clone();
+        div()
+            .w_full()
+            .pb(px_len(Spacing::XXS))
+            .child(palette_row(
                 PaletteRow {
                     id: SharedString::from(key.clone()),
                     icon: command.icon,
                     title: command.title.clone().into(),
                     subtitle: command.subtitle.clone().into(),
                     shortcut: command.shortcut.clone().map(SharedString::from),
-                    highlighted: highlighted.as_deref() == Some(key.as_str()),
+                    highlighted: highlighted == Some(key.as_str()),
                 },
                 move |_, cx| {
                     for_hover.update(cx, |palette, cx| {
@@ -719,13 +776,7 @@ impl CommandPalette {
                 move |window, cx| {
                     for_choose.update(cx, |palette, cx| palette.run(index, window, cx));
                 },
-            ));
-        }
-        div()
-            .flex()
-            .flex_col()
-            .child(list)
-            .children((!self.search_status.is_empty()).then(|| self.search_status_element()))
+            ))
             .into_any_element()
     }
 
@@ -949,18 +1000,23 @@ mod tests {
     /// The whole shell over one project with two threads, the app's real key
     /// table installed, the first thread selected.
     fn shell() -> Shell {
+        shell_with(&["First", "Second"])
+    }
+
+    /// [`shell`], with a thread for each of `titles`.
+    fn shell_with(titles: &[&str]) -> Shell {
         let dir = tempfile::tempdir().unwrap();
         let paths = AppPaths::at(dir.path().join("state"));
-        let first = Agent::new("First");
-        let second = Agent::new("Second");
+        let agents: Vec<Agent> = titles.iter().map(|title| Agent::new(*title)).collect();
+        let (first, second) = (&agents[0], &agents[1]);
         let mut project = Project::new(dir.path().to_string_lossy());
-        project.agent_order = vec![first.id, second.id];
+        project.agent_order = agents.iter().map(|agent| agent.id).collect();
         let snapshot = PersistedApp {
             active_project_id: Some(project.id),
             active_agent_id: Some(first.id),
             projects: vec![PersistedProject {
                 project: Some(project),
-                agents: vec![first.clone(), second.clone()],
+                agents: agents.clone(),
                 is_expanded: true,
                 ..Default::default()
             }],
@@ -1348,5 +1404,84 @@ mod tests {
             .find(|command| command.title == "Open Second")
             .unwrap();
         assert_eq!(second.shortcut.as_deref(), Some("⌘2"));
+    }
+
+    fn row(title: &str) -> &'static str {
+        // GPUI's selector API keeps static strings.
+        Box::leak(format!("palette-row:{title}").into_boxed_str())
+    }
+
+    #[test]
+    fn the_results_keep_their_layout_with_only_the_rows_in_view_built() {
+        let mut shell = shell();
+        let mut visual = gpui::VisualTestContext::from_window(shell.window.into(), &shell.test);
+        shell.keys("cmd-k");
+        shell.type_text("sidebar");
+        assert_eq!(shell.titles(), ["Hide sidebar", "Open project…"]);
+        // The column the padded stack of rows drew: an 8pt inset above the
+        // first row and below the last, and the 4pt gap between them.
+        let column = visual.debug_bounds("command-palette-list").unwrap();
+        let first = visual.debug_bounds(row("Hide sidebar")).unwrap();
+        let second = visual.debug_bounds(row("Open project…")).unwrap();
+        assert_eq!(first.top() - column.top(), px(Spacing::SM));
+        assert_eq!(second.top() - first.bottom(), px(Spacing::XXS));
+        assert_eq!(column.bottom() - second.bottom(), px(Spacing::SM));
+        assert_eq!(first.size.height, second.size.height);
+        let list = visual.debug_bounds("command-palette-results").unwrap();
+        assert_eq!(first.left() - list.left(), px(Spacing::SM));
+        assert_eq!(list.right() - first.right(), px(Spacing::SM));
+    }
+
+    #[test]
+    fn a_long_listing_builds_only_the_rows_in_view_and_keys_bring_the_highlight_into_it() {
+        let titles: Vec<String> = (0..300).map(|i| format!("Thread {i}")).collect();
+        let titles: Vec<&str> = titles.iter().map(String::as_str).collect();
+        let mut shell = shell_with(&titles);
+        let mut visual = gpui::VisualTestContext::from_window(shell.window.into(), &shell.test);
+        shell.keys("cmd-k");
+        let column = visual.debug_bounds("command-palette-list").unwrap();
+        assert_eq!(
+            column.size.height,
+            px(Layout::COMMAND_PALETTE_MAX_LIST_HEIGHT)
+        );
+        let list = visual.debug_bounds("command-palette-results").unwrap();
+        let inside = |bounds: gpui::Bounds<gpui::Pixels>| {
+            bounds.top() >= list.top() && bounds.bottom() <= list.bottom()
+        };
+        assert!(inside(visual.debug_bounds(row("Open project…")).unwrap()));
+        // GPUI keeps every selector it has ever drawn, so these can only
+        // show that a row was never built.
+        assert!(visual.debug_bounds(row("Open Thread 150")).is_none());
+        assert!(visual.debug_bounds(row("Open Thread 299")).is_none());
+
+        // Up from the first row wraps to the last, which is scrolled to.
+        shell.keys("up");
+        assert_eq!(shell.highlighted().as_deref(), Some("Open Thread 299"));
+        let last = visual.debug_bounds(row("Open Thread 299")).unwrap();
+        assert!(inside(last));
+        assert_eq!(last.bottom(), list.bottom() - px(Spacing::XXS));
+        assert!(visual.debug_bounds(row("Open Thread 150")).is_none());
+
+        // Up again moves one row, and nothing scrolls: it is in view.
+        shell.keys("up");
+        let above = visual.debug_bounds(row("Open Thread 298")).unwrap();
+        assert_eq!(above.bottom() + px(Spacing::XXS), last.top());
+        assert_eq!(visual.debug_bounds(row("Open Thread 299")).unwrap(), last);
+
+        // Down past the end wraps to the top, which is scrolled back to.
+        shell.keys("down down");
+        assert_eq!(shell.highlighted().as_deref(), Some("Open project…"));
+        let top = visual.debug_bounds(row("Open project…")).unwrap();
+        assert_eq!(top.top(), list.top());
+
+        // Stepping down past the bottom edge scrolls by a row, not a page:
+        // the highlighted row lands on the bottom edge.
+        let visible = ((list.size.height / (top.size.height + px(Spacing::XXS))).floor()) as usize;
+        for _ in 0..visible {
+            shell.keys("down");
+        }
+        let highlighted = shell.highlighted().unwrap();
+        let landed = visual.debug_bounds(row(&highlighted)).unwrap();
+        assert_eq!(landed.bottom(), list.bottom() - px(Spacing::XXS));
     }
 }

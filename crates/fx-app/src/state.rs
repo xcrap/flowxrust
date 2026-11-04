@@ -5,7 +5,9 @@
 //! the design settings. Anything a view can compute from those stays in the
 //! view.
 
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -20,6 +22,7 @@ use fx_design::theme::{
 };
 use fx_store::{AppPaths, PersistedApp, PersistedConversation, PersistedPreferences, Store};
 
+use crate::snapshot_index::{SnapshotIndex, Versioned};
 use crate::text_field::TextField;
 use gpui::{App, AppContext, Context, Entity};
 use uuid::Uuid;
@@ -39,7 +42,12 @@ pub enum StoreError {
 /// Root state for the window.
 pub struct AppState {
     pub store: Store,
-    pub snapshot: PersistedApp,
+    /// The saved workspace. Counts its mutable borrows, so the index below
+    /// knows when it has to be rebuilt.
+    pub snapshot: Versioned<PersistedApp>,
+    /// Lookups over `snapshot` for the paths that run every frame, rebuilt
+    /// the first time one is asked for after the snapshot changed.
+    index: RefCell<Rc<SnapshotIndex>>,
     pub preferences: PersistedPreferences,
     title_jobs: HashMap<Uuid, crate::auto_title::TitleJob>,
     /// Live transcripts, keyed by agent. Populated as threads are opened.
@@ -207,7 +215,8 @@ impl AppState {
             menu_layer: cx.new(|_| MenuLayer::default()),
             context_registry: cx.new(|_| ContextRegistry::default()),
             store,
-            snapshot,
+            snapshot: Versioned::new(snapshot),
+            index: RefCell::default(),
             preferences,
             title_jobs: HashMap::new(),
             conversations: HashMap::new(),
@@ -690,7 +699,8 @@ impl AppState {
     /// For a caller about to put another thread on screen: the one the
     /// project was left on is never drawn, so it keeps its unseen mark.
     fn enter_project(&mut self, id: Uuid) -> bool {
-        let Some(record) = self.snapshot.projects.iter().find(|record| {
+        let snapshot = &mut *self.snapshot;
+        let Some(record) = snapshot.projects.iter().find(|record| {
             record
                 .project
                 .as_ref()
@@ -698,8 +708,8 @@ impl AppState {
         }) else {
             return false;
         };
-        self.snapshot.active_project_id = Some(id);
-        self.snapshot.active_agent_id = visible_agent(record, record.last_selected_agent_id);
+        snapshot.active_project_id = Some(id);
+        snapshot.active_agent_id = visible_agent(record, record.last_selected_agent_id);
         self.request_native_refresh(id);
         true
     }
@@ -756,8 +766,8 @@ impl AppState {
     /// was left on and mark it seen though it was never drawn.
     pub fn select_agent(&mut self, id: Uuid) {
         let previous = self.snapshot.active_agent_id;
-        let Some(record) = self
-            .snapshot
+        let snapshot = &mut *self.snapshot;
+        let Some(record) = snapshot
             .projects
             .iter_mut()
             .find(|record| record.agents.iter().any(|agent| agent.id == id))
@@ -768,9 +778,9 @@ impl AppState {
             return;
         };
         let project_id = project.id;
-        let entered = self.snapshot.active_project_id != Some(project_id);
-        self.snapshot.active_project_id = Some(project_id);
-        self.snapshot.active_agent_id = Some(id);
+        let entered = snapshot.active_project_id != Some(project_id);
+        snapshot.active_project_id = Some(project_id);
+        snapshot.active_agent_id = Some(id);
         record.last_selected_agent_id = Some(id);
         self.native_sync.history_due.remove(&id);
         self.mark_seen([previous, Some(id)]);
@@ -940,7 +950,7 @@ impl AppState {
             });
             return false;
         }
-        self.snapshot = next;
+        *self.snapshot = next;
         true
     }
 
@@ -1553,6 +1563,9 @@ impl AppState {
     }
 
     fn project_for_agent(&self, agent_id: Uuid) -> Option<Uuid> {
+        if let Some(index) = self.current_index() {
+            return index.project_for_agent(agent_id);
+        }
         self.snapshot.projects.iter().find_map(|record| {
             record
                 .agents
@@ -2967,7 +2980,7 @@ impl AppState {
                     next.active_agent_id = visible_agent(record, record.last_selected_agent_id);
                 }
                 // Provider errors and no-op polls must not rewrite the workspace.
-                if serde_json::to_vec(&next).ok() != serde_json::to_vec(&self.snapshot).ok() {
+                if serde_json::to_vec(&next).ok() != serde_json::to_vec(&*self.snapshot).ok() {
                     self.commit_thread_change(next, "save native thread discovery");
                 }
                 self.forget_waiting_elsewhere(
@@ -3216,12 +3229,44 @@ impl AppState {
         self.save();
     }
 
-    pub fn native_defaults(&self, agent_id: Uuid) -> fx_core::NativeDefaults {
+    /// The lookups the render path makes, rebuilt here if the snapshot has
+    /// changed since they were last asked for.
+    ///
+    /// Call it once at the top of a view that asks about many threads; the
+    /// helpers below then answer from it for the rest of the frame.
+    pub fn snapshot_index(&self) -> Rc<SnapshotIndex> {
+        if let Some(index) = self.current_index() {
+            return index;
+        }
+        let index = Rc::new(SnapshotIndex::build(&self.snapshot));
+        *self.index.borrow_mut() = index.clone();
+        index
+    }
+
+    /// The index, only when it already describes the snapshot.
+    ///
+    /// Lookups outside the render path take it when it is there and scan
+    /// otherwise, rather than rebuilding it: a loop that edits the snapshot
+    /// and asks about a thread on each pass would rebuild it every time.
+    fn current_index(&self) -> Option<Rc<SnapshotIndex>> {
+        let index = self.index.borrow();
+        index.is_current(&self.snapshot).then(|| index.clone())
+    }
+
+    /// A thread's native binding, the first one a scan of the projects finds.
+    pub fn native_binding(&self, agent_id: Uuid) -> Option<&fx_store::PersistedBinding> {
+        if let Some(index) = self.current_index() {
+            return index.binding(&self.snapshot, agent_id);
+        }
         self.snapshot
             .projects
             .iter()
             .flat_map(|record| &record.native_bindings)
             .find(|binding| binding.agent_id == agent_id)
+    }
+
+    pub fn native_defaults(&self, agent_id: Uuid) -> fx_core::NativeDefaults {
+        self.native_binding(agent_id)
             .map(|binding| fx_core::NativeDefaults {
                 provider_id: Some(binding.provider_id.clone()),
                 model_id: binding.model.clone(),
@@ -5542,14 +5587,14 @@ mod persistence_tests {
                     .unwrap()
                     .append(ConversationMessage::text(MessageRole::User, "preserve"));
                 state.save_all(cx);
-                let before = serde_json::to_value(&state.snapshot).unwrap();
+                let before = serde_json::to_value(&*state.snapshot).unwrap();
                 let history = std::fs::read(paths.conversation_file(project, first)).unwrap();
                 std::fs::remove_file(paths.projects_file()).unwrap();
                 std::fs::create_dir(paths.projects_file()).unwrap();
                 assert!(!state.rename_thread(first, "Changed"));
                 assert!(!state.set_thread_archived(first, true));
                 assert!(!state.delete_thread(first));
-                assert_eq!(serde_json::to_value(&state.snapshot).unwrap(), before);
+                assert_eq!(serde_json::to_value(&*state.snapshot).unwrap(), before);
                 assert_eq!(
                     std::fs::read(paths.conversation_file(project, first)).unwrap(),
                     history
@@ -8723,14 +8768,14 @@ mod native_sync_tests {
                 ];
                 index(state, project, "codex", codex.clone(), Vec::new());
                 index(state, project, "claude", claude.clone(), Vec::new());
-                let settled = serde_json::to_vec(&state.snapshot).unwrap();
+                let settled = serde_json::to_vec(&*state.snapshot).unwrap();
                 // Checked after every pass: a full round of both put the old
                 // order back, so only the passes in between differed.
                 for _ in 0..2 {
                     for (provider, entries) in [("codex", &codex), ("claude", &claude)] {
                         index(state, project, provider, entries.clone(), Vec::new());
                         assert_eq!(
-                            serde_json::to_vec(&state.snapshot).unwrap(),
+                            serde_json::to_vec(&*state.snapshot).unwrap(),
                             settled,
                             "an unchanged {provider} pass changed the workspace"
                         );

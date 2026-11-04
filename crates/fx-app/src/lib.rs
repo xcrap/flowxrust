@@ -36,6 +36,7 @@ mod selection;
 pub mod session;
 pub mod settings;
 pub mod sidebar;
+pub mod snapshot_index;
 pub mod state;
 pub mod text_field;
 mod thread_actions;

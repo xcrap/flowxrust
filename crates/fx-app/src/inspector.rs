@@ -1307,4 +1307,53 @@ mod tests {
         let mut visual = gpui::VisualTestContext::from_window(window.into(), &test);
         assert!(visual.debug_bounds("git-operation-error").is_some());
     }
+
+    #[test]
+    fn choosing_files_builds_only_the_rows_in_view_and_keeps_the_column() {
+        let root = repo();
+        for i in 0..60 {
+            std::fs::write(root.path().join(format!("f{i:02}.txt")), "new\n").unwrap();
+        }
+        let data = tempfile::tempdir().unwrap();
+        let mut test = gpui::TestAppContext::single();
+        let (inspector, window) = mount(&mut test, data.path(), Some(root.path()), 360.0);
+        let files = test.read(|cx| inspector.read(cx).repository(cx).unwrap().files.len());
+        assert_eq!(files, 60);
+        inspector.update(&mut test, |inspector, cx| {
+            inspector.composer.visible = true;
+            inspector.composer.choice = CommitChoice::Chosen;
+            cx.notify();
+        });
+        test.refresh().unwrap();
+        let mut visual = gpui::VisualTestContext::from_window(window.into(), &test);
+        let file = |name: &str| -> &'static str {
+            Box::leak(format!("checkbox:commit-file:{name}").into_boxed_str())
+        };
+        let list = visual.debug_bounds("commit-file-list").unwrap();
+        let first = visual.debug_bounds(file("f00.txt")).unwrap();
+        let second = visual.debug_bounds(file("f01.txt")).unwrap();
+        assert_eq!(first.top(), list.top());
+        assert_eq!(second.top() - first.bottom(), px(Spacing::XXS));
+        // Never built: GPUI keeps every selector it has drawn.
+        assert!(visual.debug_bounds(file("f59.txt")).is_none());
+        // The list takes the room the stacked rows did, capped where it was,
+        // and the actions under it start a gap below that.
+        assert_eq!(
+            list.size.height - px(Spacing::XXS),
+            px(Layout::DIFF_NAVIGATOR_COMPACT_HEIGHT)
+        );
+        let select_all = visual.debug_bounds("compact-action:Select all").unwrap();
+        assert_eq!(
+            select_all.top() - (list.bottom() - px(Spacing::XXS)),
+            px(Spacing::SM)
+        );
+
+        visual.simulate_click(second.center(), Default::default());
+        test.read(|cx| {
+            let chosen = &inspector.read(cx).composer.chosen;
+            assert_eq!(chosen.iter().collect::<Vec<_>>(), ["f01.txt"]);
+        });
+        visual.simulate_click(select_all.center(), Default::default());
+        test.read(|cx| assert_eq!(inspector.read(cx).composer.chosen.len(), files));
+    }
 }
