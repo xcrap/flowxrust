@@ -32,6 +32,21 @@ git inspection, and terminals — a port of the Swift original at
 matters: the app needs one to own a Dock icon, a menu bar, and an
 application-support directory.
 
+A debug build compiles GPUI and every other dependency at opt-level 0, so
+`./fx run` is a slow build of the app, not the app. Judge smoothness on
+`FX_CONFIG=release`, never on a debug build.
+
+To see where a frame's time goes, set `FX_FRAME_PROFILE=<ms>`:
+
+```sh
+FX_FRAME_PROFILE=4 ./fx run 2>&1 | grep fx_frame
+```
+
+Every frame that spends at least that long on the UI thread is logged with its
+build, layout, prepaint and paint times, and a summary of all frames follows
+every five seconds. `0` logs every frame. The wrapper that measures is
+`fx-app/src/frame_profile.rs`; unset, it is not in the tree at all.
+
 ## Crate layout
 
 Dependencies point one way only. Nothing lower in this list may depend on
@@ -862,10 +877,23 @@ the conversation from a background thread, so the conversation is behind a
 
 The runner's callback **may not capture `App`**: it fires on another thread and
 `App` is neither `Send` nor reachable from there. It sends to an `mpsc` channel
-instead, which a 33 ms poller drains while anything is busy. The poller
-repaints only when the drain applied something or a running thread's revision
-moved, so a quiet turn costs no frames, and a finished turn's `Finished` update
-is what repaints it without anything asking.
+instead, and rings a wake the root awaits on the foreground executor, so an
+update is drained and drawn on the frame it arrives. Waiting for a poll
+instead put every streamed delta up to a tick late, which is what made
+streaming look like it came in steps. Wake-driven drains are spaced one
+display frame apart, so a stream that writes faster than that is drawn in
+bulk. A 33 ms poller still runs while anything is busy: it notices a
+revision that moved without an update, runs the checkpoint and the queues,
+and is what a test clock drives. Both go through one `drain_and_repaint`,
+which repaints only when the drain applied something or a running thread's
+revision moved, so a quiet turn costs no frames, and a finished turn's
+`Finished` update is what repaints it without anything asking. What the last
+pass saw is kept on the root, so a wake and the poll after it draw a change
+once.
+
+The window is opaque. Nothing in it is translucent, and a transparent
+`NSWindow` is composited against whatever is behind it on every frame, so
+`WindowBackgroundAppearance::Transparent` cost a blend per frame for nothing.
 
 Two things stay off the UI thread. Transcripts are saved by one writer thread
 (`conversation_writer.rs`): at most one waiting save per thread, a newer save

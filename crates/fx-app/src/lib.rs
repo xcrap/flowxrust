@@ -22,6 +22,7 @@ mod configuration;
 mod conversation_search;
 mod conversation_writer;
 mod follow_up_settings;
+mod frame_profile;
 pub mod inspector;
 mod markdown;
 mod native_sync;
@@ -107,6 +108,12 @@ pub struct FlowX {
     poller: Option<gpui::Task<()>>,
     native_poller: Option<gpui::Task<()>>,
     polling: bool,
+    /// Drains updates the moment a turn reports one; see
+    /// [`Self::drain_and_repaint`].
+    waker: Option<gpui::Task<()>>,
+    /// What the last drain saw, so a wake and a poll that find the same thing
+    /// draw it once.
+    seen: Option<Seen>,
     autosave: Option<gpui::Task<()>>,
     focus: Option<gpui::FocusHandle>,
     focused_thread: Option<uuid::Uuid>,
@@ -133,6 +140,8 @@ impl FlowX {
             poller: None,
             native_poller: None,
             polling: false,
+            waker: None,
+            seen: None,
             autosave: None,
             focus: None,
             focused_thread: None,
@@ -269,6 +278,29 @@ impl FlowX {
                 );
             }
         }
+        if self.waker.is_none()
+            && let Some(mut wakes) = self.state.update(cx, |state, _| state.take_wake_receiver())
+        {
+            // A turn's update is drawn on the frame it arrives. Waiting for
+            // the poller instead put every streamed delta up to a tick late,
+            // which is what made streaming look like it came in steps.
+            self.waker = Some(cx.spawn(async move |this, cx| {
+                use futures::StreamExt as _;
+                while wakes.next().await.is_some() {
+                    // Everything that arrived with this wake is one drain.
+                    while wakes.try_recv().is_ok() {}
+                    if this
+                        .update(cx, |this, cx| this.drain_and_repaint(cx))
+                        .is_err()
+                    {
+                        break;
+                    }
+                    // At most one wake-driven drain per display frame. A
+                    // stream that writes faster than that is drawn in bulk.
+                    cx.background_executor().timer(WAKE_SPACING).await;
+                }
+            }));
+        }
         if !self.polling
             && (self.state.read(cx).any_busy()
                 || self.state.read(cx).has_title_jobs()
@@ -276,45 +308,19 @@ impl FlowX {
                 || ui.read(cx).is_checking()
                 || provider_catalog::is_refreshing())
         {
+            // The clock behind the waker: it notices a revision that moved
+            // without an update, runs the checkpoint and the queues, and is
+            // what a test clock drives.
             self.polling = true;
             self.poller = Some(cx.spawn(async move |this, cx| {
-                // What the previous tick saw. A tick that applies nothing and
-                // finds every running thread where it left it draws nothing:
-                // repainting the whole window thirty times a second while a
-                // turn thinks is the cost this exists to avoid.
-                let mut seen = None;
                 loop {
                     // The executor's timer rather than a wall-clock one, so a
                     // test clock can drive the poller.
                     cx.background_executor().timer(POLL_INTERVAL).await;
                     let keep_going = this
                         .update(cx, |this, cx| {
-                            let applied = this.state.update(cx, |state, cx| {
-                                let applied = state.drain_updates_with_context(cx);
-                                state.checkpoint(cx) || applied
-                            });
-                            dispatch_ready_queues(&this.state, cx);
-                            let ui = workspace_ui::handle(cx);
-                            ui.update(cx, |ui, cx| ui.poll(cx));
-                            let state = this.state.read(cx);
-                            let activity = [
-                                state.any_busy(),
-                                state.has_title_jobs(),
-                                state.has_ready_queues(),
-                                ui.read(cx).is_checking(),
-                                provider_catalog::is_refreshing(),
-                            ];
-                            let now = (activity, state.running_revisions());
-                            let busy = activity.contains(&true);
-                            // A finished turn still repaints unasked: its
-                            // `Finished` is an applied update, and the busy flag
-                            // it clears changes what this tick saw.
-                            let changed = applied || seen.as_ref() != Some(&now);
-                            seen = Some(now);
+                            let busy = this.drain_and_repaint(cx);
                             this.polling = busy;
-                            if changed {
-                                cx.notify();
-                            }
                             busy
                         })
                         .unwrap_or(false);
@@ -325,6 +331,43 @@ impl FlowX {
             }));
         }
         ui.update(cx, |ui, cx| ui.sync_request(&self.state, window, cx));
+    }
+
+    /// Apply what running turns have reported and repaint if anything on
+    /// screen changed. Returns whether anything is still busy.
+    ///
+    /// Shared by the waker and the poller, with what the previous pass saw
+    /// kept on the root so a wake and a tick that find the same thing draw it
+    /// once. A pass that applies nothing and finds every running thread where
+    /// it left it draws nothing: repainting the whole window thirty times a
+    /// second while a turn thinks is the cost this exists to avoid.
+    fn drain_and_repaint(&mut self, cx: &mut Context<Self>) -> bool {
+        let applied = self.state.update(cx, |state, cx| {
+            let applied = state.drain_updates_with_context(cx);
+            state.checkpoint(cx) || applied
+        });
+        dispatch_ready_queues(&self.state, cx);
+        let ui = workspace_ui::handle(cx);
+        ui.update(cx, |ui, cx| ui.poll(cx));
+        let state = self.state.read(cx);
+        let activity = [
+            state.any_busy(),
+            state.has_title_jobs(),
+            state.has_ready_queues(),
+            ui.read(cx).is_checking(),
+            provider_catalog::is_refreshing(),
+        ];
+        let now = (activity, state.running_revisions());
+        let busy = activity.contains(&true);
+        // A finished turn still repaints unasked: its `Finished` is an
+        // applied update, and the busy flag it clears changes what this pass
+        // saw.
+        let changed = applied || self.seen.as_ref() != Some(&now);
+        self.seen = Some(now);
+        if changed {
+            cx.notify();
+        }
+        busy
     }
 
     /// Note where the window now is, and write it once it settles.
@@ -364,6 +407,7 @@ impl Render for FlowX {
         {
             self.renders += 1;
         }
+        let build_started = frame_profile::begin_build();
         self.observe_workspace(window, cx);
 
         let now = std::time::Instant::now();
@@ -613,7 +657,10 @@ impl Render for FlowX {
                 },
             ));
         let root = sidebar::project_commands(root, &self.state, cx);
-        fx_design::components::context_frame(&frame_registry, root)
+        frame_profile::profiled(
+            fx_design::components::context_frame(&frame_registry, root),
+            build_started,
+        )
     }
 }
 
@@ -938,8 +985,16 @@ fn inspector_column(
 /// Left inset reserved for the traffic lights.
 const TRAFFIC_LIGHT_GUTTER: f32 = 88.0;
 
-/// How often the root collects what running turns have reported.
+/// How often the root collects what running turns have reported, between
+/// the wakes that deliver most of it.
 const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(33);
+
+/// The least time between two wake-driven drains: one frame at 120 Hz.
+const WAKE_SPACING: std::time::Duration = std::time::Duration::from_millis(8);
+
+/// What a drain compares against: which kinds of work are busy, and where
+/// every running thread's conversation is.
+type Seen = ([bool; 5], Vec<(uuid::Uuid, u64)>);
 
 /// The conversation column.
 fn center_column(
@@ -1705,7 +1760,11 @@ fn window_options(state: &Entity<AppState>, cx: &App) -> WindowOptions {
             appears_transparent: true,
             traffic_light_position: Some(gpui::point(px(16.0), px(19.0))),
         }),
-        window_background: WindowBackgroundAppearance::Transparent,
+        // Opaque, because nothing in the window is translucent: the design
+        // system rules out vibrancy and see-through chrome. A transparent
+        // window is composited against whatever is behind it on every frame,
+        // and loses the opaque fast path for nothing.
+        window_background: WindowBackgroundAppearance::Opaque,
         ..Default::default()
     }
 }
@@ -3043,6 +3102,53 @@ mod tests {
             renders(&mut test, window),
             quiet + 2,
             "the poller outlived the work"
+        );
+    }
+
+    #[test]
+    fn an_update_is_drawn_on_the_frame_it_arrives_rather_than_at_the_next_poll() {
+        // A streamed delta used to wait for the poller's next tick, up to
+        // 33 ms after the runner wrote it, which is what made streaming look
+        // like it came in steps. The sender rings a wake the root drains at
+        // once; the poll that follows finds nothing new and draws nothing.
+        let mut test = gpui::TestAppContext::single();
+        let (_dir, paths) = fresh_paths();
+        let state = test.update(|cx| cx.new(|cx| AppState::restore(paths, cx)));
+        let agent = Uuid::from_u128(7);
+        let _generation =
+            test.update(|cx| state.update(cx, |state, _| state.hold_title_job(agent)));
+        let for_window = state.clone();
+        let window = test.add_window(move |_, _| FlowX::new(for_window));
+        test.refresh().unwrap();
+        tick(&mut test, 1);
+        let quiet = renders(&mut test, window);
+
+        test.update(|cx| state.read(cx).update_sender_for(agent)(session::SessionUpdate::Changed));
+        // The clock has not moved, so no poll has run.
+        test.run_until_parked();
+        assert_eq!(
+            renders(&mut test, window),
+            quiet + 1,
+            "the change waited for the poller"
+        );
+        tick(&mut test, 1);
+        assert_eq!(
+            renders(&mut test, window),
+            quiet + 1,
+            "the poll drew the same change again"
+        );
+
+        // Several deltas inside one frame are one drain and one draw.
+        for _ in 0..5 {
+            test.update(|cx| {
+                state.read(cx).update_sender_for(agent)(session::SessionUpdate::Changed)
+            });
+        }
+        test.run_until_parked();
+        assert_eq!(
+            renders(&mut test, window),
+            quiet + 2,
+            "a burst of deltas drew more than once"
         );
     }
 

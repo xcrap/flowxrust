@@ -66,6 +66,12 @@ pub struct AppState {
     update_tx: std::sync::mpsc::Sender<crate::session::SessionUpdate>,
     targeted_updates: std::sync::mpsc::Receiver<(Uuid, crate::session::SessionUpdate)>,
     targeted_tx: std::sync::mpsc::SyncSender<(Uuid, crate::session::SessionUpdate)>,
+    /// Rung after every targeted update, so the root drains it on the frame it
+    /// arrives rather than at its next poll. A `std` channel cannot be awaited
+    /// from the foreground executor; this one can.
+    wake_tx: futures::channel::mpsc::UnboundedSender<()>,
+    /// The root takes this once, when it starts listening.
+    wake_rx: Option<futures::channel::mpsc::UnboundedReceiver<()>>,
     /// A failed read must never be followed by an empty write over the source.
     snapshot_writable: bool,
     protected_conversations: HashSet<Uuid>,
@@ -196,6 +202,7 @@ impl AppState {
         // Both halves of one channel: the runner sends, the render path receives.
         let (update_tx, updates) = std::sync::mpsc::channel();
         let (targeted_tx, targeted_updates) = std::sync::mpsc::sync_channel(256);
+        let (wake_tx, wake_rx) = futures::channel::mpsc::unbounded();
         Self {
             menu_layer: cx.new(|_| MenuLayer::default()),
             context_registry: cx.new(|_| ContextRegistry::default()),
@@ -210,6 +217,8 @@ impl AppState {
             update_tx,
             targeted_updates,
             targeted_tx,
+            wake_tx,
+            wake_rx: Some(wake_rx),
             snapshot_writable,
             protected_conversations: HashSet::new(),
             deleted_agents: HashSet::new(),
@@ -1668,11 +1677,17 @@ impl AppState {
     }
 
     /// Bind updates to their originating thread, independent of the current selection.
+    ///
+    /// Every update rings the root's wake, so a streamed delta is drawn on the
+    /// frame it arrives. The wake is rung even when a `Changed` was dropped as
+    /// redundant: the drain that follows reads the whole live conversation,
+    /// and a wake with nothing behind it costs one empty drain.
     pub fn update_sender_for(
         &self,
         agent_id: Uuid,
     ) -> impl Fn(crate::session::SessionUpdate) + Send + 'static {
         let sender = self.targeted_tx.clone();
+        let wake = self.wake_tx.clone();
         move |update| {
             if matches!(update, crate::session::SessionUpdate::Changed) {
                 // A pending redraw already exposes the whole live conversation.
@@ -1682,7 +1697,15 @@ impl AppState {
                 // Lifecycle and interaction updates must never be discarded.
                 let _ = sender.send((agent_id, update));
             }
+            let _ = wake.unbounded_send(());
         }
+    }
+
+    /// The wake the update senders ring, for whoever drains the updates.
+    ///
+    /// Given out once: a second root finds `None` and relies on its poller.
+    pub fn take_wake_receiver(&mut self) -> Option<futures::channel::mpsc::UnboundedReceiver<()>> {
+        self.wake_rx.take()
     }
 
     pub fn register_runner(&mut self, agent_id: Uuid, runner: crate::session::TurnRunner) {
