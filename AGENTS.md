@@ -981,8 +981,21 @@ diff viewer (`diff_view.rs`) and the commit composer (`commit_composer.rs`).
 The pure halves live in `fx-core::git`: `diff` parses, `operations` plans
 commits and pushes, `revision` hashes a snapshot.
 
-Six rules, each of which is a bug that was written first:
+Seven rules, each of which is a bug that was written first:
 
+- **A read never writes the index.** Agents run `git add` and `git commit` in
+  the same repositories, and a read holding `index.lock` fails theirs with
+  "File exists". Status honours `GIT_OPTIONAL_LOCKS=0` by refreshing in memory
+  only; porcelain `git diff` ignores it and rewrote the index on exit whenever
+  a file was stat-dirty (`touch`, a formatter, an edit and its revert). So
+  every diff is plumbing: `diff-files`, and `diff-index` against `HEAD` or, on
+  an unborn branch, the empty tree. Plumbing reads none of porcelain's diff
+  configuration, so two defaults are restated: `--ita-invisible-in-index`, and
+  `-M` or `-C` exactly when status reported a rename or copy, so the diff pairs
+  files as the list does. `diff-files --numstat` still lists a stat-dirty
+  binary as `-\t-`, so counts are kept only for paths status reports changed
+  on that side. Nothing FlowX runs refreshes the index, so a stat-dirty file
+  is read again by each poll until the user's own git refreshes it.
 - **One poller.** The title-bar count and the inspector both observe the one
   `RepositoryMonitor`, which reads every five seconds and notifies only when
   the read differs. Two timers ran `git status` and both numstat passes twice.
@@ -993,7 +1006,7 @@ Six rules, each of which is a bug that was written first:
   the `@@` counts say how many lines follow, and every one is content: a
   removed `-- comment` arrives as `--- comment`, an added `++i` as `+++i`. A
   conflicted file's combined diff (`diff --cc`) has a marker column per
-  parent, and each is stripped. `git diff --cached` prints only
+  parent, and each is stripped. `diff-index --cached` prints only
   `* Unmerged path <path>` for one, which opens a section of its own; read as
   metadata, it joined the previous file's section.
 - **A refresh never blanks the diff.** The selection is a path, not a status
@@ -1024,7 +1037,16 @@ git's whole combined output. A chosen-files commit is built in a temporary index
 beside the repository's own: chosen paths from the working tree, a rename's
 source as removed, then the user's index is reset to the commit for those
 paths only. `--only` took the source from the working tree too, so after
-`git mv old new` and a fresh `old`, the unchosen file was committed. Only a
+`git mv old new` and a fresh `old`, the unchosen file was committed. The
+temporary index starts as a copy of the user's, its modification time
+included, merged with `HEAD` by `read-tree -m -i`, so every entry `HEAD`
+matches keeps its stat data. `read-tree HEAD` alone kept none, and the commit
+then hashed every tracked file through its clean filter (LFS, git-crypt):
+314 ms for 4,000 files where `commit -- path` takes 29. The copy keeps the
+time because git rereads an entry only while it is as new as the index
+holding it; stamped now, a same-size rewrite made in the second the index was
+written passed as unchanged. `-i` keeps the working tree out of the merge,
+which otherwise refuses any file staged and then edited again. Only a
 rename has a source to remove: a copy (`status.renames=copies`) names one
 too, and treating it as a rename committed the source as deleted. That commit
 names no pathspec, so git's own "cannot do a partial commit during a merge"

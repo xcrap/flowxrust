@@ -1,11 +1,13 @@
 //! Bounded Git reads for the inspector, and the worker every Git job runs on.
 //!
-//! Reads never refresh or lock the index (`GIT_OPTIONAL_LOCKS=0` in the
-//! hardened environment), run without a pager or a filesystem monitor, and
-//! read pathspecs literally. Diffs disable external diff and textconv
-//! programs, so a repository's configuration cannot make a poll run a program.
+//! Reads never refresh or lock the index. `git status` refreshes it in memory
+//! only, under `GIT_OPTIONAL_LOCKS=0` in the hardened environment, and every
+//! diff is plumbing, which never writes it (see [`Comparison`]). Reads run
+//! without a pager or a filesystem monitor, and read pathspecs literally.
+//! Diffs disable external diff and textconv programs, so a repository's
+//! configuration cannot make a poll run a program.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::io::Read;
 use std::os::unix::ffi::OsStrExt;
@@ -256,8 +258,8 @@ pub async fn changes_snapshot(root: &Path) -> Result<Snapshot, String> {
         ));
     }
     let (unstaged_read, staged_read, remotes) = tokio::join!(
-        numstat(&root, false, status.needs_unstaged_stats),
-        numstat(&root, true, status.needs_staged_stats),
+        numstat(&root, &status, false),
+        numstat(&root, &status, true),
         command(&root, &["remote"], MAX_LIST_BYTES),
     );
     let (mut unstaged, unstaged_text, unstaged_notice) = unstaged_read;
@@ -315,32 +317,144 @@ fn is_directory_entry(root: &Path, relative: &str) -> bool {
         || std::fs::symlink_metadata(root.join(relative)).is_ok_and(|metadata| metadata.is_dir())
 }
 
+/// What a diff compares. Each is plumbing, which reads the index and never
+/// writes it.
+///
+/// Porcelain `git diff` refreshes the index on exit whenever a file is
+/// stat-dirty (rewritten with the same bytes, as `touch`, a formatter or an
+/// agent's edit-and-revert leave it), and it does not honour
+/// `GIT_OPTIONAL_LOCKS=0`. Each poll that ran it took `index.lock`, and an
+/// agent's `git add` or `git commit` at that moment failed with "File exists".
+#[derive(Clone, Copy)]
+enum Comparison<'a> {
+    /// The working tree against the index: `diff-files`.
+    WorkingTree,
+    /// The index against a tree: `diff-index --cached`.
+    Index(&'a str),
+    /// The working tree against a tree: `diff-index`.
+    Tree(&'a str),
+}
+
+impl<'a> Comparison<'a> {
+    /// The command and its options, then `options`, then the tree.
+    ///
+    /// Plumbing reads none of porcelain's diff configuration, so two of its
+    /// defaults are restated: an intent-to-add entry is a new file, not an
+    /// empty one already in the index, and renames and copies are detected as
+    /// [`rename_detection`] says.
+    fn args(self, renames: Option<&'a str>, options: &[&'a str]) -> Vec<&'a str> {
+        let mut args = vec![
+            match self {
+                Self::WorkingTree => "diff-files",
+                Self::Index(_) | Self::Tree(_) => "diff-index",
+            },
+            "--no-ext-diff",
+            "--no-textconv",
+            "--no-color",
+            "--ita-invisible-in-index",
+        ];
+        if let Self::Index(_) = self {
+            args.push("--cached");
+        }
+        args.extend(renames);
+        args.extend_from_slice(options);
+        if let Self::Index(tree) | Self::Tree(tree) = self {
+            args.push(tree);
+        }
+        args
+    }
+}
+
+/// Whether a status column reports a change on its side.
+fn changed(column: &str) -> bool {
+    column != " " && column != "?"
+}
+
+/// The rename detection that pairs files as the status read did: `-C` when
+/// it reported a copy, `-M` when it reported a rename, and none otherwise.
+///
+/// Porcelain `git diff` detected renames by default, as `diff.renames` said;
+/// plumbing reads no such setting, and status follows `status.renames` before
+/// it. The list beside the diff is status's, so the diff follows status.
+fn rename_detection<'a>(
+    columns: impl IntoIterator<Item = (&'a str, &'a str)>,
+) -> Option<&'static str> {
+    let mut detection = None;
+    for (staged, unstaged) in columns {
+        if staged == "C" || unstaged == "C" {
+            return Some("-C");
+        }
+        if staged == "R" || unstaged == "R" {
+            detection = Some("-M");
+        }
+    }
+    detection
+}
+
+/// What the index is compared with: `HEAD`, or on an unborn branch the empty
+/// tree, which `diff-index` has to be given by name.
+async fn head_or_empty_tree(root: &Path, has_commits: bool) -> Result<String, String> {
+    if has_commits {
+        Ok("HEAD".into())
+    } else {
+        empty_tree(root).await
+    }
+}
+
+/// One side's line counts: the working tree against the index, or with
+/// `cached` the index against `HEAD`. Only the paths status reports changed on
+/// that side keep their counts.
 async fn numstat(
     root: &Path,
+    status: &git::Status,
     cached: bool,
-    enabled: bool,
 ) -> (HashMap<String, LineCounts>, String, Option<String>) {
+    let (enabled, stage) = if cached {
+        (status.needs_staged_stats, "staged")
+    } else {
+        (status.needs_unstaged_stats, "unstaged")
+    };
     if !enabled {
         return (HashMap::new(), String::new(), None);
     }
-    let mut args = vec![
-        "diff",
-        "--no-ext-diff",
-        "--no-textconv",
-        "--no-color",
-        "--numstat",
-        "-z",
-    ];
-    if cached {
-        args.push("--cached");
-    }
-    let stage = if cached { "staged" } else { "unstaged" };
-    match command(root, &args, MAX_LIST_BYTES)
-        .await
-        .and_then(require_success)
-    {
+    let paths: HashSet<&str> = status
+        .files
+        .iter()
+        .filter(|file| {
+            changed(if cached {
+                &file.staged_status
+            } else {
+                &file.unstaged_status
+            })
+        })
+        .map(|file| file.path.as_str())
+        .collect();
+    let renames = rename_detection(
+        status
+            .files
+            .iter()
+            .map(|file| (file.staged_status.as_str(), file.unstaged_status.as_str())),
+    );
+    let read = async {
+        let base;
+        let comparison = if cached {
+            base = head_or_empty_tree(root, status.has_commits).await?;
+            Comparison::Index(&base)
+        } else {
+            Comparison::WorkingTree
+        };
+        let args = comparison.args(renames, &["--numstat", "-z"]);
+        command(root, &args, MAX_LIST_BYTES)
+            .await
+            .and_then(require_success)
+    };
+    match read.await {
         Ok(output) => {
-            let counts = GitStatusParser::parse_numstat(&output.stdout);
+            let mut counts = GitStatusParser::parse_numstat(&output.stdout);
+            // Without a refresh, `diff-files` reads a stat-dirty file's bytes
+            // to find it unchanged, and still lists a binary one as `-\t-`.
+            // Status, which refreshes in memory, lists neither.
+            counts.retain(|path, _| paths.contains(path.as_str()));
             let notice = output.truncated.then(|| {
                 format!(
                     "Line totals are partial: {stage} statistics exceeded the 1 MiB read limit."
@@ -454,10 +568,10 @@ fn complete_lines(text: &str) -> &str {
 
 /// Build the diff a comparison shows.
 ///
-/// Tracked changes come from one `git diff`; new files never appear there, so
-/// each is read directly under the same symlink and containment rules as the
-/// line counts and presented as a new-file section. Every source shares one
-/// byte budget.
+/// Tracked changes come from one [`Comparison`]; new files never appear there,
+/// so each is read directly under the same symlink and containment rules as
+/// the line counts and presented as a new-file section. Every source shares
+/// one byte budget.
 pub async fn project_diff(
     root: &Path,
     mode: ComparisonMode,
@@ -472,30 +586,33 @@ pub async fn project_diff(
 
     if visible.iter().any(|file| !file.is_untracked()) {
         let base = match mode {
-            ComparisonMode::Base if has_commits => Some("HEAD".to_string()),
-            // An unborn branch has no HEAD; its base is the empty tree.
-            ComparisonMode::Base => Some(empty_tree(root).await?),
-            _ => None,
+            ComparisonMode::Unstaged => String::new(),
+            ComparisonMode::Staged | ComparisonMode::Base => {
+                head_or_empty_tree(root, has_commits).await?
+            }
         };
-        let mut args = vec![
-            "-c",
-            "core.quotePath=false",
-            "diff",
-            "--no-ext-diff",
-            "--no-textconv",
-            "--no-color",
-            "--submodule=short",
-            // Explicit prefixes override `diff.noprefix` and
-            // `diff.mnemonicPrefix`, which the path parser relies on.
-            "--src-prefix=a/",
-            "--dst-prefix=b/",
-        ];
-        if mode == ComparisonMode::Staged {
-            args.push("--cached");
-        }
-        if let Some(base) = &base {
-            args.push(base);
-        }
+        let comparison = match mode {
+            ComparisonMode::Unstaged => Comparison::WorkingTree,
+            ComparisonMode::Staged => Comparison::Index(&base),
+            ComparisonMode::Base => Comparison::Tree(&base),
+        };
+        let renames = rename_detection(
+            files
+                .iter()
+                .map(|file| (file.staged_status.as_str(), file.unstaged_status.as_str())),
+        );
+        let mut args = vec!["-c", "core.quotePath=false"];
+        args.extend(comparison.args(
+            renames,
+            &[
+                "-p",
+                "--submodule=short",
+                // The path parser relies on these prefixes, whatever
+                // `diff.noprefix` and `diff.mnemonicPrefix` say.
+                "--src-prefix=a/",
+                "--dst-prefix=b/",
+            ],
+        ));
         let output = require_success(command(root, &args, remaining).await?)?;
         let text = if output.truncated {
             truncated = true;
@@ -832,6 +949,174 @@ mod tests {
         );
     }
 
+    /// Set a file's modification time an hour back, so the index's entry for
+    /// it is not racily clean and the same bytes written again leave it
+    /// stat-dirty at any timestamp resolution.
+    fn age(path: &Path) {
+        let hour_ago = std::time::SystemTime::now() - Duration::from_secs(3_600);
+        std::fs::File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(hour_ago)
+            .unwrap();
+    }
+
+    /// Everything a write of the index changes: its bytes, inode and mtime.
+    fn index_identity(root: &Path) -> (Vec<u8>, u64, std::time::SystemTime) {
+        use std::os::unix::fs::MetadataExt;
+        let index = root.join(".git/index");
+        let metadata = std::fs::metadata(&index).unwrap();
+        (
+            std::fs::read(&index).unwrap(),
+            metadata.ino(),
+            metadata.modified().unwrap(),
+        )
+    }
+
+    /// Porcelain `git diff` with the inspector's display options.
+    fn porcelain_diff(root: &Path, args: &[&str]) -> String {
+        let output = std::process::Command::new(git::GIT)
+            .args(["-c", "core.quotePath=false", "diff", "--no-ext-diff"])
+            .args(["--no-textconv", "--no-color", "--submodule=short"])
+            .args(["--src-prefix=a/", "--dst-prefix=b/"])
+            .args(args)
+            .current_dir(root)
+            .envs(git::hardened_environment())
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "git diff {args:?}");
+        String::from_utf8(output.stdout).unwrap()
+    }
+
+    #[test]
+    fn a_poll_never_writes_the_index_for_stat_dirty_files_and_shows_what_git_diff_shows() {
+        // Porcelain `git diff` refreshed the index on exit whenever a file was
+        // stat-dirty, so a poll beside a `touch` or a formatter took
+        // `index.lock`, and an agent's `git add` at that moment failed on it.
+        let temp = repository();
+        let root = temp.path();
+        let twelve: String = (1..=12).map(|line| format!("line {line}\n")).collect();
+        for (name, bytes) in [
+            ("same.txt", b"unchanged\n".as_slice()),
+            ("same.bin", b"un\0changed"),
+            ("real.txt", b"before\n"),
+            ("mode.sh", b"echo\n"),
+            ("staged.txt", b"base\n"),
+            ("old.txt", twelve.as_bytes()),
+        ] {
+            std::fs::write(root.join(name), bytes).unwrap();
+            age(&root.join(name));
+        }
+        std::os::unix::fs::symlink("same.txt", root.join("link")).unwrap();
+        git(root, &["add", "."]);
+        git(root, &["commit", "-qm", "initial"]);
+        std::fs::write(root.join("real.txt"), "after\n").unwrap();
+        std::fs::set_permissions(root.join("mode.sh"), std::fs::Permissions::from_mode(0o755))
+            .unwrap();
+        std::fs::write(root.join("staged.txt"), "staged\n").unwrap();
+        git(root, &["add", "staged.txt"]);
+        std::fs::write(root.join("staged.txt"), "staged and more\n").unwrap();
+        git(root, &["mv", "old.txt", "new.txt"]);
+        // Last, so no git write refreshes them: the same bytes again, and a
+        // link replaced by an identical one.
+        std::fs::write(root.join("same.txt"), "unchanged\n").unwrap();
+        std::fs::write(root.join("same.bin"), b"un\0changed").unwrap();
+        std::fs::remove_file(root.join("link")).unwrap();
+        std::os::unix::fs::symlink("same.txt", root.join("link")).unwrap();
+        let before = index_identity(root);
+
+        let snapshot = block_on(changes_snapshot(root)).unwrap();
+        assert!(snapshot.notice.is_none(), "{:?}", snapshot.notice);
+        let info = snapshot.repository.unwrap();
+        let paths: Vec<&str> = info.files.iter().map(|file| file.path.as_str()).collect();
+        assert_eq!(paths, ["mode.sh", "new.txt", "real.txt", "staged.txt"]);
+        let diff =
+            |mode| block_on(project_diff(&snapshot.root, mode, info.files.clone(), true)).unwrap();
+        let (unstaged, staged, base) = (
+            diff(ComparisonMode::Unstaged),
+            diff(ComparisonMode::Staged),
+            diff(ComparisonMode::Base),
+        );
+        let status = block_on(command(
+            root,
+            &["status", "--porcelain=v1", "--branch", "-z"],
+            MAX_LIST_BYTES,
+        ))
+        .unwrap();
+        let status = GitStatusParser::parse_status(&status.stdout);
+        let (unstaged_counts, _, notice) = block_on(numstat(root, &status, false));
+        assert!(notice.is_none());
+        assert!(
+            before == index_identity(root),
+            "a read wrote the index, which takes index.lock"
+        );
+        // `diff-files` itself lists the stat-dirty binary as `-\t-`; the
+        // counts keep only what status lists.
+        let listed = block_on(command(
+            root,
+            &Comparison::WorkingTree.args(None, &["--numstat", "-z"]),
+            MAX_LIST_BYTES,
+        ))
+        .unwrap();
+        assert!(listed.stdout.contains("-\t-\tsame.bin\0"), "{listed:?}");
+        assert!(!unstaged_counts.contains_key("same.bin"));
+
+        // Porcelain is read last, because it does write the index: that
+        // write is what proves every unchanged file above was stat-dirty.
+        let porcelain = |args: &[&str]| {
+            let mut sections = git::parse_unified_diff(&porcelain_diff(root, args));
+            sections.sort_by(|a, b| a.path.cmp(&b.path));
+            sections
+        };
+        assert_eq!(unstaged.sections, porcelain(&[]));
+        assert!(
+            before != index_identity(root),
+            "the fixture left porcelain no stat-dirty file to refresh"
+        );
+        assert_eq!(staged.sections, porcelain(&["--cached"]));
+        assert_eq!(base.sections, porcelain(&["HEAD"]));
+        let numstat_of = |args: &[&str]| {
+            GitStatusParser::parse_numstat(&porcelain_diff(
+                root,
+                &[&["--numstat", "-z"][..], args].concat(),
+            ))
+        };
+        let (porcelain_unstaged, porcelain_staged) = (numstat_of(&[]), numstat_of(&["--cached"]));
+        assert_eq!(unstaged_counts, porcelain_unstaged);
+        let counts = |map: &HashMap<String, LineCounts>, path: &str| {
+            let counts = map.get(path).copied().unwrap_or_default();
+            (counts.additions, counts.deletions)
+        };
+        for file in &info.files {
+            assert_eq!(
+                (file.unstaged_additions, file.unstaged_deletions),
+                counts(&porcelain_unstaged, &file.path),
+                "{}",
+                file.path
+            );
+            assert_eq!(
+                (file.staged_additions, file.staged_deletions),
+                counts(&porcelain_staged, &file.path),
+                "{}",
+                file.path
+            );
+        }
+        assert_eq!(counts(&porcelain_staged, "new.txt"), (0, 0), "a rename");
+    }
+
+    #[test]
+    fn renames_and_copies_are_detected_as_status_reported_them() {
+        assert_eq!(rename_detection([("M", " "), ("A", " "), ("?", "?")]), None);
+        assert_eq!(rename_detection([("R", " "), ("M", "M")]), Some("-M"));
+        assert_eq!(
+            rename_detection([(" ", "R")]),
+            Some("-M"),
+            "an intent-to-add file renamed in the working tree"
+        );
+        assert_eq!(rename_detection([("R", " "), ("C", " ")]), Some("-C"));
+    }
+
     #[test]
     fn diff_content_resembling_headers_is_classified_by_hunk_state() {
         let temp = repository();
@@ -1056,7 +1341,8 @@ mod tests {
         // A repository can disappear between the status and numstat reads.
         let temp = repository();
         std::fs::remove_dir_all(temp.path().join(".git")).unwrap();
-        let (counts, _, notice) = numstat(temp.path(), true, true).await;
+        let status = GitStatusParser::parse_status("## main\0M  a.txt\0");
+        let (counts, _, notice) = numstat(temp.path(), &status, true).await;
         assert!(counts.is_empty());
         assert!(notice.unwrap().contains("statistics are unavailable"));
     }

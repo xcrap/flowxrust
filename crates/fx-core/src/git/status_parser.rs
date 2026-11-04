@@ -32,10 +32,11 @@ pub struct Status {
     /// how a clone of an empty repository starts out.
     pub upstream_gone: bool,
     pub files: Vec<StatusLine>,
-    /// Some file has unstaged edits to a tracked path, so `git diff --numstat`
-    /// has work to do.
+    /// Some file has unstaged edits to a tracked path, so `git diff-files
+    /// --numstat` has work to do.
     pub needs_unstaged_stats: bool,
-    /// Some file has staged changes, so `git diff --cached --numstat` does.
+    /// Some file has staged changes, so `git diff-index --cached --numstat`
+    /// does.
     pub needs_staged_stats: bool,
 }
 

@@ -15,7 +15,7 @@
 //! The user's own hooks, signing and credential helpers still run: these are
 //! the user's commits, made the way their git makes them.
 
-use std::path::{Component, Path};
+use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
 
 use super::command::{self, CommandSpec};
@@ -138,12 +138,21 @@ async fn commit_chosen(
     }
     const PREPARE: &str = "Preparing the commit failed.";
     let index = TemporaryIndex::beside(root).await.ok_or(PREPARE)?;
-    let index_path = Some(index.0.as_path());
+    let index_path = Some(index.path.as_path());
     let born = read(root, &["rev-parse", "--verify", "--quiet", "HEAD"])
         .await
         .is_some();
     let base: Vec<String> = if born {
-        vec!["read-tree".into(), "HEAD".into()]
+        // `read-tree HEAD` carries no stat data, so the commit read and
+        // hashed every tracked file, through its clean filter (LFS,
+        // git-crypt): 314 ms for 4,000 files where git's own `commit -- path`
+        // takes 29, and long enough in an LFS repository to reach the write
+        // timeout. Merged into a copy of the user's index, `HEAD` keeps the
+        // stat data of every entry it matches. `-i` leaves the working tree
+        // out of the merge, which otherwise refuses any file staged and then
+        // edited again ("not uptodate. Cannot merge.").
+        index.seed().map_err(|error| format!("{PREPARE} {error}"))?;
+        vec!["read-tree".into(), "-m".into(), "-i".into(), "HEAD".into()]
     } else {
         vec!["read-tree".into(), "--empty".into()]
     };
@@ -226,20 +235,55 @@ async fn partial_commit_refusal(root: &Path) -> Option<String> {
 ///
 /// Beside it rather than in the system's temporary directory, so it has the
 /// repository's permissions: an index lists every path in the tree.
-struct TemporaryIndex(std::path::PathBuf);
+struct TemporaryIndex {
+    path: PathBuf,
+    /// The repository's own index.
+    own: PathBuf,
+}
 
 impl TemporaryIndex {
     async fn beside(root: &Path) -> Option<Self> {
         let own = read(root, &["rev-parse", "--git-path", "index"]).await?;
         let path = root.join(format!("{own}.flowx-{}", uuid::Uuid::new_v4().simple()));
-        Some(Self(path))
+        Some(Self {
+            path,
+            own: root.join(own),
+        })
+    }
+
+    /// Start as a copy of the repository's own index, modification time
+    /// included.
+    ///
+    /// Git trusts an entry's stat data only while the file is older than the
+    /// index holding it; one as new or newer is racily clean, and its bytes
+    /// are read again. A copy stamped now is newer than every entry, so a file
+    /// rewritten at the same size in the second the index was written would
+    /// pass as unchanged, and its new bytes would not be committed. A missing
+    /// index is an empty one to git, and is left missing.
+    fn seed(&self) -> std::io::Result<()> {
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut own = match std::fs::File::open(&self.own) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error),
+        };
+        // The open file's time, not the path's: git replaces its index by
+        // renaming a new one over it, and the copy must carry its own source's.
+        let modified = own.metadata()?.modified()?;
+        let mut copy = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&self.path)?;
+        std::io::copy(&mut own, &mut copy)?;
+        copy.set_modified(modified)
     }
 }
 
 impl Drop for TemporaryIndex {
     fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.0);
-        let mut lock = self.0.clone().into_os_string();
+        let _ = std::fs::remove_file(&self.path);
+        let mut lock = self.path.clone().into_os_string();
         lock.push(".lock");
         let _ = std::fs::remove_file(lock);
     }
@@ -753,6 +797,117 @@ mod tests {
             "first.txt\n"
         );
         assert_eq!(status(root), "?? later.txt\n");
+    }
+
+    /// Set a file's modification time `seconds` back.
+    fn age(path: &Path, seconds: u64) {
+        let then = std::time::SystemTime::now() - Duration::from_secs(seconds);
+        std::fs::File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(then)
+            .unwrap();
+    }
+
+    fn chosen(path: &str) -> CommitPlan {
+        CommitPlan::new(
+            "Chosen",
+            &CommitScope::Paths {
+                chosen: vec![path.into()],
+                sources: vec![],
+            },
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn a_chosen_commit_reads_only_the_files_it_commits() {
+        // `read-tree HEAD` carried no stat data, so the commit read and hashed
+        // every tracked file, and ran each through its clean filter.
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        git(root, &["init", "-q", "-b", "main"]);
+        identify(root);
+        // Notes every file it cleans, as LFS or git-crypt would clean it.
+        git(
+            root,
+            &[
+                "config",
+                "filter.probe.clean",
+                "echo %f >> .git/cleaned; cat",
+            ],
+        );
+        git(root, &["config", "filter.probe.smudge", "cat"]);
+        std::fs::write(root.join(".gitattributes"), "*.txt filter=probe\n").unwrap();
+        for n in 0..20 {
+            let file = root.join(format!("file{n}.txt"));
+            std::fs::write(&file, format!("file {n}\n")).unwrap();
+            // Older than the index, so no entry is racily clean.
+            age(&file, 3_600);
+        }
+        git(root, &["add", "."]);
+        git(root, &["commit", "-qm", "initial"]);
+        // Staged and then edited again, which the merge into the copy must
+        // not take as a reason to refuse.
+        std::fs::write(root.join("file1.txt"), "staged\n").unwrap();
+        git(root, &["add", "file1.txt"]);
+        std::fs::write(root.join("file1.txt"), "staged and more\n").unwrap();
+        std::fs::write(root.join("file0.txt"), "chosen\n").unwrap();
+        let cleaned = root.join(".git/cleaned");
+        std::fs::remove_file(&cleaned).unwrap();
+
+        run(commit(root, &chosen("file0.txt"))).unwrap();
+        let read: std::collections::BTreeSet<String> = std::fs::read_to_string(&cleaned)
+            .unwrap()
+            .lines()
+            .map(str::to_string)
+            .collect();
+        // The chosen file, and the one whose index entry `HEAD` does not match.
+        assert!(
+            read.iter()
+                .all(|name| name == "file0.txt" || name == "file1.txt"),
+            "{read:?}"
+        );
+        assert_eq!(git(root, &["show", "HEAD:file0.txt"]), "chosen\n");
+        assert_eq!(status(root), "MM file1.txt\n");
+        assert_eq!(git(root, &["show", ":file1.txt"]), "staged\n");
+        assert_no_temporary_index(root);
+    }
+
+    #[test]
+    fn a_chosen_file_rewritten_as_its_index_was_written_is_still_committed() {
+        // Copied at a time of its own, the temporary index was newer than the
+        // entry, so git trusted the entry's stat data, and a same-size rewrite
+        // in the second the user's index was written read as unchanged.
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        git(root, &["init", "-q", "-b", "main"]);
+        identify(root);
+        // As with whole-second timestamps, only git's race check can tell:
+        // the inode, size and mtime stay, and the ctime is not consulted.
+        git(root, &["config", "core.trustctime", "false"]);
+        let file = root.join("chosen.txt");
+        std::fs::write(&file, "before\n").unwrap();
+        age(&file, 3_600);
+        git(root, &["add", "."]);
+        git(root, &["commit", "-qm", "initial"]);
+        let written = std::fs::metadata(&file).unwrap().modified().unwrap();
+        let stamp = |path: &Path| {
+            std::fs::File::options()
+                .write(true)
+                .open(path)
+                .unwrap()
+                .set_modified(written)
+                .unwrap();
+        };
+        stamp(&root.join(".git/index"));
+        std::fs::write(&file, "after!\n").unwrap();
+        stamp(&file);
+
+        run(commit(root, &chosen("chosen.txt"))).unwrap();
+        assert_eq!(git(root, &["show", "HEAD:chosen.txt"]), "after!\n");
+        assert_eq!(status(root), "");
     }
 
     /// Run git where failing is the point, as a conflicted merge does.
