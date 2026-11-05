@@ -99,6 +99,10 @@ pub struct AppState {
     /// Claude threads whose context has been asked for this launch, so a
     /// failed or slow check is not repeated on every frame.
     context_probed: HashSet<Uuid>,
+    /// The account's usage limits by provider id, as the last turn on any of
+    /// its threads reported them. Live state, never saved: the next response
+    /// says what they are now.
+    rate_limits: HashMap<String, fx_agent::provider::RateLimits>,
     /// The revision, draft and image ids each transcript was handed to the writer at,
     /// or read from disk at. A version, never the bytes: the writer compares
     /// content by hash, so nothing here grows with the size of a transcript.
@@ -237,6 +241,7 @@ impl AppState {
             turn_banner: None,
             panel_save: None,
             context_probed: HashSet::new(),
+            rate_limits: HashMap::new(),
             saved_conversations: HashMap::new(),
             writer: Default::default(),
             loading: HashSet::new(),
@@ -1941,6 +1946,10 @@ impl AppState {
             }
             SessionUpdate::Refused { tool, reason } => {
                 tracing::info!(tool, reason, "a tool call was refused");
+            }
+            SessionUpdate::RateLimits { provider, limits } => {
+                self.rate_limits.insert(provider, limits);
+                should_save = false;
             }
             SessionUpdate::AutoTitle { .. } => unreachable!("handled before conversation updates"),
         }
@@ -3978,6 +3987,11 @@ impl AppState {
         Some((session, self.project_root_for(agent_id)?))
     }
 
+    /// The account's usage limits for a provider, as last reported.
+    pub fn rate_limits_for(&self, provider: &str) -> Option<&fx_agent::provider::RateLimits> {
+        self.rate_limits.get(provider)
+    }
+
     /// Record a context check, unless the thread has moved on since it was
     /// asked: a turn that ran meanwhile reported fresher figures itself.
     fn apply_probed_context(
@@ -4002,6 +4016,9 @@ impl AppState {
                 .is_none_or(|window| window == 0)
         {
             conversation.record_context(context.used, context.window);
+            if let Some(breakdown) = &context.breakdown {
+                conversation.record_context_breakdown(breakdown.clone());
+            }
         }
     }
 
@@ -6920,6 +6937,15 @@ mod persistence_tests {
                     used: 88_443,
                     window: 1_000_000,
                     model: Some("claude-opus-5-5[1m]".into()),
+                    breakdown: Some(fx_agent::provider::ContextBreakdown {
+                        categories: vec![fx_agent::provider::ContextCategory {
+                            name: "Messages".into(),
+                            tokens: 80_000,
+                            kind: fx_agent::provider::ContextCategoryKind::Used,
+                        }],
+                        total_tokens: 88_443,
+                        window: 1_000_000,
+                    }),
                 };
                 // An answer for a session the thread has left is dropped.
                 state.apply_probed_context(claude, "another-session", &report);
@@ -6941,6 +6967,13 @@ mod persistence_tests {
                     Some(&conversation.lock().unwrap()),
                 );
                 assert_eq!(usage.fraction(), Some(88_443.0 / 1_000_000.0));
+                // The check's breakdown is the gauge's detail.
+                let detail = crate::thread_presentation::context_detail(
+                    state,
+                    &agent,
+                    Some(&conversation.lock().unwrap()),
+                );
+                assert_eq!(detail.breakdown, vec![("Messages".into(), 80_000)]);
 
                 // A window a turn reported meanwhile is fresher; keep it.
                 conversation.lock().unwrap().record_context(5, 200_000);
@@ -6949,6 +6982,71 @@ mod persistence_tests {
                     conversation.lock().unwrap().usage().reported_context_window,
                     Some(200_000)
                 );
+            })
+        });
+    }
+
+    #[test]
+    fn usage_limits_are_kept_per_provider_and_shown_beside_the_gauge() {
+        use fx_agent::provider::{RateLimitKind, RateLimitStatus, RateLimitWindow, RateLimits};
+        let temp = tempfile::tempdir().unwrap();
+        let paths = AppPaths::at(temp.path().join("state"));
+        let test = gpui::TestAppContext::single();
+        let (state, project, claude, codex) = test.update(|cx| workspace(cx, &paths));
+        test.update(|cx| {
+            state.update(cx, |state, _| {
+                state.snapshot.projects[0].agents[0]
+                    .configuration
+                    .provider_id = Some("claude".into());
+                state.snapshot.projects[0].agents[1]
+                    .configuration
+                    .provider_id = Some("codex".into());
+                let limits = RateLimits {
+                    status: RateLimitStatus::Warning,
+                    windows: vec![RateLimitWindow {
+                        kind: RateLimitKind::SevenDay,
+                        used: 0.92,
+                        resets_at: None,
+                    }],
+                    plan: Some("max".into()),
+                };
+                state.apply_update(
+                    Some(claude),
+                    SessionUpdate::RateLimits {
+                        provider: "claude".into(),
+                        limits: limits.clone(),
+                    },
+                );
+                assert_eq!(state.rate_limits_for("claude"), Some(&limits));
+                assert_eq!(state.rate_limits_for("codex"), None);
+
+                let detail = |state: &mut AppState, agent_id| {
+                    let agent = state.thread(agent_id).unwrap().clone();
+                    let conversation = state.conversation(project, agent_id);
+                    crate::thread_presentation::context_detail(
+                        state,
+                        &agent,
+                        Some(&conversation.lock().unwrap()),
+                    )
+                };
+                let claude_detail = detail(state, claude);
+                assert_eq!(
+                    claude_detail
+                        .pressing_limit()
+                        .map(|limit| limit.label.to_string()),
+                    Some("Weekly limit".into())
+                );
+                assert!(detail(state, codex).limits.is_empty());
+
+                // The next report replaces it, for every thread of the provider.
+                state.apply_update(
+                    Some(claude),
+                    SessionUpdate::RateLimits {
+                        provider: "claude".into(),
+                        limits: RateLimits::default(),
+                    },
+                );
+                assert!(detail(state, claude).pressing_limit().is_none());
             })
         });
     }

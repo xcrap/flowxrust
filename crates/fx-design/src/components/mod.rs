@@ -28,7 +28,10 @@ pub mod turn_action;
 pub use change_indicator::{
     ChangeIndicatorPalette, change_indicator, change_indicator_palette, change_indicator_surface,
 };
-pub use context_meter::{ContextUsage, context_meter};
+pub use context_meter::{
+    ContextDetail, ContextUsage, LIMIT_CRITICAL_AT, LIMIT_WARNING_AT, UsageLimit,
+    context_detail_text, context_meter, usage_limit_badge, usage_limit_label, usage_limit_tone,
+};
 pub use provider_status::{ProviderIdentity, provider_status};
 pub use turn_action::{TurnAction, turn_action_button};
 

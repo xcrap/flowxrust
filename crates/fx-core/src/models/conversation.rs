@@ -193,6 +193,52 @@ pub enum MessageContent {
     Thinking {
         text: String,
     },
+    /// The provider compacted the context here: everything before was
+    /// summarized, and from this point the model reads the summary plus what
+    /// followed. Not prose. [`Self::as_text`] does not read it, so it is
+    /// neither searched nor compared against a provider's history, and the
+    /// transcript draws it as a boundary between the rows around it.
+    Compaction {
+        #[serde(default)]
+        trigger: CompactionTrigger,
+        /// Tokens in the context before and after, where the provider says.
+        #[serde(rename = "preTokens", default, skip_serializing_if = "Option::is_none")]
+        pre_tokens: Option<u64>,
+        #[serde(
+            rename = "postTokens",
+            default,
+            skip_serializing_if = "Option::is_none"
+        )]
+        post_tokens: Option<u64>,
+        /// What the model reads in place of the compacted history.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        summary: Option<String>,
+    },
+}
+
+/// What started a compaction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CompactionTrigger {
+    /// The provider compacted on its own as the window filled.
+    Auto,
+    /// The reader asked for it.
+    Manual,
+    /// The provider did not say, or said something this build does not know.
+    #[default]
+    #[serde(other)]
+    Unknown,
+}
+
+impl CompactionTrigger {
+    /// The provider's word for it. Both CLIs say `auto` or `manual`.
+    pub fn parse(trigger: &str) -> Self {
+        match trigger.trim().to_ascii_lowercase().as_str() {
+            "auto" | "automatic" => Self::Auto,
+            "manual" => Self::Manual,
+            _ => Self::Unknown,
+        }
+    }
 }
 
 impl MessageContent {
@@ -223,6 +269,11 @@ impl MessageContent {
     /// Whether this block is the model's reasoning.
     pub fn is_thinking(&self) -> bool {
         matches!(self, Self::Thinking { .. })
+    }
+
+    /// Whether this block marks a compaction of the context.
+    pub fn is_compaction(&self) -> bool {
+        matches!(self, Self::Compaction { .. })
     }
 }
 
@@ -348,6 +399,18 @@ mod tests {
             MessageContent::Thinking {
                 text: "Checking the tests first.".into(),
             },
+            MessageContent::Compaction {
+                trigger: CompactionTrigger::Auto,
+                pre_tokens: Some(610_207),
+                post_tokens: Some(22_223),
+                summary: Some("The user asked for a parser.".into()),
+            },
+            MessageContent::Compaction {
+                trigger: CompactionTrigger::Unknown,
+                pre_tokens: None,
+                post_tokens: None,
+                summary: None,
+            },
         ];
         for content in cases {
             let json = serde_json::to_string(&content).unwrap();
@@ -377,6 +440,42 @@ mod tests {
             MessageContent::Image { data, .. } => assert_eq!(data, bytes),
             other => panic!("decoded as {other:?}"),
         }
+    }
+
+    #[test]
+    fn a_compaction_is_not_text_and_reads_an_unknown_trigger_as_unknown() {
+        let m = ConversationMessage::new(
+            MessageRole::System,
+            vec![MessageContent::Compaction {
+                trigger: CompactionTrigger::Manual,
+                pre_tokens: Some(10),
+                post_tokens: None,
+                summary: Some("kept".into()),
+            }],
+        );
+        assert_eq!(m.text_content(), "");
+        assert!(m.content[0].is_compaction());
+
+        // A newer build's trigger reads as unknown rather than failing the
+        // whole message, and a bare marker needs none of the counts.
+        let json = r#"{"type":"compaction","trigger":"scheduled","preTokens":5}"#;
+        let back: MessageContent = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            back,
+            MessageContent::Compaction {
+                trigger: CompactionTrigger::Unknown,
+                pre_tokens: Some(5),
+                post_tokens: None,
+                summary: None,
+            }
+        );
+        let bare: MessageContent = serde_json::from_str(r#"{"type":"compaction"}"#).unwrap();
+        assert!(bare.is_compaction());
+        assert_eq!(CompactionTrigger::parse("Auto"), CompactionTrigger::Auto);
+        assert_eq!(
+            CompactionTrigger::parse("manual"),
+            CompactionTrigger::Manual
+        );
     }
 
     #[test]

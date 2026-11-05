@@ -13,10 +13,10 @@ pub mod services;
 
 pub use models::{
     Agent, AgentAccess, AgentConfiguration, AgentExecutionState, AppDefaults, ApprovalStatus,
-    Attachment, Conversation, ConversationImageAssetReference, ConversationMessage, GitFileStatus,
-    GitRepositoryInfo, MessageContent, MessageRole, NativeDefaults, Project, ResolvedConfiguration,
-    Timestamp, ToolApprovalRequest, ToolRiskLevel, UserInputOption, UserInputQuestion,
-    UserInputRequest, UserInputResponse,
+    Attachment, CompactionTrigger, Conversation, ConversationImageAssetReference,
+    ConversationMessage, GitFileStatus, GitRepositoryInfo, MessageContent, MessageRole,
+    NativeDefaults, Project, ResolvedConfiguration, Timestamp, ToolApprovalRequest, ToolRiskLevel,
+    UserInputOption, UserInputQuestion, UserInputRequest, UserInputResponse,
 };
 
 /// Provider and model identifiers used when a thread states none.

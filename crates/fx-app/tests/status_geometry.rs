@@ -144,7 +144,11 @@ impl Render for ProviderProbe {
                 self.0,
                 "Status",
             ))
-            .child(context_meter(self.1, ProviderIdentity::Claude))
+            .child(context_meter(
+                self.1,
+                &fx_design::components::ContextDetail::default(),
+                ProviderIdentity::Claude,
+            ))
     }
 }
 

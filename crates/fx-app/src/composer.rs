@@ -90,8 +90,9 @@ use std::rc::Rc;
 use fx_agent::conversation::state::VISIBLE_QUEUED_PROMPTS;
 use fx_core::models::{ConversationGoal, GoalStatus};
 use fx_design::components::{
-    BadgeTone, ButtonStyle, ContextUsage, IconButtonProps, ProviderIdentity, SegmentedOption,
-    TurnAction, badge, button, context_meter, icon_button, segmented_control, turn_action_button,
+    BadgeTone, ButtonStyle, ContextDetail, ContextUsage, IconButtonProps, ProviderIdentity,
+    SegmentedOption, TurnAction, badge, button, context_meter, icon_button, segmented_control,
+    turn_action_button, usage_limit_badge,
 };
 use fx_design::icon::Icon;
 use fx_design::styled::{FxStyled, px_len};
@@ -260,6 +261,9 @@ impl Picker {
 pub struct ComposerChrome {
     /// Compact context gauge, separate from the send/stop action.
     pub context_usage: Option<ContextUsage>,
+    /// What the gauge's tooltip says beyond the fill: what is in the window,
+    /// and the account's limits, which also badge the gauge when pressing.
+    pub context_detail: ContextDetail,
     pub provider: ProviderIdentity,
     /// A turn is running: the send button becomes a stop button.
     pub busy: bool,
@@ -830,13 +834,17 @@ fn control_row(
         .items_end()
         .gap(px_len(Spacing::SM))
         .child(controls)
+        // A usage limit that is nearly used up is said here, beside the gauge,
+        // rather than only in its tooltip: the next prompt may be the refused
+        // one.
+        .children(usage_limit_badge(&chrome.context_detail))
         // Only a known percentage is shown. A meter that does not know
         // drew an empty ring and a dash, which read as a stray line.
         .children(
             chrome
                 .context_usage
                 .filter(|usage| usage.fraction().is_some())
-                .map(|usage| context_meter(usage, chrome.provider)),
+                .map(|usage| context_meter(usage, &chrome.context_detail, chrome.provider)),
         )
         .child(primary_action(chrome, can_send))
         .into_any_element()

@@ -802,8 +802,12 @@ fn read_rollout_metadata(
                 context_found = true;
             }
             if result.context_tokens.is_none() && payload["type"] == "token_count" {
-                result.context_tokens =
-                    payload["info"]["last_token_usage"]["total_tokens"].as_u64();
+                // Less the reasoning, which the next request does not carry,
+                // as the live `thread/tokenUsage/updated` reader counts it.
+                let last = &payload["info"]["last_token_usage"];
+                result.context_tokens = last["total_tokens"].as_u64().map(|total| {
+                    total.saturating_sub(last["reasoning_output_tokens"].as_u64().unwrap_or(0))
+                });
                 if let Some(window) = payload["info"]["model_context_window"].as_u64() {
                     result.defaults.context_window_size = Some(window);
                 }
@@ -948,10 +952,21 @@ fn convert_turns(
                         )?;
                     }
                 }
-                // A compaction is a phase while the turn runs and leaves no
-                // row; the rest has nothing to show. Written as rows they were
-                // raw JSON, hundreds of them in a thread that used sub-agents.
-                ItemKind::Compaction | ItemKind::Hidden => {}
+                // A compaction is the boundary row it is live: Codex says
+                // nothing more about it than that it happened.
+                ItemKind::Compaction => push(
+                    MessageRole::System,
+                    vec![MessageContent::Compaction {
+                        trigger: fx_core::CompactionTrigger::Unknown,
+                        pre_tokens: None,
+                        post_tokens: None,
+                        summary: None,
+                    }],
+                    false,
+                )?,
+                // Nothing to show. Written as rows they were raw JSON,
+                // hundreds of them in a thread that used sub-agents.
+                ItemKind::Hidden => {}
             }
         }
     }
@@ -1444,10 +1459,13 @@ for line in sys.stdin:
         ]);
         let turns = json!([{"id":"turn","items":items}]);
         let restored = convert_turns("thread", turns.as_array().unwrap(), &json!({})).unwrap();
+        // The one System row is the compaction boundary, which the live turn
+        // shows too; nothing else becomes one.
         assert!(
-            restored
-                .iter()
-                .all(|message| message.role != MessageRole::System),
+            restored.iter().all(|message| {
+                message.role != MessageRole::System
+                    || message.content.iter().all(MessageContent::is_compaction)
+            }),
             "{restored:#?}"
         );
 
@@ -1480,6 +1498,7 @@ for line in sys.stdin:
             [
                 MessageRole::User,
                 MessageRole::Assistant,
+                MessageRole::System,
                 MessageRole::Assistant,
                 MessageRole::Tool,
                 MessageRole::Tool,
@@ -1487,6 +1506,8 @@ for line in sys.stdin:
                 MessageRole::Assistant,
             ]
         );
+        // The compaction is a boundary row, as it is live.
+        assert!(restored[2].content[0].is_compaction());
         // The thought is the summary, a row of its own among the work.
         assert_eq!(
             restored[1].content,
@@ -1579,7 +1600,7 @@ for line in sys.stdin:
             json!({"type":"turn_context","payload":{"model":"old","effort":"low","approval_policy":"never","sandbox_policy":{"type":"danger-full-access"}}}),
             json!({"type":"turn_context","payload":{"model":"current","effort":"high","approval_policy":"on-request","sandbox_policy":{"type":"workspace-write"}}}),
             json!({"type":"response_item","payload":{"padding":"x".repeat(CONTEXT_CHUNK as usize+60)}}),
-            json!({"type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"total_tokens":456},"total_token_usage":{"total_tokens":99999},"model_context_window":200000}}}),
+            json!({"type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"total_tokens":456,"reasoning_output_tokens":56},"total_token_usage":{"total_tokens":99999},"model_context_window":200000}}}),
         ];
         let write = |lines: &[Value]| {
             std::fs::write(
@@ -1599,7 +1620,8 @@ for line in sys.stdin:
             metadata.defaults.agent_access,
             Some(AgentAccess::AcceptEdits)
         );
-        assert_eq!(metadata.context_tokens, Some(456));
+        // 456 less the 56 reasoning tokens the next request does not carry.
+        assert_eq!(metadata.context_tokens, Some(400));
         assert_eq!(metadata.defaults.context_window_size, Some(200000));
         let wrong = read_rollout_metadata(&path, "different-thread", &cwd, fingerprint.clone());
         assert_eq!(wrong.defaults, NativeDefaults::default());

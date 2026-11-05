@@ -112,6 +112,10 @@ impl TranscriptActivityGroupingPolicy {
                 // is one step of them; on its own it is a turn that thought
                 // before it answered, which is still a group, not a message.
                 MessageContent::Thinking { .. } => true,
+                // A compaction is a boundary in the turn, not a step of its
+                // work: it closes the group before it and opens the one after,
+                // so the reader can see which calls the model still remembers.
+                MessageContent::Compaction { .. } => false,
                 // Any prose at all — even in the same message as a tool call —
                 // keeps the message narrative. Collapsing the two together
                 // would bury the words the model just said.
@@ -163,6 +167,31 @@ mod tests {
             ],
         );
         assert!(!TranscriptActivityGroupingPolicy::is_activity_only(&mixed));
+    }
+
+    #[test]
+    fn a_compaction_splits_the_work_around_it() {
+        let before = tool_use(MessageRole::Assistant, "a", "Read");
+        let compaction = message(
+            MessageRole::System,
+            MessageContent::Compaction {
+                trigger: crate::models::CompactionTrigger::Auto,
+                pre_tokens: Some(100),
+                post_tokens: Some(10),
+                summary: None,
+            },
+        );
+        let after = tool_use(MessageRole::Assistant, "b", "Read");
+        assert!(!TranscriptActivityGroupingPolicy::is_activity_only(
+            &compaction
+        ));
+        let messages = [before, compaction, after];
+        let segments = TranscriptActivityGroupingPolicy::segments(&messages);
+        assert_eq!(segments.len(), 3);
+        assert!(matches!(
+            segments[1],
+            TranscriptActivitySegment::Narrative { .. }
+        ));
     }
 
     fn tool_use(role: MessageRole, id: &str, name: &str) -> ConversationMessage {

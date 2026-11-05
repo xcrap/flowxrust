@@ -541,6 +541,40 @@ Two more, for how a turn ends:
   which is the call's arguments in the completed item's shape; both are
   `ToolOutputDelta` / `ToolInput`, and the live output is never recorded,
   because the completed item carries the whole.
+- **A compaction is a boundary, and its summary belongs to it.** Claude's
+  `system` `compact_boundary` (`compact_metadata`: the trigger, `pre_tokens`,
+  `post_tokens`) is the `Compacted` event. The synthetic user message after it
+  ("This session is being continued…", `isSynthetic` live, `isCompactSummary`
+  in the history) is what the model read in place of the dropped history,
+  never a prompt: live it is `CompactionSummary`, in the history it is
+  attached to the last boundary. Read as a prompt it was the thread's latest
+  prompt in the sidebar and split the turns around it. Codex reports its own
+  twice, as a `contextCompaction` item and the deprecated `thread/compacted`,
+  so `TurnNotifications` drops the second, and `compact()` synthesizes a
+  boundary only when neither arrived.
+- **What fills the context is asked for as the turn's input closes.** The CLI
+  reads stdin in order, so a `get_context_usage` control request (`detail:
+  full`, `CONTEXT_REQUEST_ID`) written just before `Close` is answered before
+  the exit, and its `control_response` is the `/context` breakdown
+  (`ContextBreakdown`) the gauge's tooltip lists. The idle probe
+  (`claude::catalog`) sends the same request and carries the same breakdown.
+  The report's `totalTokens` is the fill; a `used` category is in the window,
+  while `deferred`, `buffer` and `free` are not.
+- **Usage limits are the account's, not the thread's.** Claude's
+  `rate_limit_event` (`unifiedWindows`: five-hour and seven-day, absent for an
+  API-key account) and Codex's `account/rateLimits/updated` (`primary` and
+  `secondary`, named by `windowDurationMins`) both become
+  `ProviderEvent::RateLimits`, which the conversation ignores and the app
+  keeps per provider (`AppState::rate_limits`: live, never saved). Codex says
+  nothing before a turn, so `run_codex` reads `account/rateLimits/read` once
+  the thread is open, bounded to two seconds and never waited on by the
+  prompt; the fake answers it as an unknown method, which is the API-key
+  case. A window past `LIMIT_WARNING_AT` badges the composer beside the gauge.
+- **Codex's context fill is the last turn's total minus its reasoning.**
+  `thread/tokenUsage/updated`'s `last.totalTokens` counts
+  `reasoningOutputTokens`, which the next turn does not carry; the TUI
+  subtracts them, and so does `context_tokens` in `codex/session.rs`, live
+  and from a rollout's `last_token_usage`.
 - **Stop ends the tools too.** Each provider runs in its own process group
   (`fx-agent::process`), but its tools do not stay in it: `claude` starts each
   `Bash` call in a session of its own and `codex app-server` gives each command
@@ -793,6 +827,15 @@ Three more, for what a turn shows of itself while it works:
   that has not finished arriving. Every panel a row draws is in
   `group_paragraphs` too, in draw order, so an off-screen selection copies
   what the row would have shown.
+- **A compaction is a row of its own.** `MessageContent::Compaction` is a
+  System message between the work either side, and the grouping policy splits
+  the groups there: the model that did the second never saw the first, only
+  the summary. The row is a rule across the column with a caption ("Context
+  compacted automatically · 610k → 22k tokens") and, where the provider gave
+  one, a disclosure to the summary the model read, dimmed as a thought is. It
+  is not text: `as_text()` does not read it, so search, sync, previews and
+  copy never see it, and `message_paragraphs` reads the caption and the open
+  summary so an off-screen selection copies what the row shows.
 
 Tool output is read from `aggregatedOutput` first, then `output`, `result`,
 `error`, `contentItems`, `changes`, `results`, `agentsStates` — that order is the

@@ -2133,6 +2133,7 @@ name = "fx-app"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "chrono",
  "futures",
  "fx-agent",
  "fx-core",

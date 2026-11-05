@@ -111,6 +111,12 @@ pub enum SessionUpdate {
     GoalChanged {
         goal: Option<fx_core::models::ConversationGoal>,
     },
+    /// The provider reported the account's usage limits. Account-level, so
+    /// the app keeps one per provider rather than the thread keeping it.
+    RateLimits {
+        provider: String,
+        limits: fx_agent::provider::RateLimits,
+    },
 }
 
 /// A thread-level request that is not a prompt: what `/compact` and `/goal`
@@ -519,6 +525,10 @@ enum RuntimeProvider {
     Unsupported(String),
 }
 
+/// How long the first read of the account's limits may take before the turn
+/// goes ahead without it.
+const RATE_LIMITS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
 /// Everything one worker needs, gathered so it crosses the thread boundary in a
 /// single move.
 struct Job {
@@ -571,6 +581,15 @@ fn emit(sink: &UpdateSink, update: SessionUpdate) {
 }
 
 impl Job {
+    /// The provider's id, as the app's preferences and limits name it.
+    fn provider_id(&self) -> &str {
+        match &self.provider {
+            RuntimeProvider::Codex(_) => "codex",
+            RuntimeProvider::Claude { .. } => "claude",
+            RuntimeProvider::Unsupported(id) => id,
+        }
+    }
+
     async fn run(
         self,
         interrupts: tokio::sync::mpsc::UnboundedReceiver<()>,
@@ -680,6 +699,16 @@ impl Job {
                 thread_id: thread_id.clone(),
             },
         );
+
+        // The account's limits, which Codex reports as they change during a
+        // turn but says nothing about before one. Bounded, and an answer the
+        // turn does not wait on: an account without limits may refuse or
+        // never answer, and neither is a reason to hold the prompt.
+        if let Ok(Ok(Some(limits))) =
+            tokio::time::timeout(RATE_LIMITS_TIMEOUT, session.rate_limits()).await
+        {
+            self.apply(fx_agent::ProviderEvent::RateLimits(limits));
+        }
 
         // Whether `Accepted` went out from inside the turn, so a Stop that has to
         // report it afterwards does not report it twice. Atomic only because
@@ -1286,6 +1315,15 @@ impl Job {
     fn apply(&self, event: ProviderEvent) {
         if let Some((tool, reason)) = refused(&event) {
             emit(&self.on_update, SessionUpdate::Refused { tool, reason });
+        }
+        if let ProviderEvent::RateLimits(limits) = &event {
+            emit(
+                &self.on_update,
+                SessionUpdate::RateLimits {
+                    provider: self.provider_id().to_string(),
+                    limits: limits.clone(),
+                },
+            );
         }
         lock(&self.conversation).apply(event.clone());
         if matches!(
@@ -4120,7 +4158,11 @@ for line in sys.stdin:
             "the compaction was not waited for"
         );
         assert_eq!(conversation.phase(), Phase::Idle);
-        assert_eq!(conversation.message_count(), 0, "a control adds no rows");
+        // The one row a compaction adds is its boundary: where the model's
+        // memory of the thread was replaced by a summary.
+        let rows: Vec<_> = conversation.messages().collect();
+        assert_eq!(rows.len(), 1, "a control adds only the boundary: {rows:#?}");
+        assert!(rows[0].content[0].is_compaction());
     }
 
     #[test]

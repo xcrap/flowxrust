@@ -3,7 +3,7 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use fx_core::Timestamp;
+use fx_core::{CompactionTrigger, Timestamp};
 
 #[derive(Debug, thiserror::Error)]
 pub enum ProviderError {
@@ -157,6 +157,21 @@ pub enum ProviderEvent {
         used: u64,
         window: u64,
     },
+    /// What fills the context, by category, as Claude's `/context` counts it.
+    /// Carries the total and the window too, which are the freshest figures
+    /// the provider has.
+    ContextBreakdown(ContextBreakdown),
+    /// The provider compacted the context. The conversation records it where
+    /// it happened, as a boundary between the rows around it.
+    Compacted(Compaction),
+    /// What the model now reads in place of the compacted history. Claude
+    /// sends it as the message after the boundary; it belongs to the last
+    /// compaction that has none.
+    CompactionSummary(String),
+    /// The account's usage limits, as the provider read them off its last
+    /// response. Account-level, not the thread's: the app keeps one per
+    /// provider.
+    RateLimits(RateLimits),
     ModelChanged {
         model: String,
         reason: String,
@@ -238,9 +253,138 @@ impl TaskStatus {
 #[non_exhaustive]
 pub enum Lifecycle {
     TurnStarted,
+    /// The provider is summarizing the context. Ends with
+    /// [`ProviderEvent::Compacted`].
     Compacting,
-    Compacted,
     Preparing,
+}
+
+/// One compaction of the context, as the provider reported it.
+///
+/// Claude's `compact_boundary` names the trigger and the token counts either
+/// side; Codex's `contextCompaction` item names nothing, so every field has a
+/// default.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Compaction {
+    pub trigger: CompactionTrigger,
+    pub pre_tokens: Option<u64>,
+    pub post_tokens: Option<u64>,
+}
+
+/// What fills the context window, as Claude's `get_context_usage` reports it:
+/// the system prompt, the tools, memory files, the messages, the buffer kept
+/// for compaction, and what is free.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContextBreakdown {
+    pub categories: Vec<ContextCategory>,
+    /// Tokens in use, which is what the context meter shows.
+    pub total_tokens: u64,
+    /// The window these counts are measured against.
+    pub window: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContextCategory {
+    pub name: String,
+    pub tokens: u64,
+    pub kind: ContextCategoryKind,
+}
+
+/// What a category's tokens are doing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ContextCategoryKind {
+    /// In the context now.
+    #[default]
+    Used,
+    /// Loaded only when needed, so counted but not in use: deferred tools.
+    Deferred,
+    /// Kept free so compaction has room to work.
+    Buffer,
+    /// Not in use.
+    Free,
+}
+
+impl ContextCategoryKind {
+    pub fn parse(kind: &str) -> Self {
+        match kind {
+            "deferred" => Self::Deferred,
+            "buffer" => Self::Buffer,
+            "free" => Self::Free,
+            _ => Self::Used,
+        }
+    }
+}
+
+/// The account's usage limits, as the provider last read them.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct RateLimits {
+    /// Whether the account can still send, as of the last response.
+    pub status: RateLimitStatus,
+    /// Each window the provider tracks, in the provider's order.
+    pub windows: Vec<RateLimitWindow>,
+    /// The plan the limits belong to, where the provider names it.
+    pub plan: Option<String>,
+}
+
+impl RateLimits {
+    /// The fullest window, which is the one the reader needs to know about.
+    pub fn hottest(&self) -> Option<&RateLimitWindow> {
+        self.windows.iter().max_by(|a, b| a.used.total_cmp(&b.used))
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RateLimitStatus {
+    #[default]
+    Allowed,
+    /// Allowed, but the provider is warning that a window is nearly used up.
+    Warning,
+    /// The last request was refused for the limit.
+    Rejected,
+}
+
+/// One usage window: a fraction used, and when it resets.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RateLimitWindow {
+    pub kind: RateLimitKind,
+    /// The fraction of the window used. Usually within 0–1; a provider can
+    /// report more when usage legitimately ran past the cap.
+    pub used: f32,
+    pub resets_at: Option<Timestamp>,
+}
+
+/// Which window a limit is, named so both providers' windows read alike:
+/// Claude's `five_hour` and `seven_day`, Codex's primary and secondary by
+/// their durations.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RateLimitKind {
+    FiveHour,
+    SevenDay,
+    /// A window neither provider had when this was written, labelled as the
+    /// provider named it.
+    Other(String),
+}
+
+impl RateLimitKind {
+    /// A window by its length in minutes, which is how Codex names its two.
+    pub fn from_minutes(minutes: u64) -> Self {
+        match minutes {
+            300 => Self::FiveHour,
+            10_080 => Self::SevenDay,
+            minutes if minutes % 1440 == 0 => Self::Other(format!("{}-day", minutes / 1440)),
+            minutes if minutes % 60 == 0 => Self::Other(format!("{}-hour", minutes / 60)),
+            minutes => Self::Other(format!("{minutes}-minute")),
+        }
+    }
+
+    /// The window's name as the UI shows it.
+    pub fn label(&self) -> String {
+        match self {
+            Self::FiveHour => "5-hour limit".into(),
+            Self::SevenDay => "Weekly limit".into(),
+            Self::Other(name) => format!("{name} limit"),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]

@@ -103,6 +103,12 @@ const MESSAGE_COPY_SELECTOR: &str = "transcript.copy-message";
 const STREAMING_SELECTOR: &str = "transcript.streaming";
 /// The model's reasoning as it streams, in the tail or under a live group.
 const THINKING_SELECTOR: &str = "transcript.thinking";
+/// Where the provider compacted the context, drawn as a rule across the column.
+const COMPACTION_SELECTOR: &str = "transcript.compaction";
+/// The compaction's summary, shown while its disclosure is open.
+const COMPACTION_SUMMARY_SELECTOR: &str = "transcript.compaction-summary";
+/// The disclosure that opens and closes that summary.
+const COMPACTION_TOGGLE_SELECTOR: &str = "transcript.compaction-toggle";
 /// What a running call has printed so far, under its row.
 const LIVE_OUTPUT_SELECTOR: &str = "transcript.live-output";
 const HELD_STEER_SELECTOR: &str = "transcript.held-steer";
@@ -2597,6 +2603,141 @@ fn content_block(
             }
             Some(thought_block(text, place.key("thought")))
         }
+        MessageContent::Compaction {
+            trigger,
+            pre_tokens,
+            post_tokens,
+            summary,
+        } => Some(compaction_row(
+            *trigger,
+            *pre_tokens,
+            *post_tokens,
+            summary.as_deref(),
+            place,
+        )),
+    }
+}
+
+/// Where the provider summarized the conversation so far and went on from the
+/// summary: a rule across the column with what happened, and the summary the
+/// model read in place of what was dropped, behind a disclosure. It is what
+/// the model remembers from here on, so a reader who wonders why the model has
+/// forgotten something can see what it was told.
+fn compaction_row(
+    trigger: fx_core::CompactionTrigger,
+    pre_tokens: Option<u64>,
+    post_tokens: Option<u64>,
+    summary: Option<&str>,
+    place: Place,
+) -> AnyElement {
+    let theme = global::current();
+    let key = place.key("compaction");
+    let summary = summary.filter(|summary| !summary.trim().is_empty());
+    let open = summary.is_some() && is_disclosed(&key);
+    let caption = compaction_caption(trigger, pre_tokens, post_tokens);
+    let rule = || {
+        div()
+            .flex_1()
+            .h(px_len(BorderWidth::HAIRLINE))
+            .bg(Colors::border_subtle(&theme))
+    };
+    let mut header = div()
+        .w_full()
+        .min_w_0()
+        .flex()
+        .items_center()
+        .gap(px_len(Spacing::SM))
+        .child(rule())
+        .child(
+            div()
+                .flex_shrink_0()
+                .whitespace_nowrap()
+                .fx_caption()
+                .text_color(Colors::fg_tertiary(&theme))
+                .child(SelectableText::new(
+                    key.clone(),
+                    caption.clone(),
+                    StyledText::new(caption),
+                )),
+        );
+    if summary.is_some() {
+        // The row's id has to be its own: `text_disclosure` names its element
+        // after its label, and a thread compacted twice has two of these.
+        header = header.child(
+            div()
+                .id(SharedString::from(format!("{key}:toggle")))
+                .debug_selector(|| COMPACTION_TOGGLE_SELECTOR.to_string())
+                .child(text_disclosure(
+                    if open { "Hide summary" } else { "Show summary" },
+                    open,
+                    {
+                        let key = key.clone();
+                        move |_, _window, cx| {
+                            toggle_disclosure(&key);
+                            cx.refresh_windows();
+                        }
+                    },
+                )),
+        );
+    }
+    header = header.child(rule());
+    let mut row = div()
+        .debug_selector(|| COMPACTION_SELECTOR.to_string())
+        .w_full()
+        .min_w_0()
+        .flex()
+        .flex_col()
+        .gap(px_len(Spacing::SM))
+        .py(px_len(Spacing::XS))
+        .child(header);
+    if let Some(summary) = summary.filter(|_| open) {
+        row = row.child(
+            div()
+                .debug_selector(|| COMPACTION_SUMMARY_SELECTOR.to_string())
+                .w_full()
+                .min_w_0()
+                .child(thought_block(summary, place.key("summary"))),
+        );
+    }
+    row.into_any_element()
+}
+
+/// "Context compacted automatically · 610k → 22k tokens": what happened at a
+/// compaction, and the counts either side where the provider gave them.
+fn compaction_caption(
+    trigger: fx_core::CompactionTrigger,
+    pre_tokens: Option<u64>,
+    post_tokens: Option<u64>,
+) -> SharedString {
+    let mut caption = String::from(match trigger {
+        fx_core::CompactionTrigger::Auto => "Context compacted automatically",
+        fx_core::CompactionTrigger::Manual | fx_core::CompactionTrigger::Unknown => {
+            "Context compacted"
+        }
+    });
+    match (pre_tokens, post_tokens) {
+        (Some(before), Some(after)) => {
+            caption.push_str(&format!(
+                " · {} → {} tokens",
+                short_tokens(before),
+                short_tokens(after)
+            ));
+        }
+        (Some(before), None) => {
+            caption.push_str(&format!(" · {} tokens", short_tokens(before)));
+        }
+        _ => {}
+    }
+    caption.into()
+}
+
+/// A token count short enough for a caption: "842", "1.2k", "610k", "1.2M".
+fn short_tokens(count: u64) -> String {
+    match count {
+        0..=999 => count.to_string(),
+        1_000..=9_999 => format!("{:.1}k", count as f64 / 1_000.0),
+        10_000..=999_999 => format!("{}k", count / 1_000),
+        _ => format!("{:.1}M", count as f64 / 1_000_000.0),
     }
 }
 
@@ -2789,10 +2930,12 @@ fn has_copyable_text(message: &ConversationMessage) -> bool {
         MessageContent::Text { text } => !text.trim().is_empty(),
         MessageContent::Code { code, .. } => !code.is_empty(),
         MessageContent::ToolUse { .. } | MessageContent::ToolResult { .. } => true,
-        // What the model said to itself is not the answer a copy carries.
+        // What the model said to itself is not the answer a copy carries, and
+        // a compaction is the provider's bookkeeping, not the model's words.
         MessageContent::Image { .. }
         | MessageContent::ImageAsset(_)
-        | MessageContent::Thinking { .. } => false,
+        | MessageContent::Thinking { .. }
+        | MessageContent::Compaction { .. } => false,
     })
 }
 
@@ -2814,7 +2957,8 @@ fn copyable_text(message: &ConversationMessage) -> String {
             MessageContent::ToolResult { content, .. } => Some(content.clone()),
             MessageContent::Image { .. }
             | MessageContent::ImageAsset(_)
-            | MessageContent::Thinking { .. } => None,
+            | MessageContent::Thinking { .. }
+            | MessageContent::Compaction { .. } => None,
         })
         .filter(|part| !part.trim().is_empty())
         .collect();
@@ -3069,6 +3213,28 @@ fn message_paragraphs(message: &ConversationMessage, conversation: Uuid) -> Vec<
                     continue;
                 }
                 paragraphs.extend(crate::markdown::paragraphs(text, place.key("thought")));
+                continue;
+            }
+            // The caption, and the summary while the row is open, as the row
+            // draws them.
+            MessageContent::Compaction {
+                trigger,
+                pre_tokens,
+                post_tokens,
+                summary,
+            } => {
+                let key = place.key("compaction");
+                let summary = summary
+                    .as_deref()
+                    .filter(|summary| !summary.trim().is_empty());
+                paragraphs.push(Paragraph {
+                    key: key.clone(),
+                    text: compaction_caption(*trigger, *pre_tokens, *post_tokens),
+                    tight: false,
+                });
+                if let Some(summary) = summary.filter(|_| is_disclosed(&key)) {
+                    paragraphs.extend(crate::markdown::paragraphs(summary, place.key("summary")));
+                }
                 continue;
             }
             MessageContent::Image { .. } | MessageContent::ImageAsset(_) => continue,
@@ -7710,6 +7876,15 @@ mod tests {
                 },
             ],
         ));
+        conversation.append(message(
+            MessageRole::System,
+            vec![MessageContent::Compaction {
+                trigger: fx_core::CompactionTrigger::Auto,
+                pre_tokens: Some(610_207),
+                post_tokens: Some(22_223),
+                summary: Some("## Summary\n\n1. Asked a question.\n2. Read a file.".into()),
+            }],
+        ));
         conversation.append(text(MessageRole::User, "Run it."));
         conversation.apply(ProviderEvent::Lifecycle(Lifecycle::TurnStarted));
         conversation.apply(ProviderEvent::ThinkingDelta(
@@ -7739,12 +7914,20 @@ mod tests {
             })
             .unwrap();
         toggle_disclosure(&group);
+        let compaction = messages
+            .iter()
+            .find(|message| message.content.iter().any(MessageContent::is_compaction))
+            .map(|message| format!("{}:0:compaction", message.id))
+            .unwrap();
+        toggle_disclosure(&compaction);
 
         let (_test, _visual) = open(conversation, 900.0, 4_000.0);
         let painted = crate::selection::tests::painted_paragraphs();
         let document = crate::selection::tests::document_paragraphs();
         assert!(
-            painted.iter().any(|(key, ..)| key.ends_with(":failure"))
+            painted.iter().any(|(key, ..)| key.ends_with(":compaction"))
+                && painted.iter().any(|(key, ..)| key.contains(":0:summary"))
+                && painted.iter().any(|(key, ..)| key.ends_with(":failure"))
                 && painted
                     .iter()
                     .any(|(key, ..)| key.starts_with(STREAMING_PREFIX))
@@ -7758,6 +7941,146 @@ mod tests {
             "the fixture no longer reaches every kind of paragraph: {painted:#?}"
         );
         assert_eq!(document, painted);
+    }
+
+    // ── Compaction ──────────────────────────────────────────────────────────
+
+    fn compaction(summary: Option<&str>) -> ConversationMessage {
+        message(
+            MessageRole::System,
+            vec![MessageContent::Compaction {
+                trigger: fx_core::CompactionTrigger::Auto,
+                pre_tokens: Some(610_207),
+                post_tokens: Some(22_223),
+                summary: summary.map(str::to_owned),
+            }],
+        )
+    }
+
+    #[test]
+    fn a_compaction_caption_says_what_happened_and_how_much_was_kept() {
+        use fx_core::CompactionTrigger as T;
+        assert_eq!(
+            compaction_caption(T::Auto, Some(610_207), Some(22_223)).as_ref(),
+            "Context compacted automatically · 610k → 22k tokens"
+        );
+        assert_eq!(
+            compaction_caption(T::Manual, Some(1_234), Some(842)).as_ref(),
+            "Context compacted · 1.2k → 842 tokens"
+        );
+        assert_eq!(
+            compaction_caption(T::Unknown, None, None).as_ref(),
+            "Context compacted"
+        );
+        // Codex reports no counts; Claude's history has both.
+        assert_eq!(
+            compaction_caption(T::Auto, Some(1_200_000), None).as_ref(),
+            "Context compacted automatically · 1.2M tokens"
+        );
+        assert_eq!(short_tokens(999), "999");
+        assert_eq!(short_tokens(9_999), "10.0k");
+        assert_eq!(short_tokens(10_000), "10k");
+    }
+
+    #[test]
+    fn a_compaction_is_a_row_of_its_own_between_the_work_either_side() {
+        // The work before it and after it are two groups: the model that did
+        // the second never saw the first, only the summary.
+        let messages = [
+            text(MessageRole::User, "Do the thing."),
+            tool_use("t1", "Bash", r#"{"command":"ls"}"#),
+            tool_result("t1", "a\nb", false),
+            compaction(Some("1. Listed the files.")),
+            tool_use("t2", "Bash", r#"{"command":"cat a"}"#),
+            tool_result("t2", "contents", false),
+            text(MessageRole::Assistant, "Done."),
+        ];
+        let rows = build_rows(&borrowed(&messages), false, CONVERSATION);
+        let shape: Vec<&str> = rows
+            .iter()
+            .map(|row| match row {
+                Row::Activity(_) => "work",
+                Row::Message(message) if message.content[0].is_compaction() => "compaction",
+                Row::Message(_) => "message",
+            })
+            .collect();
+        assert_eq!(shape, ["message", "work", "compaction", "work", "message"]);
+        // The row is the provider's, with nothing in it the reader wrote or
+        // the model said: a copy of the thread skips it.
+        assert!(!has_copyable_text(&messages[3]));
+        assert_eq!(copyable_text(&messages[3]), "");
+    }
+
+    #[test]
+    fn a_compaction_row_opens_to_the_summary_the_model_read() {
+        let mut conversation = Conversation::new(Uuid::new_v4());
+        conversation.append(text(MessageRole::User, "Do the thing."));
+        conversation.append(compaction(Some(
+            "## Summary\n\n1. Asked a question.\n2. Read a file.",
+        )));
+        conversation.append(text(MessageRole::Assistant, "Continuing."));
+        let (mut test, mut visual) = open(conversation, 900.0, 2_000.0);
+        assert!(visual.debug_bounds(COMPACTION_SELECTOR).is_some());
+        let painted = crate::selection::tests::painted_paragraphs();
+        assert!(
+            painted
+                .iter()
+                .any(|(_, text, _)| text == "Context compacted automatically · 610k → 22k tokens"),
+            "{painted:#?}"
+        );
+        // Closed, the summary is not on screen and not in the document.
+        assert!(
+            !painted.iter().any(|(key, ..)| key.contains(":summary")),
+            "{painted:#?}"
+        );
+        assert_eq!(
+            crate::selection::tests::document_paragraphs(),
+            painted,
+            "the document reads what the rows draw"
+        );
+
+        let toggle = visual
+            .debug_bounds(COMPACTION_TOGGLE_SELECTOR)
+            .unwrap()
+            .center();
+        visual.simulate_mouse_down(toggle, gpui::MouseButton::Left, Default::default());
+        visual.simulate_mouse_up(toggle, gpui::MouseButton::Left, Default::default());
+        test.refresh().unwrap();
+        assert!(visual.debug_bounds(COMPACTION_SUMMARY_SELECTOR).is_some());
+        let painted = crate::selection::tests::painted_paragraphs();
+        assert!(
+            painted
+                .iter()
+                .any(|(key, text, _)| key.contains(":summary") && text.contains("Read a file.")),
+            "{painted:#?}"
+        );
+        assert_eq!(crate::selection::tests::document_paragraphs(), painted);
+
+        // Closed again on the next click. The list sits on its bottom, so the
+        // open summary moved the header up: find the toggle again.
+        let toggle = visual
+            .debug_bounds(COMPACTION_TOGGLE_SELECTOR)
+            .unwrap()
+            .center();
+        visual.simulate_mouse_down(toggle, gpui::MouseButton::Left, Default::default());
+        visual.simulate_mouse_up(toggle, gpui::MouseButton::Left, Default::default());
+        test.refresh().unwrap();
+        assert!(
+            !crate::selection::tests::painted_paragraphs()
+                .iter()
+                .any(|(key, ..)| key.contains(":summary"))
+        );
+    }
+
+    #[test]
+    fn a_compaction_without_a_summary_has_nothing_to_open() {
+        // Codex reports the compaction and nothing of what it kept.
+        let mut conversation = Conversation::new(Uuid::new_v4());
+        conversation.append(text(MessageRole::User, "Do the thing."));
+        conversation.append(compaction(None));
+        let (_test, mut visual) = open(conversation, 900.0, 2_000.0);
+        assert!(visual.debug_bounds(COMPACTION_SELECTOR).is_some());
+        assert!(visual.debug_bounds(COMPACTION_TOGGLE_SELECTOR).is_none());
     }
 
     // ── Long prompts ────────────────────────────────────────────────────────

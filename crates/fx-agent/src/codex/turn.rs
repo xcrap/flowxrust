@@ -615,6 +615,7 @@ impl CodexSession {
         ));
         let deadline = tokio::time::Instant::now() + COMPACTION_TIMEOUT;
         let mut notifications = TurnNotifications::new();
+        let mut compacted = false;
         loop {
             let next = tokio::time::timeout_at(deadline, self.transport.next_event())
                 .await
@@ -649,6 +650,7 @@ impl CodexSession {
                         if let ProviderEvent::Error(reason) = event {
                             return Err(ProviderError::Protocol(reason));
                         }
+                        compacted |= matches!(event, ProviderEvent::Compacted(_));
                         // The compaction turn's own completion is not an
                         // answer, and must not commit anything as one.
                         if !matches!(event, ProviderEvent::Done { .. }) {
@@ -656,10 +658,10 @@ impl CodexSession {
                         }
                     }
                     if finished {
-                        if method == "turn/completed" {
-                            sink(ProviderEvent::Lifecycle(
-                                crate::provider::Lifecycle::Compacted,
-                            ));
+                        // A compaction turn that completed without naming its
+                        // compaction still compacted; one boundary, not two.
+                        if !compacted {
+                            sink(ProviderEvent::Compacted(Default::default()));
                         }
                         return Ok(());
                     }
@@ -673,6 +675,19 @@ impl CodexSession {
                 }
             }
         }
+    }
+
+    /// The account's usage limits (`account/rateLimits/read`), or `None` for
+    /// an account that has none to report, such as an API key.
+    pub async fn rate_limits(&self) -> Result<Option<crate::provider::RateLimits>, ProviderError> {
+        let result = self
+            .transport
+            .request("account/rateLimits/read", Some(json!({})))
+            .await
+            .map_err(map_error)?;
+        Ok(super::session::rate_limits_of(
+            result.get("rateLimits").unwrap_or(&result),
+        ))
     }
 
     /// The thread's goal, if it has one (`thread/goal/get`).

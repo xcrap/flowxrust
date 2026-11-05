@@ -399,6 +399,8 @@ pub struct Conversation {
     tasks_revision: u64,
     /// The provider's session, once known.
     session_id: Option<String>,
+    /// What fills the context, as the provider last broke it down.
+    context_breakdown: Option<crate::provider::ContextBreakdown>,
     /// When the current or most recent turn began, for its elapsed time.
     turn_started_at: Option<Timestamp>,
     /// When the turn last moved on to something new: a call, a result, or a
@@ -1015,6 +1017,74 @@ impl Conversation {
         self.touch();
     }
 
+    /// Record what fills the context. Its total and window are the
+    /// provider's own count of the meter, so they replace what a reply's
+    /// usage estimated.
+    pub fn record_context_breakdown(&mut self, breakdown: crate::provider::ContextBreakdown) {
+        let (used, window) = (breakdown.total_tokens, breakdown.window);
+        self.context_breakdown = Some(breakdown);
+        self.record_context(used, window);
+    }
+
+    /// What fills the context, as the provider last broke it down.
+    pub fn context_breakdown(&self) -> Option<&crate::provider::ContextBreakdown> {
+        self.context_breakdown.as_ref()
+    }
+
+    /// Record a compaction where it happened: after whatever was streaming,
+    /// which is committed first, and before what the model says next. The
+    /// boundary is a row of its own, and the meter drops to what is left.
+    pub fn record_compaction(&mut self, compaction: crate::provider::Compaction) {
+        self.commit_streaming();
+        self.set_phase(self.working_phase());
+        self.record_activity("Context compacted", true);
+        if let Some(post_tokens) = compaction.post_tokens {
+            self.usage.current_context_tokens = post_tokens;
+        }
+        self.append(ConversationMessage::new(
+            fx_core::MessageRole::System,
+            vec![fx_core::MessageContent::Compaction {
+                trigger: compaction.trigger,
+                pre_tokens: compaction.pre_tokens,
+                post_tokens: compaction.post_tokens,
+                summary: None,
+            }],
+        ));
+        self.streaming_revision += 1;
+    }
+
+    /// Attach the summary the model now reads to the last compaction that
+    /// has none. One that arrives with no compaction to belong to is dropped:
+    /// nothing on screen could say what it summarized.
+    pub fn record_compaction_summary(&mut self, summary: String) {
+        if summary.trim().is_empty() {
+            return;
+        }
+        let Some(message) = self.messages.iter_mut().rev().find(|message| {
+            message.content.iter().any(|block| {
+                matches!(
+                    block,
+                    fx_core::MessageContent::Compaction { summary: None, .. }
+                )
+            })
+        }) else {
+            return;
+        };
+        let mut summary = Some(summary);
+        for block in &mut Arc::make_mut(message).content {
+            if let fx_core::MessageContent::Compaction {
+                summary: slot @ None,
+                ..
+            } = block
+            {
+                *slot = summary.take();
+                break;
+            }
+        }
+        self.message_revision += 1;
+        self.touch();
+    }
+
     // ── Unsent prompt ──────────────────────────────────────────────────────
 
     pub fn unsent(&self) -> Option<&UnsentPrompt> {
@@ -1300,10 +1370,6 @@ impl Conversation {
                     L::Compacting => {
                         self.set_phase(Phase::Compacting);
                     }
-                    L::Compacted => {
-                        self.set_phase(self.working_phase());
-                        self.record_activity("Context compacted", true);
-                    }
                     // A retry is starting over, but a wait on the reader is not
                     // answered by the provider reconnecting.
                     L::Preparing => {
@@ -1471,6 +1537,11 @@ impl Conversation {
             ProviderEvent::Usage(usage) => self.record_usage(usage),
             ProviderEvent::CumulativeUsage(usage) => self.record_cumulative_usage(usage),
             ProviderEvent::ContextUsage { used, window } => self.record_context(used, window),
+            ProviderEvent::ContextBreakdown(breakdown) => self.record_context_breakdown(breakdown),
+            ProviderEvent::Compacted(compaction) => self.record_compaction(compaction),
+            ProviderEvent::CompactionSummary(summary) => self.record_compaction_summary(summary),
+            // The account's, not the thread's: the app keeps it per provider.
+            ProviderEvent::RateLimits(_) => {}
             ProviderEvent::ModelChanged { model, reason } => {
                 self.record_activity(format!("Switched to {model}"), false);
                 if !reason.is_empty() {
@@ -1734,9 +1805,7 @@ mod tests {
             crate::provider::Lifecycle::Compacting,
         ));
         assert_eq!(c.phase(), Phase::Compacting);
-        c.apply(ProviderEvent::Lifecycle(
-            crate::provider::Lifecycle::Compacted,
-        ));
+        c.apply(ProviderEvent::Compacted(Default::default()));
         assert_eq!(c.phase(), Phase::Running);
     }
 
@@ -2646,6 +2715,82 @@ mod tests {
         assert_eq!(u.input_tokens, 30);
         assert_eq!(u.output_tokens, 10);
         assert_eq!(u.total_tokens, 43);
+    }
+
+    #[test]
+    fn a_compaction_is_a_boundary_row_that_takes_the_summary_after_it() {
+        use crate::provider::Compaction;
+        use fx_core::{CompactionTrigger, MessageRole};
+        let mut c = Conversation::new(Uuid::new_v4());
+        c.apply(ProviderEvent::Lifecycle(
+            crate::provider::Lifecycle::TurnStarted,
+        ));
+        c.record_context(100_000, 200_000);
+        c.apply(ProviderEvent::TextDelta("Reading the".into()));
+        c.apply(ProviderEvent::Lifecycle(
+            crate::provider::Lifecycle::Compacting,
+        ));
+        assert_eq!(c.phase(), Phase::Compacting);
+        c.apply(ProviderEvent::Compacted(Compaction {
+            trigger: CompactionTrigger::Auto,
+            pre_tokens: Some(100_000),
+            post_tokens: Some(9_000),
+        }));
+        // The reply streaming before it is committed ahead of the boundary,
+        // the phase is back to working, and the meter shows what is left.
+        assert_eq!(c.phase(), Phase::Running);
+        assert_eq!(c.usage().current_context_tokens, 9_000);
+        assert_eq!(c.usage().reported_context_window, Some(200_000));
+        let messages: Vec<_> = c.messages().collect();
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].text_content(), "Reading the");
+        assert_eq!(messages[1].role, MessageRole::System);
+        assert!(messages[1].content[0].is_compaction());
+
+        // The summary that follows belongs to it; a second one has nothing
+        // left to belong to and is dropped.
+        let revision = c.message_revision();
+        c.apply(ProviderEvent::CompactionSummary(
+            "The user asked for X.".into(),
+        ));
+        assert!(c.message_revision() > revision);
+        let messages: Vec<_> = c.messages().collect();
+        match &messages[1].content[0] {
+            MessageContent::Compaction {
+                trigger,
+                pre_tokens,
+                post_tokens,
+                summary,
+            } => {
+                assert_eq!(*trigger, CompactionTrigger::Auto);
+                assert_eq!((*pre_tokens, *post_tokens), (Some(100_000), Some(9_000)));
+                assert_eq!(summary.as_deref(), Some("The user asked for X."));
+            }
+            other => panic!("not a compaction: {other:?}"),
+        }
+        let revision = c.message_revision();
+        c.apply(ProviderEvent::CompactionSummary("stray".into()));
+        assert_eq!(c.message_revision(), revision);
+        assert_eq!(c.messages().count(), 2);
+    }
+
+    #[test]
+    fn a_context_breakdown_is_kept_and_sets_the_meter() {
+        use crate::provider::{ContextBreakdown, ContextCategory, ContextCategoryKind};
+        let mut c = Conversation::new(Uuid::new_v4());
+        c.record_context(50_000, 200_000);
+        c.apply(ProviderEvent::ContextBreakdown(ContextBreakdown {
+            categories: vec![ContextCategory {
+                name: "Messages".into(),
+                tokens: 3_000,
+                kind: ContextCategoryKind::Used,
+            }],
+            total_tokens: 26_851,
+            window: 1_000_000,
+        }));
+        assert_eq!(c.usage().current_context_tokens, 26_851);
+        assert_eq!(c.usage().reported_context_window, Some(1_000_000));
+        assert_eq!(c.context_breakdown().map(|b| b.categories.len()), Some(1));
     }
 
     #[test]

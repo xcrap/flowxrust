@@ -801,7 +801,9 @@ pub fn parse_notification(method: &str, params: &Value) -> Vec<ProviderEvent> {
                 ItemKind::Compaction if started => {
                     vec![ProviderEvent::Lifecycle(Lifecycle::Compacting)]
                 }
-                ItemKind::Compaction => vec![ProviderEvent::Lifecycle(Lifecycle::Compacted)],
+                // Codex names nothing about its compaction: no trigger, no
+                // counts, no summary. The row says only that it happened.
+                ItemKind::Compaction => vec![ProviderEvent::Compacted(Default::default())],
                 // Starting says nothing yet; the deltas do. Completed, the item
                 // is the thought whole, which the stateful reader turns into
                 // the end of the stream when the deltas already carried it.
@@ -949,14 +951,23 @@ pub fn parse_notification(method: &str, params: &Value) -> Vec<ProviderEvent> {
             let window = usage.get("modelContextWindow").and_then(Value::as_u64);
             if let Some(window) = window.filter(|w| *w > 0) {
                 events.push(ProviderEvent::ContextUsage {
-                    used: read(usage.get("last").unwrap_or(&Value::Null)).total_tokens,
+                    used: context_tokens(read(usage.get("last").unwrap_or(&Value::Null))),
                     window,
                 });
             }
             events
         }
 
-        "thread/compacted" => vec![ProviderEvent::Lifecycle(Lifecycle::Compacted)],
+        // The account's limits, read off the last response. Sparse: a rolling
+        // update may name one window and not the other.
+        "account/rateLimits/updated" => rate_limits_of(params.get("rateLimits").unwrap_or(params))
+            .map(ProviderEvent::RateLimits)
+            .into_iter()
+            .collect(),
+
+        // Deprecated in favour of the `contextCompaction` item, and sent as
+        // well as it. The stateful reader drops the second report.
+        "thread/compacted" => vec![ProviderEvent::Compacted(Default::default())],
 
         "thread/status/changed" => {
             let status = params.get("status").unwrap_or(params);
@@ -973,10 +984,7 @@ pub fn parse_notification(method: &str, params: &Value) -> Vec<ProviderEvent> {
                         .to_string(),
                 )]
             } else {
-                compaction_status(params)
-                    .map(ProviderEvent::Lifecycle)
-                    .into_iter()
-                    .collect()
+                compaction_status(params).into_iter().collect()
             }
         }
 
@@ -1009,13 +1017,13 @@ pub fn parse_notification(method: &str, params: &Value) -> Vec<ProviderEvent> {
 /// The status has arrived as a bare string, as `{type|state|status}`, and on
 /// the thread itself, depending on the build. Swift read all of them, and so
 /// does this.
-fn compaction_status(params: &Value) -> Option<Lifecycle> {
+fn compaction_status(params: &Value) -> Option<ProviderEvent> {
     let normalize = |value: &str| {
         let value = value.trim().to_ascii_lowercase();
         if value.contains("compacting") {
-            Some(Lifecycle::Compacting)
+            Some(ProviderEvent::Lifecycle(Lifecycle::Compacting))
         } else if value.contains("compacted") || value == "compact_boundary" {
-            Some(Lifecycle::Compacted)
+            Some(ProviderEvent::Compacted(Default::default()))
         } else {
             None
         }
@@ -1056,6 +1064,9 @@ pub struct TurnNotifications {
     /// from a server that does not echo ids: it is still the moment Codex
     /// read what had been written.
     prompt_recorded: bool,
+    /// A `contextCompaction` item completed, so the deprecated
+    /// `thread/compacted` that follows it is the same compaction again.
+    compaction_reported: bool,
 }
 
 impl TurnNotifications {
@@ -1113,10 +1124,81 @@ impl TurnNotifications {
                     return vec![ProviderEvent::TextEnd];
                 }
             }
+            "item/completed"
+                if params.pointer("/item/type").and_then(Value::as_str)
+                    == Some("contextCompaction") =>
+            {
+                self.compaction_reported = true;
+            }
+            "thread/compacted" if std::mem::take(&mut self.compaction_reported) => {
+                return Vec::new();
+            }
             _ => {}
         }
         events
     }
+}
+
+/// What a request's usage leaves in the context window.
+///
+/// Reasoning output is not carried into the next request, so counting it
+/// overstated the fill by every thought the model had this turn. Codex's own
+/// TUI makes the same subtraction.
+fn context_tokens(usage: Usage) -> u64 {
+    usage
+        .total_tokens
+        .saturating_sub(usage.reasoning_output_tokens)
+}
+
+/// Read a `RateLimitSnapshot`: a `primary` and a `secondary` window, each a
+/// percentage used, a reset time and a length in minutes, which is how the
+/// 5-hour and weekly windows are told apart. `None` where the snapshot names
+/// no window at all, as an API-key account's does.
+pub(super) fn rate_limits_of(snapshot: &Value) -> Option<crate::provider::RateLimits> {
+    use crate::provider::{RateLimitKind, RateLimitStatus, RateLimitWindow, RateLimits};
+    let window = |value: Option<&Value>, fallback: RateLimitKind| {
+        let value = value?;
+        let used = value.get("usedPercent").and_then(Value::as_f64)? as f32 / 100.0;
+        Some(RateLimitWindow {
+            kind: value
+                .get("windowDurationMins")
+                .and_then(Value::as_u64)
+                .map(RateLimitKind::from_minutes)
+                .unwrap_or(fallback),
+            used,
+            resets_at: value
+                .get("resetsAt")
+                .and_then(Value::as_i64)
+                .and_then(|seconds| chrono::DateTime::from_timestamp(seconds, 0)),
+        })
+    };
+    let windows: Vec<_> = [
+        window(snapshot.get("primary"), RateLimitKind::FiveHour),
+        window(snapshot.get("secondary"), RateLimitKind::SevenDay),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    if windows.is_empty() {
+        return None;
+    }
+    let status = if snapshot
+        .get("rateLimitReachedType")
+        .is_some_and(|reached| !reached.is_null())
+    {
+        RateLimitStatus::Rejected
+    } else {
+        RateLimitStatus::Allowed
+    };
+    Some(RateLimits {
+        status,
+        windows,
+        plan: snapshot
+            .get("planType")
+            .and_then(Value::as_str)
+            .filter(|plan| !plan.is_empty() && *plan != "unknown")
+            .map(str::to_owned),
+    })
 }
 
 fn parse_approval(method: &str, params: &Value) -> ApprovalRequest {
@@ -1715,30 +1797,23 @@ mod tests {
             "item/completed",
             &json!({ "item": { "type": "contextCompaction", "id": "c1" } }),
         );
-        assert_eq!(events, vec![ProviderEvent::Lifecycle(Lifecycle::Compacted)]);
+        assert_eq!(events, vec![ProviderEvent::Compacted(Default::default())]);
     }
 
     #[test]
     fn a_thread_status_reports_compaction_in_each_shape_codex_has_used() {
+        let compacting = ProviderEvent::Lifecycle(Lifecycle::Compacting);
+        let compacted = ProviderEvent::Compacted(Default::default());
         for (params, expected) in [
-            (json!({ "status": "compacting" }), Lifecycle::Compacting),
-            (
-                json!({ "status": { "type": "Compacted" } }),
-                Lifecycle::Compacted,
-            ),
-            (
-                json!({ "status": { "state": "compacting" } }),
-                Lifecycle::Compacting,
-            ),
-            (
-                json!({ "thread": { "status": "compacted" } }),
-                Lifecycle::Compacted,
-            ),
-            (json!({ "state": "compact_boundary" }), Lifecycle::Compacted),
+            (json!({ "status": "compacting" }), &compacting),
+            (json!({ "status": { "type": "Compacted" } }), &compacted),
+            (json!({ "status": { "state": "compacting" } }), &compacting),
+            (json!({ "thread": { "status": "compacted" } }), &compacted),
+            (json!({ "state": "compact_boundary" }), &compacted),
         ] {
             assert_eq!(
                 parse_notification("thread/status/changed", &params),
-                vec![ProviderEvent::Lifecycle(expected)],
+                vec![expected.clone()],
                 "{params}"
             );
         }
@@ -2001,11 +2076,82 @@ mod tests {
                     reasoning_output_tokens: 50,
                     total_tokens: 1020,
                 }),
+                // Less the request's reasoning, which the next request does
+                // not carry: 125 minus 5.
                 ProviderEvent::ContextUsage {
-                    used: 125,
+                    used: 120,
                     window: 272_000,
                 },
             ]
+        );
+    }
+
+    #[test]
+    fn rate_limits_read_both_windows_by_their_length() {
+        use crate::provider::{RateLimitKind, RateLimitStatus};
+        // The `RateLimitSnapshot` of codex-cli 0.164.
+        let snapshot = json!({
+            "planType": "plus",
+            "primary": {"usedPercent": 45, "resetsAt": 1793900000, "windowDurationMins": 300},
+            "secondary": {"usedPercent": 12, "resetsAt": 1793980800, "windowDurationMins": 10080},
+            "rateLimitReachedType": null
+        });
+        let limits = rate_limits_of(&snapshot).expect("two windows");
+        assert_eq!(limits.status, RateLimitStatus::Allowed);
+        assert_eq!(limits.plan.as_deref(), Some("plus"));
+        assert_eq!(
+            limits
+                .windows
+                .iter()
+                .map(|window| (window.kind.clone(), window.used))
+                .collect::<Vec<_>>(),
+            vec![
+                (RateLimitKind::FiveHour, 0.45),
+                (RateLimitKind::SevenDay, 0.12)
+            ]
+        );
+        assert_eq!(
+            limits.windows[0].resets_at.map(|at| at.timestamp()),
+            Some(1_793_900_000)
+        );
+        // A sparse update names one window; a reached limit is a rejection;
+        // a snapshot with no window at all is an account without limits.
+        let events = parse_notification(
+            "account/rateLimits/updated",
+            &json!({"rateLimits": {"primary": {"usedPercent": 100}, "rateLimitReachedType": "rate_limit_reached"}}),
+        );
+        let [ProviderEvent::RateLimits(limits)] = events.as_slice() else {
+            panic!("{events:?}");
+        };
+        assert_eq!(limits.status, RateLimitStatus::Rejected);
+        assert_eq!(limits.windows.len(), 1);
+        assert_eq!(limits.windows[0].kind, RateLimitKind::FiveHour);
+        assert!(rate_limits_of(&json!({"planType": "unknown"})).is_none());
+        assert_eq!(
+            RateLimitKind::from_minutes(1440),
+            RateLimitKind::Other("1-day".into())
+        );
+        assert_eq!(RateLimitKind::SevenDay.label(), "Weekly limit");
+    }
+
+    #[test]
+    fn the_deprecated_compacted_notification_repeats_the_item_and_is_dropped_once() {
+        let mut notifications = TurnNotifications::new();
+        let item = notifications.parse(
+            "item/completed",
+            &json!({"item": {"type": "contextCompaction", "id": "c1"}}),
+        );
+        assert_eq!(item, vec![ProviderEvent::Compacted(Default::default())]);
+        assert!(
+            notifications
+                .parse("thread/compacted", &json!({"threadId": "t"}))
+                .is_empty(),
+            "the same compaction, reported again"
+        );
+        // A build that sends only the notification still reports it.
+        assert_eq!(
+            notifications.parse("thread/compacted", &json!({"threadId": "t"})),
+            vec![ProviderEvent::Compacted(Default::default())]
         );
     }
 

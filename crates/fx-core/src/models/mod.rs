@@ -18,8 +18,8 @@ pub use agent::{
     ResolvedConfiguration,
 };
 pub use conversation::{
-    Attachment, Conversation, ConversationImageAssetReference, ConversationMessage, MessageContent,
-    MessageRole,
+    Attachment, CompactionTrigger, Conversation, ConversationImageAssetReference,
+    ConversationMessage, MessageContent, MessageRole,
 };
 pub use git::{GitFileStatus, GitRepositoryInfo};
 pub use goal::{ConversationGoal, GoalStatus};

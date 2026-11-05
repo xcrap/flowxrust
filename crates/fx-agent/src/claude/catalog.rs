@@ -16,7 +16,7 @@ use crate::Model;
 use crate::codex::framing::LineFramer;
 
 const REQUEST_ID: &str = "flowx-model-discovery";
-const CONTEXT_REQUEST_ID: &str = "flowx-context-usage";
+use super::stream::{CONTEXT_REQUEST_ID, context_breakdown_of, context_usage_request};
 const RESPONSE_LIMIT: usize = 1024 * 1024;
 const DISCOVERY_TIMEOUT: Duration = Duration::from_secs(15);
 const CLOSE_GRACE: Duration = Duration::from_millis(750);
@@ -50,6 +50,8 @@ pub struct SessionContext {
     pub window: u64,
     /// The model the window belongs to, such as `claude-opus-5-5[1m]`.
     pub model: Option<String>,
+    /// What fills the window, by category, where the report lists them.
+    pub breakdown: Option<crate::provider::ContextBreakdown>,
 }
 
 /// Ask Claude how full a saved session's context is, without a turn.
@@ -89,11 +91,7 @@ async fn query_context(command: Command, timeout: Duration) -> Result<SessionCon
             "request_id": REQUEST_ID,
             "request": {"subtype": "initialize", "hooks": {}}
         }),
-        json!({
-            "type": "control_request",
-            "request_id": CONTEXT_REQUEST_ID,
-            "request": {"subtype": "get_context_usage", "detail": "summary"}
-        }),
+        context_usage_request(),
     ];
     let response = control_query(command, &requests, CONTEXT_REQUEST_ID, timeout, &CONTEXT).await?;
     parse_context(&response)
@@ -114,6 +112,7 @@ fn parse_context(response: &Value) -> Result<SessionContext, String> {
             .as_str()
             .filter(|model| !model.is_empty())
             .map(str::to_owned),
+        breakdown: context_breakdown_of(response),
     })
 }
 
@@ -421,7 +420,7 @@ import json, sys
 init = json.loads(sys.stdin.readline())
 assert init["request"] == {"subtype":"initialize", "hooks":{}}, init
 ask = json.loads(sys.stdin.readline())
-assert ask == {"type":"control_request", "request_id":"flowx-context-usage", "request":{"subtype":"get_context_usage", "detail":"summary"}}, ask
+assert ask == {"type":"control_request", "request_id":"flowx-context-usage", "request":{"subtype":"get_context_usage", "detail":"full"}}, ask
 # A resumed session first replays tasks a killed process left behind.
 print(json.dumps({"type":"system","subtype":"task_notification","status":"stopped"}), flush=True)
 # And a CLI may print a line that is not JSON at all, which is not the answer.
@@ -437,12 +436,12 @@ open(sys.argv[1], 'w').write('closed')
             .await
             .unwrap();
         assert_eq!(
-            context,
-            SessionContext {
-                used: 88_443,
-                window: 1_000_000,
-                model: Some("claude-opus-5-5[1m]".into()),
-            }
+            (context.used, context.window, context.model.as_deref()),
+            (88_443, 1_000_000, Some("claude-opus-5-5[1m]"))
+        );
+        assert_eq!(
+            context.breakdown.map(|breakdown| breakdown.total_tokens),
+            Some(88_443)
         );
         assert!(
             seen.exists(),

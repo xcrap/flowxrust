@@ -74,6 +74,9 @@ pub struct ClaudeStreamParser {
     /// Set once a `thinking_delta` with text arrives, for the same reason: the
     /// assembled `assistant` frame repeats the whole thought.
     saw_thinking_delta: bool,
+    /// A compaction boundary has passed and the message saying what the model
+    /// now reads has not: the next synthetic user frame is that summary.
+    awaiting_compaction_summary: bool,
     /// The content blocks the current message has opened and not yet closed,
     /// by index. A delta names only its index, so this is how a
     /// `content_block_stop` is known to end a thought, and how a tool call's
@@ -340,6 +343,14 @@ impl ClaudeStreamParser {
             "user" => self.user(&envelope),
             "result" => self.result(&envelope),
             "command_lifecycle" => self.command_lifecycle(&envelope),
+            "rate_limit_event" => rate_limits_of(envelope.get("rate_limit_info"))
+                .map(ProviderEvent::RateLimits)
+                .into_iter()
+                .collect(),
+            "control_response" => context_report(&envelope)
+                .map(ProviderEvent::ContextBreakdown)
+                .into_iter()
+                .collect(),
             _ => Vec::new(),
         }
     }
@@ -546,7 +557,21 @@ impl ClaudeStreamParser {
                     vec![ProviderEvent::InputTaken { id: None }]
                 }
             }
-            Some("compact_boundary") => vec![ProviderEvent::Lifecycle(Lifecycle::Compacted)],
+            // The context was compacted. The boundary carries the trigger and
+            // the counts either side; the summary follows as a user frame.
+            Some("compact_boundary") => {
+                self.awaiting_compaction_summary = true;
+                let metadata = envelope.get("compact_metadata").unwrap_or(&Value::Null);
+                vec![ProviderEvent::Compacted(crate::provider::Compaction {
+                    trigger: metadata
+                        .get("trigger")
+                        .and_then(Value::as_str)
+                        .map(fx_core::CompactionTrigger::parse)
+                        .unwrap_or_default(),
+                    pre_tokens: metadata.get("pre_tokens").and_then(Value::as_u64),
+                    post_tokens: metadata.get("post_tokens").and_then(Value::as_u64),
+                })]
+            }
             Some("task_started") => self.task_started(envelope),
             Some("task_progress") => self.task_progress(envelope),
             Some("task_updated") => self.task_updated(envelope),
@@ -951,6 +976,22 @@ impl ClaudeStreamParser {
 
     /// Tool results, echoed back after Claude ran them.
     fn user(&mut self, envelope: &Value) -> Vec<ProviderEvent> {
+        // The frame after a compaction boundary is what the model now reads in
+        // place of the history. Nobody typed it: Claude marks it synthetic
+        // live and `isCompactSummary` in the history, and it is the only user
+        // frame of its kind, so it is the summary and not a prompt.
+        let flagged = |key: &str| envelope.get(key).and_then(Value::as_bool) == Some(true);
+        if (self.awaiting_compaction_summary && flagged("isSynthetic"))
+            || flagged("isCompactSummary")
+        {
+            self.awaiting_compaction_summary = false;
+            let summary = content_string(envelope.pointer("/message/content"));
+            return if summary.trim().is_empty() {
+                Vec::new()
+            } else {
+                vec![ProviderEvent::CompactionSummary(summary)]
+            };
+        }
         let Some(blocks) = envelope
             .pointer("/message/content")
             .and_then(Value::as_array)
@@ -977,6 +1018,8 @@ impl ClaudeStreamParser {
 
     /// The end of a turn: usage, then completion.
     fn result(&mut self, envelope: &Value) -> Vec<ProviderEvent> {
+        // A summary that has not arrived by the end of the turn is not coming.
+        self.awaiting_compaction_summary = false;
         if answers_notification(envelope) {
             self.follow_up_owed = false;
         }
@@ -1669,6 +1712,143 @@ fn write_canonical(value: &Value, out: &mut Vec<u8>) {
 }
 
 /// The readable text of a tool result, which may be a string or a block list.
+/// The id of FlowX's own `get_context_usage` request, written as a turn's
+/// input closes and by the idle context check. Only a response under this id
+/// is read as the context report.
+pub(crate) const CONTEXT_REQUEST_ID: &str = "flowx-context-usage";
+
+/// The request for what fills the context, in full: every category Claude's
+/// `/context` lists, with the total and the window.
+pub(crate) fn context_usage_request() -> Value {
+    json!({
+        "type": "control_request",
+        "request_id": CONTEXT_REQUEST_ID,
+        "request": { "subtype": "get_context_usage", "detail": "full" },
+    })
+}
+
+/// The context report in a `control_response` to FlowX's own request, if
+/// that is what the envelope is.
+fn context_report(envelope: &Value) -> Option<crate::provider::ContextBreakdown> {
+    let response = envelope.get("response")?;
+    if response.get("request_id").and_then(Value::as_str) != Some(CONTEXT_REQUEST_ID) {
+        return None;
+    }
+    context_breakdown_of(response.get("response")?)
+}
+
+/// Read Claude's context report: `categories`, each with a name, a token
+/// count and a kind, under `totalTokens` and `maxTokens`. Both totals are
+/// required; a report without them says nothing the meter can show.
+pub(crate) fn context_breakdown_of(report: &Value) -> Option<crate::provider::ContextBreakdown> {
+    use crate::provider::{ContextBreakdown, ContextCategory, ContextCategoryKind};
+    let total_tokens = report.get("totalTokens").and_then(Value::as_u64)?;
+    let window = report
+        .get("maxTokens")
+        .and_then(Value::as_u64)
+        .filter(|window| *window > 0)?;
+    let categories = report
+        .get("categories")
+        .and_then(Value::as_array)
+        .map(|categories| {
+            categories
+                .iter()
+                .filter_map(|category| {
+                    let name = category.get("name")?.as_str()?.trim();
+                    if name.is_empty() {
+                        return None;
+                    }
+                    Some(ContextCategory {
+                        name: name.to_string(),
+                        tokens: category.get("tokens").and_then(Value::as_u64).unwrap_or(0),
+                        kind: ContextCategoryKind::parse(
+                            category
+                                .get("kind")
+                                .and_then(Value::as_str)
+                                .unwrap_or("used"),
+                        ),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    Some(ContextBreakdown {
+        categories,
+        total_tokens,
+        window,
+    })
+}
+
+/// Read a `rate_limit_event`'s `rate_limit_info`.
+///
+/// `unifiedWindows` carries each subscription window the account has — the
+/// 5-hour and the weekly, and a per-model weekly where the account has one —
+/// as a fraction used and a reset time; the top-level fields describe only
+/// the window that is limiting now, and stand in for the windows where a
+/// build sends none. Absent for API-key accounts, whose responses carry no
+/// limits.
+fn rate_limits_of(info: Option<&Value>) -> Option<crate::provider::RateLimits> {
+    use crate::provider::{RateLimitKind, RateLimitStatus, RateLimitWindow, RateLimits};
+    let info = info?;
+    let status = match info.get("status").and_then(Value::as_str)? {
+        "allowed" => RateLimitStatus::Allowed,
+        "allowed_warning" => RateLimitStatus::Warning,
+        "rejected" => RateLimitStatus::Rejected,
+        _ => RateLimitStatus::Allowed,
+    };
+    let kind = |name: &str| match name {
+        "five_hour" => RateLimitKind::FiveHour,
+        "seven_day" => RateLimitKind::SevenDay,
+        "seven_day_opus" => RateLimitKind::Other("Weekly Opus".into()),
+        "seven_day_sonnet" => RateLimitKind::Other("Weekly Sonnet".into()),
+        "seven_day_overage_included" => RateLimitKind::Other("Weekly overage".into()),
+        other => RateLimitKind::Other(other.replace('_', " ")),
+    };
+    let reset = |value: Option<&Value>| {
+        value
+            .and_then(Value::as_i64)
+            .and_then(|seconds| chrono::DateTime::from_timestamp(seconds, 0))
+    };
+    let mut windows = Vec::new();
+    if let Some(unified) = info.get("unifiedWindows").and_then(Value::as_object) {
+        // The two every account has first, then whatever else the build sends.
+        let mut names: Vec<&str> = unified.keys().map(String::as_str).collect();
+        names.sort_by_key(|name| match *name {
+            "five_hour" => 0,
+            "seven_day" => 1,
+            _ => 2,
+        });
+        for name in names {
+            let window = &unified[name];
+            if let Some(used) = window.get("utilization").and_then(Value::as_f64) {
+                windows.push(RateLimitWindow {
+                    kind: kind(name),
+                    used: used as f32,
+                    resets_at: reset(window.get("resetsAt")),
+                });
+            }
+        }
+    }
+    if windows.is_empty()
+        && let Some(used) = info.get("utilization").and_then(Value::as_f64)
+    {
+        windows.push(RateLimitWindow {
+            kind: kind(
+                info.get("rateLimitType")
+                    .and_then(Value::as_str)
+                    .unwrap_or("five_hour"),
+            ),
+            used: used as f32,
+            resets_at: reset(info.get("resetsAt")),
+        });
+    }
+    Some(RateLimits {
+        status,
+        windows,
+        plan: None,
+    })
+}
+
 fn content_string(value: Option<&Value>) -> String {
     match value {
         Some(Value::String(text)) => text.clone(),
@@ -1886,7 +2066,173 @@ mod tests {
         })));
         assert_eq!(
             compacted,
-            vec![ProviderEvent::Lifecycle(Lifecycle::Compacted)]
+            vec![ProviderEvent::Compacted(Default::default())],
+            "a boundary with no metadata is still the boundary"
+        );
+    }
+
+    #[test]
+    fn a_compaction_boundary_is_a_row_and_the_synthetic_message_after_it_is_the_summary() {
+        // The frames a manual `/compact` wrote under Claude Code 2.1.283, in
+        // order: compacting, the boundary with its counts, the summary as a
+        // synthetic user frame, the command's own echo, and the result.
+        let mut parser = ClaudeStreamParser::new();
+        let mut events = Vec::new();
+        for frame in [
+            json!({"type": "system", "subtype": "status", "status": "compacting"}),
+            json!({"type": "system", "subtype": "status", "status": null, "compact_result": "success"}),
+            json!({"type": "system", "subtype": "init", "session_id": "s1"}),
+            json!({"type": "system", "subtype": "compact_boundary", "session_id": "s1",
+                   "compact_metadata": {"trigger": "manual", "pre_tokens": 35833, "post_tokens": 2728,
+                                        "cumulative_dropped_tokens": 33105, "duration_ms": 10611}}),
+            json!({"type": "user", "isSynthetic": true, "parent_tool_use_id": null,
+                   "message": {"role": "user", "content": "This session is being continued from a previous conversation.\n\nSummary:\n1. The user asked for X."}}),
+            json!({"type": "user", "isReplay": true, "parent_tool_use_id": null,
+                   "message": {"role": "user", "content": "<local-command-stdout>Compacted </local-command-stdout>"}}),
+            json!({"type": "result", "subtype": "success", "num_turns": 0,
+                   "usage": {"input_tokens": 0, "output_tokens": 0}}),
+        ] {
+            events.extend(parser.events(&line(frame)));
+        }
+        assert_eq!(
+            events[..4],
+            [
+                ProviderEvent::Lifecycle(Lifecycle::Compacting),
+                ProviderEvent::Lifecycle(Lifecycle::TurnStarted),
+                ProviderEvent::Compacted(crate::provider::Compaction {
+                    trigger: fx_core::CompactionTrigger::Manual,
+                    pre_tokens: Some(35_833),
+                    post_tokens: Some(2_728),
+                }),
+                ProviderEvent::CompactionSummary(
+                    "This session is being continued from a previous conversation.\n\nSummary:\n1. The user asked for X.".into()
+                ),
+            ]
+        );
+        // The echo is not a second summary, and the turn ends as any other.
+        assert!(
+            !events[4..]
+                .iter()
+                .any(|event| matches!(event, ProviderEvent::CompactionSummary(_))),
+            "{events:?}"
+        );
+        assert!(matches!(events.last(), Some(ProviderEvent::Done { .. })));
+
+        // A synthetic user frame with no boundary before it is not a summary.
+        let mut parser = ClaudeStreamParser::new();
+        let stray = parser.events(&line(json!({"type": "user", "isSynthetic": true,
+            "message": {"role": "user", "content": "nothing to belong to"}})));
+        assert!(stray.is_empty(), "{stray:?}");
+        // The history's own mark is read wherever it appears.
+        let marked = parser.events(&line(json!({"type": "user", "isCompactSummary": true,
+            "message": {"role": "user", "content": [{"type": "text", "text": "kept"}]}})));
+        assert_eq!(
+            marked,
+            vec![ProviderEvent::CompactionSummary("kept".into())]
+        );
+    }
+
+    #[test]
+    fn a_rate_limit_event_reads_every_window_and_the_status() {
+        use crate::provider::{RateLimitKind, RateLimitStatus};
+        let mut parser = ClaudeStreamParser::new();
+        // The frame Claude Code 2.1.283 wrote for a subscription account.
+        let events = parser.events(&line(
+            json!({"type": "rate_limit_event", "rate_limit_info": {
+            "status": "allowed_warning", "resetsAt": 1793980800, "rateLimitType": "seven_day",
+            "overageStatus": "rejected", "isUsingOverage": false,
+            "unifiedWindows": {
+                "seven_day": {"utilization": 0.46, "resetsAt": 1793980800},
+                "five_hour": {"utilization": 0.12, "resetsAt": 1793900000}
+            }}}),
+        ));
+        let [ProviderEvent::RateLimits(limits)] = events.as_slice() else {
+            panic!("{events:?}");
+        };
+        assert_eq!(limits.status, RateLimitStatus::Warning);
+        assert_eq!(
+            limits
+                .windows
+                .iter()
+                .map(|window| (window.kind.clone(), window.used))
+                .collect::<Vec<_>>(),
+            vec![
+                (RateLimitKind::FiveHour, 0.12),
+                (RateLimitKind::SevenDay, 0.46)
+            ],
+            "the 5-hour window first, whatever order the frame used"
+        );
+        assert_eq!(
+            limits.windows[1].resets_at.map(|at| at.timestamp()),
+            Some(1_793_980_800)
+        );
+        assert_eq!(
+            limits.hottest().map(|w| w.kind.clone()),
+            Some(RateLimitKind::SevenDay)
+        );
+
+        // A frame with only the limiting window's fields still names one.
+        let events = parser.events(&line(
+            json!({"type": "rate_limit_event", "rate_limit_info": {
+            "status": "rejected", "rateLimitType": "five_hour", "utilization": 1.0}}),
+        ));
+        let [ProviderEvent::RateLimits(limits)] = events.as_slice() else {
+            panic!("{events:?}");
+        };
+        assert_eq!(limits.status, RateLimitStatus::Rejected);
+        assert_eq!(limits.windows.len(), 1);
+        assert_eq!(limits.windows[0].kind, RateLimitKind::FiveHour);
+        // An API-key session carries none, and says nothing.
+        assert!(
+            parser
+                .events(&line(json!({"type": "rate_limit_event"})))
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn the_context_report_is_read_from_flowx_s_own_request_only() {
+        use crate::provider::ContextCategoryKind;
+        let mut parser = ClaudeStreamParser::new();
+        let report = json!({"categories": [
+            {"name": "System prompt", "tokens": 2482, "color": "promptBorder", "kind": "used"},
+            {"name": "MCP tools (deferred)", "tokens": 6481, "isDeferred": true, "kind": "deferred"},
+            {"name": "Messages", "tokens": 3422, "kind": "used"},
+            {"name": "Autocompact buffer", "tokens": 33000, "kind": "buffer"},
+            {"name": "Free space", "tokens": 940149, "kind": "free"}],
+            "totalTokens": 26851, "maxTokens": 1000000, "percentage": 3});
+        let events = parser.events(&line(json!({"type": "control_response", "response": {
+            "subtype": "success", "request_id": CONTEXT_REQUEST_ID, "response": report}})));
+        let [ProviderEvent::ContextBreakdown(breakdown)] = events.as_slice() else {
+            panic!("{events:?}");
+        };
+        assert_eq!(
+            (breakdown.total_tokens, breakdown.window),
+            (26_851, 1_000_000)
+        );
+        assert_eq!(breakdown.categories.len(), 5);
+        assert_eq!(breakdown.categories[1].kind, ContextCategoryKind::Deferred);
+        assert_eq!(breakdown.categories[3].kind, ContextCategoryKind::Buffer);
+        assert_eq!(breakdown.categories[4].kind, ContextCategoryKind::Free);
+        assert_eq!(breakdown.categories[2].tokens, 3_422);
+
+        // Another request's answer, and a report with no window, say nothing.
+        assert!(
+            parser
+                .events(&line(json!({"type": "control_response", "response": {
+            "subtype": "success", "request_id": "something-else", "response": report}})))
+                .is_empty()
+        );
+        assert!(
+            parser
+                .events(&line(json!({"type": "control_response", "response": {
+            "subtype": "success", "request_id": CONTEXT_REQUEST_ID,
+            "response": {"totalTokens": 5, "maxTokens": 0}}})))
+                .is_empty()
+        );
+        assert_eq!(
+            context_usage_request()["request"],
+            json!({"subtype": "get_context_usage", "detail": "full"})
         );
     }
 

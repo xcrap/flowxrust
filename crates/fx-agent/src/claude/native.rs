@@ -756,6 +756,38 @@ fn parse_file(
             "last-prompt" => {
                 parsed.last_prompt = nonempty(&object["lastPrompt"]);
             }
+            // The context was compacted here. The record carries the trigger
+            // and the counts either side; the summary is the next user record,
+            // marked `isCompactSummary`, and belongs to this row.
+            "system" if object["subtype"] == "compact_boundary" => {
+                if !include_messages {
+                    continue;
+                }
+                let metadata = &object["compactMetadata"];
+                let native_id = object["uuid"].as_str();
+                let message_id = native_id
+                    .and_then(|id| Uuid::parse_str(id).ok())
+                    .unwrap_or_else(|| {
+                        let namespace = Uuid::parse_str(id).expect("validated session ID");
+                        Uuid::new_v5(&namespace, native_id.map(str::as_bytes).unwrap_or(&line))
+                    });
+                positions.insert(message_id, messages.len());
+                messages.push(ConversationMessage {
+                    id: message_id,
+                    role: MessageRole::System,
+                    content: vec![MessageContent::Compaction {
+                        trigger: metadata["trigger"]
+                            .as_str()
+                            .map(fx_core::CompactionTrigger::parse)
+                            .unwrap_or_default(),
+                        pre_tokens: metadata["preTokens"].as_u64(),
+                        post_tokens: metadata["postTokens"].as_u64(),
+                        summary: None,
+                    }],
+                    timestamp: parse_timestamp(&object["timestamp"])
+                        .unwrap_or(DateTime::<Utc>::UNIX_EPOCH),
+                });
+            }
             kind @ ("user" | "assistant" | "attachment") => {
                 let assistant = kind == "assistant";
                 let content = if kind == "attachment" {
@@ -771,6 +803,18 @@ fn parse_file(
                     // around it into separate turns, so FlowX's copy of the
                     // thread never matched this history and the sync warned
                     // on every pass.
+                    // What the model reads in place of the compacted history.
+                    // Nobody typed it: it is not a prompt, and read as one it
+                    // was the thread's latest prompt in the sidebar. It is the
+                    // boundary's summary.
+                    if object["isCompactSummary"].as_bool() == Some(true) {
+                        if include_messages
+                            && let Some(summary) = full_text(&object["message"]["content"])
+                        {
+                            attach_compaction_summary(&mut messages, summary);
+                        }
+                        continue;
+                    }
                     if object["isMeta"].as_bool() == Some(true)
                         || object["origin"]["kind"].as_str() == Some("task-notification")
                         || is_claude_bookkeeping(&object)
@@ -1004,6 +1048,25 @@ fn content_string(value: &Value) -> String {
 /// state — and both split the turn around them, so FlowX's copy of a thread
 /// that was ever interrupted could not be found in its history. A synthetic
 /// API error is kept: it is what the turn said when it failed.
+/// Give a compaction's summary to the last boundary that has none.
+fn attach_compaction_summary(messages: &mut [ConversationMessage], summary: String) {
+    if summary.trim().is_empty() {
+        return;
+    }
+    let slot = messages.iter_mut().rev().find_map(|message| {
+        message.content.iter_mut().find_map(|block| match block {
+            MessageContent::Compaction {
+                summary: slot @ None,
+                ..
+            } => Some(slot),
+            _ => None,
+        })
+    });
+    if let Some(slot) = slot {
+        *slot = Some(summary);
+    }
+}
+
 fn is_claude_bookkeeping(record: &Value) -> bool {
     let message = &record["message"];
     if record["type"] == "assistant" {
@@ -1044,7 +1107,8 @@ fn steer_prompt(record: &Value) -> Option<&Value> {
     (typed && (prompt.is_string() || prompt.is_array())).then_some(prompt)
 }
 
-fn prompt_text(value: &Value) -> Option<String> {
+/// A record's text, whole: a string, or its text blocks joined.
+fn full_text(value: &Value) -> Option<String> {
     let text = value.as_str().map(str::to_owned).or_else(|| {
         value.as_array().map(|blocks| {
             blocks
@@ -1056,14 +1120,20 @@ fn prompt_text(value: &Value) -> Option<String> {
         })
     })?;
     let text = text.trim();
-    (!text.is_empty()).then(|| {
+    (!text.is_empty()).then(|| text.to_owned())
+}
+
+/// A prompt's first line, as the sidebar previews it.
+fn prompt_text(value: &Value) -> Option<String> {
+    let text = full_text(value)?;
+    Some(
         text.lines()
             .next()
-            .unwrap_or(text)
+            .unwrap_or(&text)
             .chars()
             .take(200)
-            .collect()
-    })
+            .collect(),
+    )
 }
 
 /// How large a conversation a reply answered: everything sent, cached or not,
@@ -1599,6 +1669,69 @@ mod tests {
         assert_eq!(
             store.read(fixture.root(), SESSION).unwrap().messages.len(),
             700
+        );
+    }
+
+    #[test]
+    fn a_compaction_boundary_is_a_row_and_its_summary_is_not_a_prompt() {
+        // The records Claude Code 2.1.283 writes: the boundary with its
+        // counts, then the summary as a user record marked `isCompactSummary`.
+        let fixture = Fixture::new();
+        let user = fixture.record("user", "Question", Uuid::new_v4());
+        let first = fixture.record("assistant", "First", Uuid::new_v4());
+        let boundary = json!({"type":"system","subtype":"compact_boundary","uuid":Uuid::new_v4(),
+            "sessionId":SESSION,"cwd":fixture.root(),"timestamp":"2026-10-12T12:01:00.000Z",
+            "content":"Conversation compacted","level":"info",
+            "compactMetadata":{"trigger":"auto","preTokens":610207,"postTokens":22223,"cumulativeDroppedTokens":587984}});
+        let mut summary = fixture.record(
+            "user",
+            "This session is being continued from a previous conversation.\n\nSummary:\n1. Asked a question.",
+            Uuid::new_v4(),
+        );
+        summary["isCompactSummary"] = json!(true);
+        let second = fixture.record("assistant", "Second", Uuid::new_v4());
+        fixture.write(&[user, first, boundary, summary, second]);
+        let store = fixture.store();
+        let thread = store.read(fixture.root(), SESSION).unwrap();
+        assert_eq!(
+            thread
+                .messages
+                .iter()
+                .map(|message| message.role)
+                .collect::<Vec<_>>(),
+            [
+                MessageRole::User,
+                MessageRole::Assistant,
+                MessageRole::System,
+                MessageRole::Assistant,
+            ],
+            "the summary is the boundary's, not a prompt of its own"
+        );
+        match &thread.messages[2].content[0] {
+            MessageContent::Compaction {
+                trigger,
+                pre_tokens,
+                post_tokens,
+                summary,
+            } => {
+                assert_eq!(*trigger, fx_core::CompactionTrigger::Auto);
+                assert_eq!((*pre_tokens, *post_tokens), (Some(610_207), Some(22_223)));
+                assert!(
+                    summary
+                        .as_deref()
+                        .is_some_and(|summary| summary.ends_with("1. Asked a question."))
+                );
+            }
+            other => panic!("not a compaction: {other:?}"),
+        }
+        // The listing's latest prompt is still the reader's own.
+        let index = store.list(fixture.root()).unwrap();
+        assert_eq!(index.threads.len(), 1);
+        assert!(
+            !index.threads[0]
+                .summary
+                .title
+                .contains("This session is being continued")
         );
     }
 

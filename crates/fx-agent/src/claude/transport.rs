@@ -1258,7 +1258,19 @@ async fn deliver_line(
         // answered still holds this pipe open until it does not. Closed before
         // the line's events go out, so a reader handed this `result` already
         // sees the input as it will stay.
-        close_stdin(&inner.input, stdin).await;
+        let mut input = inner.input.lock().await;
+        if input.close() {
+            // One question first: what fills the context now. Claude reads
+            // its input in order, so it answers from its own count before it
+            // reaches the end of the pipe, and the answer arrives as a frame
+            // like any other. Nothing waits on it, so a CLI that never answers
+            // costs nothing.
+            if let Ok(mut bytes) = serde_json::to_vec(&super::stream::context_usage_request()) {
+                bytes.push(b'\n');
+                let _ = stdin.send(Write::Message(bytes)).await;
+            }
+            let _ = stdin.send(Write::Close).await;
+        }
     }
     for event in produced {
         // Awaited: the queue is bounded, so `send` is a future. Discarding it
@@ -1878,6 +1890,44 @@ mod process {
         assert_eq!(message["message"]["content"][0]["text"], "hello there");
         assert_eq!(message["session_id"], "");
         assert!(message["parent_tool_use_id"].is_null());
+    }
+
+    #[tokio::test]
+    async fn a_finished_turn_asks_what_fills_the_context_before_closing_its_input() {
+        // The answer arrives as a frame like any other, so nothing here waits
+        // on it; what matters is that the question goes out, once, and that
+        // the input then closes so the process can exit.
+        let Some(server) = FakeClaude::new() else {
+            return;
+        };
+        let transport = connect(&server).await.expect("started");
+        transport
+            .send_prompt("hello there", &[] as &[&Path])
+            .await
+            .expect("written");
+        let asked = server
+            .received_matching(1, Duration::from_secs(5), |message| {
+                message["request"]["subtype"] == "get_context_usage"
+            })
+            .await;
+        assert_eq!(asked.len(), 1, "{asked:?}");
+        assert_eq!(
+            asked[0]["request_id"],
+            super::super::stream::CONTEXT_REQUEST_ID
+        );
+        assert_eq!(asked[0]["request"]["detail"], "full");
+        // The request went out as the input closed, after the prompt.
+        let received = server.received();
+        let prompt = received
+            .iter()
+            .position(|message| message["type"] == "user")
+            .expect("the prompt");
+        let ask = received
+            .iter()
+            .position(|message| message["request"]["subtype"] == "get_context_usage")
+            .expect("the ask");
+        assert!(prompt < ask);
+        assert!(!transport.inner.input.lock().await.is_open());
     }
 
     #[tokio::test]

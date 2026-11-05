@@ -28,5 +28,6 @@ unicode-segmentation.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+chrono.workspace = true
 gpui = { workspace = true, features = ["test-support"] }
 tokio = { workspace = true, features = ["test-util"] }

@@ -1208,14 +1208,17 @@ fn composer_row(
     chrome.editing_queued = editing_queued;
     chrome.enabled = true;
     chrome.provider = thread_presentation::provider(state.read(cx), &agent);
-    chrome.context_usage = {
+    {
         let conversation = conversation.and_then(|conversation| conversation.lock().ok());
-        Some(thread_presentation::context_usage(
-            state.read(cx),
+        let state = state.read(cx);
+        chrome.context_usage = Some(thread_presentation::context_usage(
+            state,
             &agent,
             conversation.as_deref(),
-        ))
-    };
+        ));
+        chrome.context_detail =
+            thread_presentation::context_detail(state, &agent, conversation.as_deref());
+    }
     if chrome
         .context_usage
         .is_some_and(|usage| usage.fraction().is_none())

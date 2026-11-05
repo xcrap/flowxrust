@@ -1,8 +1,12 @@
 //! Translate provider and conversation data into shared UI controls.
 
 use fx_agent::conversation::{Conversation, Phase};
+use fx_agent::provider::{ContextCategoryKind, RateLimitStatus, RateLimits};
+use fx_core::Timestamp;
 use fx_core::{Agent, AgentExecutionState};
-use fx_design::components::{ActivityState, ContextUsage, ProviderIdentity};
+use fx_design::components::{
+    ActivityState, ContextDetail, ContextUsage, ProviderIdentity, UsageLimit,
+};
 
 use crate::AppState;
 
@@ -60,6 +64,75 @@ pub(crate) fn context_usage(
     ContextUsage {
         used: known.then_some(usage.current_context_tokens),
         limit,
+    }
+}
+
+/// What the context gauge's tooltip says beyond the fill: what is in the
+/// window, as the provider last broke it down, and the account's usage limits
+/// as its provider last reported them.
+pub(crate) fn context_detail(
+    state: &AppState,
+    agent: &Agent,
+    conversation: Option<&Conversation>,
+) -> ContextDetail {
+    let provider_id = match provider(state, agent) {
+        ProviderIdentity::Claude => "claude",
+        _ => "codex",
+    };
+    // Only what is in the window: deferred tools are counted but not loaded,
+    // the compaction buffer is room kept clear, and the free space is what the
+    // gauge already shows.
+    let breakdown = conversation
+        .and_then(Conversation::context_breakdown)
+        .map(|breakdown| {
+            breakdown
+                .categories
+                .iter()
+                .filter(|category| {
+                    category.tokens > 0 && category.kind == ContextCategoryKind::Used
+                })
+                .map(|category| (category.name.clone().into(), category.tokens))
+                .collect()
+        })
+        .unwrap_or_default();
+    let (limits, limited) = state
+        .rate_limits_for(provider_id)
+        .map(|limits| usage_limits(limits, fx_core::models::now()))
+        .unwrap_or_default();
+    ContextDetail {
+        breakdown,
+        limits,
+        limited,
+    }
+}
+
+/// The account's limits as the gauge shows them, and whether the provider
+/// has refused a request for them.
+pub(crate) fn usage_limits(limits: &RateLimits, now: Timestamp) -> (Vec<UsageLimit>, bool) {
+    let windows = limits
+        .windows
+        .iter()
+        .map(|window| UsageLimit {
+            label: window.kind.label().into(),
+            fraction: window.used.max(0.0),
+            resets: window
+                .resets_at
+                .map(|resets_at| resets_label(resets_at, now).into()),
+        })
+        .collect();
+    (windows, limits.status == RateLimitStatus::Rejected)
+}
+
+/// When a window resets, relative to now: "resets in 2h 10m", "resets in 3d
+/// 4h". A reset already passed reads as imminent rather than negative.
+fn resets_label(resets_at: Timestamp, now: Timestamp) -> String {
+    let minutes = resets_at.signed_duration_since(now).num_minutes().max(0);
+    let (days, hours, minutes) = (minutes / 1440, minutes % 1440 / 60, minutes % 60);
+    match (days, hours, minutes) {
+        (0, 0, 0) => "resets now".into(),
+        (0, 0, m) => format!("resets in {m}m"),
+        (0, h, m) => format!("resets in {h}h {m}m"),
+        (d, h, _) => format!("resets in {d}d {h}h"),
     }
 }
 
@@ -204,6 +277,107 @@ mod tests {
             );
             assert_eq!(usage.fraction(), Some(0.25));
         });
+    }
+
+    #[test]
+    fn the_detail_lists_only_what_is_in_the_window() {
+        use fx_agent::provider::{ContextBreakdown, ContextCategory, ContextCategoryKind};
+        let temp = tempfile::TempDir::new().unwrap();
+        let test = gpui::TestAppContext::single();
+        test.update(|cx| {
+            let state = cx.new(|cx| AppState::restore(fx_store::AppPaths::at(temp.path()), cx));
+            let agent = Agent::new("Context test");
+            let mut conversation = Conversation::new(agent.id);
+            assert_eq!(
+                context_detail(state.read(cx), &agent, Some(&conversation)),
+                ContextDetail::default()
+            );
+            let category = |name: &str, tokens, kind| ContextCategory {
+                name: name.into(),
+                tokens,
+                kind,
+            };
+            conversation.record_context_breakdown(ContextBreakdown {
+                categories: vec![
+                    category("System prompt", 2_482, ContextCategoryKind::Used),
+                    category("System tools", 0, ContextCategoryKind::Used),
+                    category("Messages", 3_422, ContextCategoryKind::Used),
+                    category("Deferred tools", 9_000, ContextCategoryKind::Deferred),
+                    category("Autocompact buffer", 45_000, ContextCategoryKind::Buffer),
+                    category("Free space", 900_000, ContextCategoryKind::Free),
+                ],
+                total_tokens: 5_904,
+                window: 1_000_000,
+            });
+            let detail = context_detail(state.read(cx), &agent, Some(&conversation));
+            assert_eq!(
+                detail.breakdown,
+                vec![("System prompt".into(), 2_482), ("Messages".into(), 3_422)]
+            );
+            assert!(detail.limits.is_empty() && !detail.limited);
+            // The breakdown's total is the gauge's fill.
+            assert_eq!(
+                context_usage(state.read(cx), &agent, Some(&conversation)).used,
+                Some(5_904)
+            );
+        });
+    }
+
+    #[test]
+    fn usage_limits_are_named_and_say_when_they_reset() {
+        use fx_agent::provider::{RateLimitKind, RateLimitWindow};
+        let now = Timestamp::from_timestamp(1_700_000_000, 0).unwrap();
+        let window = |kind, used, minutes: Option<i64>| RateLimitWindow {
+            kind,
+            used,
+            resets_at: minutes.map(|minutes| now + chrono::Duration::minutes(minutes)),
+        };
+        let limits = RateLimits {
+            status: RateLimitStatus::Allowed,
+            windows: vec![
+                window(RateLimitKind::FiveHour, 0.12, Some(130)),
+                window(RateLimitKind::SevenDay, 0.46, Some(3 * 1440 + 4 * 60 + 59)),
+                window(RateLimitKind::Other("Sonnet".into()), 0.0, None),
+            ],
+            plan: None,
+        };
+        let (shown, limited) = usage_limits(&limits, now);
+        assert!(!limited);
+        assert_eq!(
+            shown,
+            vec![
+                UsageLimit {
+                    label: "5-hour limit".into(),
+                    fraction: 0.12,
+                    resets: Some("resets in 2h 10m".into()),
+                },
+                UsageLimit {
+                    label: "Weekly limit".into(),
+                    fraction: 0.46,
+                    resets: Some("resets in 3d 4h".into()),
+                },
+                UsageLimit {
+                    label: "Sonnet limit".into(),
+                    fraction: 0.0,
+                    resets: None,
+                },
+            ]
+        );
+        assert_eq!(
+            resets_label(now + chrono::Duration::minutes(7), now),
+            "resets in 7m"
+        );
+        assert_eq!(resets_label(now, now), "resets now");
+        // A reset that passed before the next report is not negative.
+        assert_eq!(
+            resets_label(now - chrono::Duration::minutes(5), now),
+            "resets now"
+        );
+        let refused = RateLimits {
+            status: RateLimitStatus::Rejected,
+            ..limits
+        };
+        assert!(usage_limits(&refused, now).1);
     }
 
     #[test]

@@ -1,9 +1,10 @@
 //! A small context gauge, independent of the send/stop action.
 
 use gpui::prelude::*;
-use gpui::{PathBuilder, Rgba, canvas, div, point, px};
+use gpui::{PathBuilder, Rgba, SharedString, canvas, div, point, px};
 
 use super::ProviderIdentity;
+use super::status::{BadgeTone, badge};
 use crate::styled::FxStyled;
 use crate::theme::{Colors, Layout, Radii, Spacing, TextRole, Theme, global};
 
@@ -41,6 +42,115 @@ impl ContextUsage {
             (None, _) => "Context usage not reported yet.".into(),
         }
     }
+}
+
+/// One of the account's usage limits, as the meter shows it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct UsageLimit {
+    /// The window's name: "5-hour limit", "Weekly limit".
+    pub label: SharedString,
+    /// The fraction used. May pass 1.0 when usage ran past the cap.
+    pub fraction: f32,
+    /// When it resets, in words: "resets in 2h 10m".
+    pub resets: Option<SharedString>,
+}
+
+/// What the meter knows beyond the fraction: what fills the window and how
+/// much of the account's limits is used. Both go in the tooltip; a limit that
+/// is nearly used up also gets a badge beside the gauge.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ContextDetail {
+    /// What is in the window, by category, in the provider's order and only
+    /// what is in use: name and tokens.
+    pub breakdown: Vec<(SharedString, u64)>,
+    pub limits: Vec<UsageLimit>,
+    /// The provider refused the last request for the limit.
+    pub limited: bool,
+}
+
+/// The fraction of a limit at which it is worth a badge beside the gauge.
+pub const LIMIT_WARNING_AT: f32 = 0.8;
+/// …and at which the badge turns to the error tone.
+pub const LIMIT_CRITICAL_AT: f32 = 0.95;
+
+impl ContextDetail {
+    /// The limit the reader needs to know about: the fullest, when it is
+    /// past the warning line or the provider has refused a request.
+    pub fn pressing_limit(&self) -> Option<&UsageLimit> {
+        let hottest = self
+            .limits
+            .iter()
+            .max_by(|a, b| a.fraction.total_cmp(&b.fraction))?;
+        (self.limited || hottest.fraction >= LIMIT_WARNING_AT).then_some(hottest)
+    }
+}
+
+/// The tooltip: the fill in words, then what fills it, then the limits.
+pub fn context_detail_text(usage: ContextUsage, detail: &ContextDetail) -> String {
+    let mut text = usage.detail();
+    if !detail.breakdown.is_empty() {
+        text.push_str("\n\nIn the window:");
+        for (name, count) in &detail.breakdown {
+            text.push_str(&format!("\n{name}: {}", tokens(*count)));
+        }
+    }
+    if !detail.limits.is_empty() {
+        text.push_str("\n\nUsage limits:");
+        for limit in &detail.limits {
+            text.push_str(&format!(
+                "\n{}: {:.0}% used",
+                limit.label,
+                limit.fraction * 100.0
+            ));
+            if let Some(resets) = &limit.resets {
+                text.push_str(&format!(", {resets}"));
+            }
+        }
+    }
+    if detail.limited {
+        text.push_str("\nThe provider refused the last request for the limit.");
+    }
+    text
+}
+
+/// The badge's tone at one limit level.
+pub fn usage_limit_tone(limit: &UsageLimit, limited: bool) -> BadgeTone {
+    if limited || limit.fraction >= LIMIT_CRITICAL_AT {
+        BadgeTone::Error
+    } else {
+        BadgeTone::Warning
+    }
+}
+
+/// The badge's text: the window and how much of it is used, short enough to
+/// sit beside the gauge. "Weekly 92%", "5-hour 100%".
+pub fn usage_limit_label(limit: &UsageLimit) -> String {
+    let name = limit
+        .label
+        .strip_suffix(" limit")
+        .unwrap_or(&limit.label)
+        .to_string();
+    format!("{name} {:.0}%", limit.fraction * 100.0)
+}
+
+/// A badge for the pressing limit, or nothing while every window has room.
+pub fn usage_limit_badge(detail: &ContextDetail) -> Option<impl IntoElement> {
+    let limit = detail.pressing_limit()?;
+    let tone = usage_limit_tone(limit, detail.limited);
+    let text = usage_limit_label(limit);
+    let tooltip = context_detail_text(ContextUsage::default(), detail);
+    let tooltip = tooltip
+        .split_once("\n\nUsage limits:")
+        .map(|(_, limits)| format!("Usage limits:{limits}"))
+        .unwrap_or(tooltip);
+    Some(
+        div()
+            .id("composer.limit")
+            .debug_selector(|| "composer-limit".into())
+            .flex_shrink_0()
+            .tooltip(move |window, cx| super::tooltip(tooltip.clone(), window, cx))
+            .child(badge(text, tone, false)),
+    )
 }
 
 fn tokens(value: u64) -> String {
@@ -89,11 +199,15 @@ pub fn context_meter_palette(
     }
 }
 
-pub fn context_meter(usage: ContextUsage, provider: ProviderIdentity) -> impl IntoElement {
+pub fn context_meter(
+    usage: ContextUsage,
+    detail: &ContextDetail,
+    provider: ProviderIdentity,
+) -> impl IntoElement {
     let theme = global::current();
     let fraction = usage.fraction();
     let ContextMeterPalette { ring: ink, track } = context_meter_palette(usage, provider, &theme);
-    let detail = usage.detail();
+    let detail = context_detail_text(usage, detail);
     div()
         .id("composer.context")
         .debug_selector(|| "composer-context".into())
@@ -197,6 +311,79 @@ mod tests {
         assert_eq!(ring(Some(89)), Colors::warning_ink(&theme));
         assert_eq!(ring(Some(90)), Colors::error(&theme));
         assert_eq!(ring(Some(500)), Colors::error(&theme));
+    }
+
+    #[test]
+    fn the_tooltip_lists_what_fills_the_window_and_the_limits() {
+        let usage = ContextUsage {
+            used: Some(26_851),
+            limit: Some(1_000_000),
+        };
+        let detail = ContextDetail {
+            breakdown: vec![("System prompt".into(), 2_482), ("Messages".into(), 3_422)],
+            limits: vec![
+                UsageLimit {
+                    label: "5-hour limit".into(),
+                    fraction: 0.12,
+                    resets: Some("resets in 2h 10m".into()),
+                },
+                UsageLimit {
+                    label: "Weekly limit".into(),
+                    fraction: 0.46,
+                    resets: None,
+                },
+            ],
+            limited: false,
+        };
+        assert_eq!(
+            context_detail_text(usage, &detail),
+            "3% of the model's context window used: 26,851 tokens of 1,000,000 tokens.\n\
+             The provider summarizes older messages when it fills up.\n\n\
+             In the window:\nSystem prompt: 2,482 tokens\nMessages: 3,422 tokens\n\n\
+             Usage limits:\n5-hour limit: 12% used, resets in 2h 10m\nWeekly limit: 46% used"
+        );
+        // With nothing known beyond the fill, the tooltip is what it was.
+        assert_eq!(
+            context_detail_text(usage, &ContextDetail::default()),
+            usage.detail()
+        );
+    }
+
+    #[test]
+    fn a_limit_gets_a_badge_only_once_it_presses() {
+        let limit = |fraction: f32| UsageLimit {
+            label: "Weekly limit".into(),
+            fraction,
+            resets: None,
+        };
+        let detail = |fraction: f32, limited: bool| ContextDetail {
+            breakdown: Vec::new(),
+            limits: vec![limit(0.1), limit(fraction)],
+            limited,
+        };
+        assert!(detail(0.79, false).pressing_limit().is_none());
+        assert_eq!(
+            detail(0.8, false).pressing_limit().map(|l| l.fraction),
+            Some(0.8)
+        );
+        // A refusal presses whatever the windows say.
+        assert_eq!(
+            detail(0.3, true).pressing_limit().map(|l| l.fraction),
+            Some(0.3)
+        );
+        assert!(ContextDetail::default().pressing_limit().is_none());
+        assert_eq!(usage_limit_tone(&limit(0.8), false), BadgeTone::Warning);
+        assert_eq!(usage_limit_tone(&limit(0.95), false), BadgeTone::Error);
+        assert_eq!(usage_limit_tone(&limit(0.3), true), BadgeTone::Error);
+        assert_eq!(usage_limit_label(&limit(0.92)), "Weekly 92%");
+        assert_eq!(
+            usage_limit_label(&UsageLimit {
+                label: "5-hour limit".into(),
+                fraction: 1.0,
+                resets: None
+            }),
+            "5-hour 100%"
+        );
     }
 
     #[test]
