@@ -878,6 +878,7 @@ fn convert_turns(
             match item_kind(item) {
                 ItemKind::UserMessage => {
                     let mut content = Vec::new();
+                    let mut mentions: Vec<(String, String)> = Vec::new();
                     for block in item["content"].as_array().into_iter().flatten() {
                         match block["type"].as_str() {
                             Some("text") => {
@@ -890,11 +891,24 @@ fn convert_turns(
                             Some("image" | "localImage") => {
                                 content.push(image_content(block, &mut image_budget)?)
                             }
+                            // A file the prompt mentioned, as the item FlowX
+                            // sends beside the text. Read back as the `@path`
+                            // the text already carries, or appended where the
+                            // text does not name it (a prompt from the Codex app).
+                            Some("mention") => {
+                                if let Some(path) = block["path"].as_str() {
+                                    mentions.push((
+                                        block["name"].as_str().unwrap_or_default().to_string(),
+                                        path.to_string(),
+                                    ));
+                                }
+                            }
                             _ => content.push(MessageContent::Text {
                                 text: block.to_string(),
                             }),
                         }
                     }
+                    append_unnamed_mentions(&mut content, &mentions);
                     if !content.is_empty() {
                         push(MessageRole::User, content, false)?;
                     }
@@ -1042,6 +1056,40 @@ fn image_content(block: &Value, budget: &mut usize) -> Result<MessageContent, Pr
             format!("[Image]\nPreview unavailable: {source}")
         },
     })
+}
+
+/// Add `@path` for each mentioned file the prompt's text does not already
+/// name, so a restored prompt shows what the model was given. One FlowX sent
+/// names every mention in its text, so this adds nothing to those and the
+/// history still matches the local copy.
+fn append_unnamed_mentions(content: &mut Vec<MessageContent>, mentions: &[(String, String)]) {
+    let text: String = content
+        .iter()
+        .filter_map(MessageContent::as_text)
+        .collect::<Vec<_>>()
+        .join("\n");
+    let unnamed: Vec<String> = mentions
+        .iter()
+        .filter(|(name, path)| {
+            !(text.contains(&format!("@{path}"))
+                || (!name.is_empty() && text.contains(&format!("@{name}"))))
+        })
+        .map(|(_, path)| format!("@{path}"))
+        .collect();
+    if unnamed.is_empty() {
+        return;
+    }
+    let addition = unnamed.join(" ");
+    match content.iter_mut().rev().find_map(|block| match block {
+        MessageContent::Text { text } => Some(text),
+        _ => None,
+    }) {
+        Some(text) => {
+            text.push(' ');
+            text.push_str(&addition);
+        }
+        None => content.push(MessageContent::Text { text: addition }),
+    }
 }
 
 #[cfg(test)]
@@ -1514,6 +1562,37 @@ for line in sys.stdin:
             vec![MessageContent::Thinking {
                 text: "Reading".into()
             }]
+        );
+    }
+
+    #[test]
+    fn a_mention_item_reads_back_as_the_at_path_the_prompt_names() {
+        // The user message Codex records for a FlowX prompt: the text with its
+        // `@path`, and the `mention` item FlowX sent beside it (shape from the
+        // live app-server). One from the Codex app may carry only the item.
+        let turns = json!([{"id":"turn","items":[
+            {"type":"userMessage","id":"u1","clientId":null,"content":[
+                {"type":"text","text":"Explain @AGENTS.md please","text_elements":[]},
+                {"type":"mention","name":"AGENTS.md","path":"/repo/AGENTS.md"}]},
+            {"type":"userMessage","id":"u2","clientId":null,"content":[
+                {"type":"text","text":"Explain this","text_elements":[]},
+                {"type":"mention","name":"lib.rs","path":"/repo/src/lib.rs"},
+                {"type":"mention","name":"mod.rs","path":"/repo/src/mod.rs"}]},
+            {"type":"userMessage","id":"u3","clientId":null,"content":[
+                {"type":"mention","name":"lone.rs","path":"/repo/lone.rs"}]}
+        ]}]);
+        let restored = convert_turns("thread", turns.as_array().unwrap(), &json!({})).unwrap();
+        let texts: Vec<String> = restored
+            .iter()
+            .map(|message| message.text_content())
+            .collect();
+        assert_eq!(
+            texts,
+            [
+                "Explain @AGENTS.md please",
+                "Explain this @/repo/src/lib.rs @/repo/src/mod.rs",
+                "@/repo/lone.rs",
+            ]
         );
     }
 

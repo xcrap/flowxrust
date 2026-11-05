@@ -361,6 +361,36 @@ impl TextField {
         self.marked.is_some()
     }
 
+    /// The caret, in bytes of the value, while nothing is selected or being
+    /// composed: the point a completion is typed up to.
+    pub(crate) fn caret(&self) -> Option<usize> {
+        (self.selection.is_empty() && self.marked.is_none()).then_some(self.selection.head)
+    }
+
+    /// Replace `range` with `text` as one undoable step of its own, with the
+    /// caret after what went in. Refused while the IME is composing, and for
+    /// a range that is not within the value on character boundaries, since
+    /// the caller read it from an earlier frame. Returns whether it applied.
+    pub(crate) fn replace_range(
+        &mut self,
+        range: Range<usize>,
+        text: &str,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if !self.enabled
+            || self.marked.is_some()
+            || range.start > range.end
+            || range.end > self.value.len()
+            || !self.value.is_char_boundary(range.start)
+            || !self.value.is_char_boundary(range.end)
+        {
+            return false;
+        }
+        self.user_edit(EditKind::Clipboard, range, text);
+        cx.notify();
+        true
+    }
+
     /// Append an explicit reference as one undoable edit, or keep the entire
     /// draft unchanged if it does not fit. Context must never be cut in half.
     pub(crate) fn append_context(
@@ -2992,6 +3022,31 @@ mod tests {
             let field = cx.new(|cx| TextField::new(cx).max_len(2));
             field.update(cx, |field, _| field.edit(0..0, "a🜁b"));
             assert_eq!(field.read(cx).value(), "a🜁");
+        });
+    }
+
+    #[test]
+    fn a_completion_replaces_its_token_as_one_undoable_step() {
+        let test = gpui::TestAppContext::single();
+        let field = test.update(|cx| cx.new(|cx| TextField::new(cx).multiline(4.0)));
+        test.update(|cx| {
+            field.update(cx, |field, cx| {
+                field.set_value("Fix @comp", cx);
+                assert_eq!(field.caret(), Some(9));
+                assert!(field.replace_range(4..9, "@src/composer.rs ", cx));
+                assert_eq!(field.value(), "Fix @src/composer.rs ");
+                assert_eq!(field.caret(), Some(21), "the caret follows the completion");
+                // A range from a stale frame is refused rather than applied
+                // somewhere else.
+                assert!(!field.replace_range(4..40, "x", cx));
+                // A range whose end precedes its start, as a stale token's
+                // could; built rather than written, since a literal one is a
+                // lint error.
+                let reversed = std::ops::Range { start: 7, end: 3 };
+                assert!(!field.replace_range(reversed, "x", cx));
+                assert!(field.undo(cx));
+                assert_eq!(field.value(), "Fix @comp");
+            });
         });
     }
 

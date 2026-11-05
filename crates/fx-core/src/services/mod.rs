@@ -1,8 +1,11 @@
 //! Services: the parts of the domain that talk to the machine.
 
 pub mod editor;
+pub mod file_listing;
 pub mod images;
 pub mod runtime;
+
+pub use file_listing::{FileListing, ListingSource, list_files};
 
 pub use images::{
     DEFAULT_MAX_IMAGE_BYTES, ImageError, ImageFormat, ImagePolicy, MAX_CONCURRENT_IMAGE_READS,

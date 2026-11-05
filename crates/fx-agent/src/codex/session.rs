@@ -5,6 +5,8 @@
 //! protocol can be tested against real captured payloads without spawning a
 //! process.
 
+use std::path::{Path, PathBuf};
+
 use fx_core::AgentAccess;
 use fx_core::policy::TurnPlan;
 use serde_json::{Value, json};
@@ -48,13 +50,70 @@ pub fn image_input(path: &str) -> Value {
 
 /// The `input` array for a turn.
 ///
-/// **Order matters and is asserted by tests:** images come first and the text
-/// block comes last. Codex treats the final text item as the prompt, so a
-/// trailing image would be read as the user's words.
-pub fn turn_input(prompt: &str, image_paths: &[String]) -> Vec<Value> {
+/// **Order matters and is asserted by tests:** images come first, then the
+/// files the prompt mentions, and the text block comes last. Codex treats the
+/// final text item as the prompt, so a trailing image would be read as the
+/// user's words.
+pub fn turn_input(prompt: &str, image_paths: &[String], working_directory: &str) -> Vec<Value> {
     let mut input: Vec<Value> = image_paths.iter().map(|p| image_input(p)).collect();
+    input.extend(mention_inputs(prompt, Path::new(working_directory)));
     input.push(json!({ "type": "text", "text": prompt }));
     input
+}
+
+/// The files a prompt mentions with `@`, as Codex's `mention` inputs.
+///
+/// Codex does not read an `@path` out of the text itself. Checked live against
+/// codex-cli 0.164: given the text alone, the model ran `head` on the file;
+/// given a `mention` item, it answered from the file with no command. So each
+/// mention that names a file — under the working directory, or by an absolute
+/// path — goes beside the text, once. The text keeps its `@path`, which is
+/// what the reader typed and what the history shows. A path that names
+/// nothing stays words, as it would for Claude.
+pub fn mention_inputs(prompt: &str, working_directory: &Path) -> Vec<Value> {
+    let mut inputs = Vec::new();
+    let mut seen: Vec<PathBuf> = Vec::new();
+    for token in fx_core::policy::mention::mentioned_paths(prompt) {
+        let Some(path) = resolve_mention(token, working_directory) else {
+            continue;
+        };
+        if seen.contains(&path) {
+            continue;
+        }
+        let name = path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        inputs.push(json!({
+            "type": "mention",
+            "name": name,
+            "path": path.to_string_lossy(),
+        }));
+        seen.push(path);
+    }
+    inputs
+}
+
+/// The punctuation a sentence hangs on a mention's end, which is not part of
+/// the path: `see @src/lib.rs, then…`.
+const TRAILING_PUNCTUATION: [char; 11] = [',', '.', ';', ':', '!', '?', ')', ']', '}', '>', '"'];
+
+/// The file a token names, if one exists: as typed, or with trailing
+/// punctuation removed a character at a time until something matches.
+fn resolve_mention(token: &str, working_directory: &Path) -> Option<PathBuf> {
+    std::iter::successors(Some(token), |token| {
+        token.strip_suffix(|c: char| TRAILING_PUNCTUATION.contains(&c))
+    })
+    .filter(|candidate| !candidate.is_empty())
+    .map(|candidate| {
+        let path = Path::new(candidate);
+        if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            working_directory.join(path)
+        }
+    })
+    .find(|path| path.is_file())
 }
 
 /// Parameters for `thread/start` or `thread/resume`.
@@ -140,7 +199,7 @@ pub fn turn_params(request: &TurnRequest<'_>) -> Value {
     let (approval, _) = access_params(access);
     let mut params = json!({
         "threadId": thread_id,
-        "input": turn_input(prompt, image_paths),
+        "input": turn_input(prompt, image_paths, working_directory),
         "approvalPolicy": approval,
         "sandboxPolicy": sandbox_policy(access, working_directory),
         "model": model,
@@ -174,12 +233,13 @@ pub fn steer_params(
     id: &str,
     prompt: &str,
     image_paths: &[String],
+    working_directory: &str,
 ) -> Value {
     json!({
         "threadId": thread_id,
         "expectedTurnId": expected_turn_id,
         "clientUserMessageId": id,
-        "input": turn_input(prompt, image_paths),
+        "input": turn_input(prompt, image_paths, working_directory),
     })
 }
 
@@ -1393,7 +1453,7 @@ mod tests {
         // Codex treats the last text item as the prompt. A trailing image would
         // become the user's words.
         let images = vec!["/tmp/a.png".to_string(), "/tmp/b.png".to_string()];
-        let input = turn_input("fix the parser", &images);
+        let input = turn_input("fix the parser", &images, "/tmp");
         assert_eq!(input.len(), 3);
         assert_eq!(input[0]["type"], "localImage");
         assert_eq!(input[0]["path"], "/tmp/a.png");
@@ -1407,8 +1467,61 @@ mod tests {
     }
 
     #[test]
+    fn a_mentioned_file_goes_beside_the_text_as_a_mention_item() {
+        // Codex reads no `@path` out of the text; the item is what attaches
+        // the file. Shape from the live app-server (codex-cli 0.164).
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/lib.rs"), "").unwrap();
+        std::fs::write(root.join("README.md"), "").unwrap();
+        let elsewhere = temp.path().join("elsewhere.txt");
+        std::fs::write(&elsewhere, "").unwrap();
+        let prompt = format!(
+            "Compare @src/lib.rs with @README.md, @src/lib.rs again, @missing.rs and @{}.",
+            elsewhere.display()
+        );
+        let input = turn_input(&prompt, &[], &root.to_string_lossy());
+        let mentions: Vec<(&str, &str)> = input
+            .iter()
+            .filter(|item| item["type"] == "mention")
+            .map(|item| {
+                (
+                    item["name"].as_str().unwrap(),
+                    item["path"].as_str().unwrap(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            mentions,
+            [
+                ("lib.rs", root.join("src/lib.rs").to_str().unwrap()),
+                ("README.md", root.join("README.md").to_str().unwrap()),
+                ("elsewhere.txt", elsewhere.to_str().unwrap()),
+            ],
+            "each existing file once, trailing punctuation dropped, the missing one left as words"
+        );
+        assert_eq!(
+            input.last().unwrap()["type"],
+            "text",
+            "the prompt stays the final input item"
+        );
+        assert_eq!(input.last().unwrap()["text"], prompt);
+        // A prompt that mentions nothing adds nothing.
+        assert_eq!(
+            turn_input(
+                "plain words, mail me@example.com",
+                &[],
+                &root.to_string_lossy()
+            )
+            .len(),
+            1
+        );
+    }
+
+    #[test]
     fn a_prompt_with_no_images_is_just_the_text() {
-        let input = turn_input("hello", &[]);
+        let input = turn_input("hello", &[], "/tmp");
         assert_eq!(input.len(), 1);
         assert_eq!(input[0]["type"], "text");
     }
@@ -1429,7 +1542,7 @@ mod tests {
     #[test]
     fn steering_carries_the_turn_it_expects() {
         // Codex rejects a steer aimed at a turn that has already finished.
-        let params = steer_params("t1", "turn-9", "steer-1", "actually, use zsh", &[]);
+        let params = steer_params("t1", "turn-9", "steer-1", "actually, use zsh", &[], "/tmp");
         assert_eq!(params["expectedTurnId"], "turn-9");
         assert_eq!(params["threadId"], "t1");
         assert_eq!(params["input"][0]["text"], "actually, use zsh");

@@ -21,6 +21,7 @@ pub mod composer;
 mod configuration;
 mod conversation_search;
 mod conversation_writer;
+mod file_mentions;
 mod follow_up_settings;
 mod frame_profile;
 pub mod inspector;
@@ -1240,6 +1241,7 @@ fn composer_row(
         chrome.steering = state.is_steering(agent.id);
         chrome.follow_up = state.follow_up_mode();
         chrome.goal = state.goal(agent.id).cloned();
+        chrome.mention = state.mention_popup(agent.id);
     }
     let mut chrome = chrome.on_action(move |action, window, cx| match action {
         composer::ComposerAction::Submit => {
@@ -1297,6 +1299,26 @@ fn composer_row(
             });
             let field = for_actions.update(cx, |state, cx| state.draft(agent.id, cx));
             field.read(cx).focus_handle().focus(window);
+        }
+        composer::ComposerAction::MentionMove(delta) => {
+            for_actions.update(cx, |state, cx| {
+                state.mention_move(delta, cx);
+            });
+        }
+        composer::ComposerAction::MentionHighlight(key) => {
+            for_actions.update(cx, |state, cx| {
+                state.mention_highlight(&key, cx);
+            });
+        }
+        composer::ComposerAction::MentionChoose(key) => {
+            for_actions.update(cx, |state, cx| {
+                state.mention_choose(key.as_deref(), cx);
+            });
+        }
+        composer::ComposerAction::MentionDismiss => {
+            for_actions.update(cx, |state, cx| {
+                state.mention_dismiss(cx);
+            });
         }
         composer::ComposerAction::Select(..) => {}
     });

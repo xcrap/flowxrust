@@ -90,9 +90,9 @@ use std::rc::Rc;
 use fx_agent::conversation::state::VISIBLE_QUEUED_PROMPTS;
 use fx_core::models::{ConversationGoal, GoalStatus};
 use fx_design::components::{
-    BadgeTone, ButtonStyle, ContextDetail, ContextUsage, IconButtonProps, ProviderIdentity,
-    SegmentedOption, TurnAction, badge, button, context_meter, icon_button, segmented_control,
-    turn_action_button, usage_limit_badge,
+    BadgeTone, ButtonStyle, ContextDetail, ContextUsage, IconButtonProps, MenuItem,
+    ProviderIdentity, SegmentedOption, TurnAction, badge, button, context_meter, icon_button,
+    row_palette, segmented_control, turn_action_button, usage_limit_badge,
 };
 use fx_design::icon::Icon;
 use fx_design::styled::{FxStyled, px_len};
@@ -178,6 +178,41 @@ pub enum ComposerAction {
     /// ends, and a position read from the last frame then names the prompt
     /// behind the one the reader clicked.
     RemoveQueued(uuid::Uuid),
+    /// Move the `@` picker's highlight by this many rows (↑ is −1, ↓ is 1).
+    MentionMove(isize),
+    /// The pointer is over this picker row, by its key.
+    MentionHighlight(String),
+    /// Take a picker row into the draft: the one with this key, or the
+    /// highlighted one when none is named (↩ and ⇥).
+    MentionChoose(Option<String>),
+    /// Close the picker without taking anything (⎋).
+    MentionDismiss,
+}
+
+/// The `@` file picker, as the composer draws it: what was typed after the
+/// `@`, the files ranked for it, and which row is highlighted.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MentionPopup {
+    pub query: String,
+    pub rows: Vec<MentionRow>,
+    /// The highlighted row's key, shared by pointer and keyboard.
+    pub highlighted: Option<String>,
+    /// The root's files are still being listed.
+    pub loading: bool,
+    /// The listing stopped at its cap, so a file may be missing from it.
+    pub truncated: bool,
+}
+
+/// One file in the picker.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MentionRow {
+    /// The row's id, which is also its highlight key.
+    pub key: String,
+    pub name: SharedString,
+    /// The directory the file is in, root-relative; empty at the root.
+    pub directory: SharedString,
+    /// The root-relative path the mention inserts.
+    pub path: String,
 }
 
 /// One queued prompt, as the strip shows it.
@@ -297,6 +332,8 @@ pub struct ComposerChrome {
     pub goal: Option<ConversationGoal>,
     /// The queued prompt open for editing: its queue position, and its field.
     pub editing_queued: Option<(usize, Entity<TextField>)>,
+    /// The `@` file picker, while the reader is typing a mention.
+    pub mention: Option<MentionPopup>,
     on_action: Option<ActionHandler>,
 }
 
@@ -338,6 +375,7 @@ impl std::fmt::Debug for ComposerChrome {
             .field("busy", &self.busy)
             .field("queued", &self.queued)
             .field("enabled", &self.enabled)
+            .field("mention", &self.mention)
             .field("model", &self.model)
             .field("effort", &self.effort)
             .field("attachments", &self.attachments)
@@ -481,6 +519,15 @@ pub fn view_with_controls(
         .as_ref()
         .map(|(_, editor)| editor.clone());
     let editor_for_key = editor.clone();
+    // The `@` picker's keys are the composer's only while the picker is open
+    // under a focused draft.
+    let for_mention_keys = handler
+        .clone()
+        .filter(|_| focused && chrome.mention.is_some());
+    let mention_has_row = chrome
+        .mention
+        .as_ref()
+        .is_some_and(|popup| popup.highlighted.is_some());
 
     div()
         .w_full()
@@ -526,6 +573,21 @@ pub fn view_with_controls(
                 handler(ComposerAction::PasteImage(image), window, cx);
             }
         })
+        // The `@` picker's keys: the arrows move its highlight, Return and
+        // Tab take the row, Escape closes it. Caught on the way down, before
+        // the field would move its caret or insert a newline for the same
+        // key; every other key goes on to the field, which is how the token
+        // grows.
+        .capture_key_down(move |event, window, cx| {
+            let Some(handler) = &for_mention_keys else {
+                return;
+            };
+            let Some(action) = mention_key_action(&event.keystroke, mention_has_row) else {
+                return;
+            };
+            cx.stop_propagation();
+            handler(action, window, cx);
+        })
         .child(
             div()
                 .w_full()
@@ -538,13 +600,27 @@ pub fn view_with_controls(
                 .pt(px_len(Spacing::SM))
                 .pb(px_len(Spacing::MD))
                 .children(chrome.goal.as_ref().map(goal_row))
-                .child(composer_card(
-                    field,
-                    chrome,
-                    focused,
-                    can_send,
-                    configuration,
-                ))
+                .child(
+                    // The picker is anchored to this wrapper's top-left, so
+                    // it is placed against the card and not the column.
+                    div()
+                        .relative()
+                        .w_full()
+                        .children(
+                            chrome
+                                .mention
+                                .as_ref()
+                                .filter(|_| focused)
+                                .map(|popup| mention_overlay(popup, handler.clone())),
+                        )
+                        .child(composer_card(
+                            field,
+                            chrome,
+                            focused,
+                            can_send,
+                            configuration,
+                        )),
+                )
                 .child(
                     div()
                         .pt(px_len(Spacing::SM))
@@ -554,6 +630,24 @@ pub fn view_with_controls(
                 ),
         )
         .into_any_element()
+}
+
+/// What a key does while the `@` picker is open, or nothing. Only the keys
+/// that move, take or close it, and only unmodified, so typing and the
+/// composer's own shortcuts go on reaching their owners. Return and Tab take
+/// a row only while one is highlighted: with nothing to take, Return is the
+/// field's newline again.
+fn mention_key_action(keystroke: &gpui::Keystroke, has_highlight: bool) -> Option<ComposerAction> {
+    if keystroke.modifiers.modified() {
+        return None;
+    }
+    match keystroke.key.as_str() {
+        "up" if has_highlight => Some(ComposerAction::MentionMove(-1)),
+        "down" if has_highlight => Some(ComposerAction::MentionMove(1)),
+        "enter" | "tab" if has_highlight => Some(ComposerAction::MentionChoose(None)),
+        "escape" => Some(ComposerAction::MentionDismiss),
+        _ => None,
+    }
 }
 
 /// Whether a key is ⌘V.
@@ -574,6 +668,155 @@ fn clipboard_image(cx: &App) -> Option<gpui::Image> {
             gpui::ClipboardEntry::Image(image) => Some(image),
             gpui::ClipboardEntry::String(_) => None,
         })
+}
+
+// ── The @ picker ───────────────────────────────────────────────────────────
+
+pub(crate) const MENTION_SELECTOR: &str = "composer.mention";
+
+/// The selectors of the picker's rows, one per row it can show. Static,
+/// because a test looks a row up by its selector and GPUI keeps the name.
+const MENTION_ROW_SELECTORS: [&str; Layout::MENTION_MAX_ROWS] = [
+    "composer.mention-row.0",
+    "composer.mention-row.1",
+    "composer.mention-row.2",
+    "composer.mention-row.3",
+    "composer.mention-row.4",
+    "composer.mention-row.5",
+    "composer.mention-row.6",
+    "composer.mention-row.7",
+];
+
+/// The selector of the picker's `index`th row.
+pub(crate) fn mention_row_selector(index: usize) -> &'static str {
+    MENTION_ROW_SELECTORS
+        .get(index)
+        .copied()
+        .unwrap_or("composer.mention-row.more")
+}
+
+/// The `@` picker, above the card.
+///
+/// Anchored by its bottom-left corner to the card's top-left, so it grows
+/// upward over the transcript rather than pushing the card down as rows come
+/// and go; drawn deferred, so it paints over the rows above it; and kept
+/// inside the window with the menus' margin.
+fn mention_overlay(popup: &MentionPopup, handler: Option<ActionHandler>) -> AnyElement {
+    gpui::deferred(
+        gpui::anchored()
+            .anchor(gpui::Corner::BottomLeft)
+            .offset(gpui::point(px(0.0), px(-Layout::MENU_ANCHOR_GAP)))
+            .snap_to_window_with_margin(gpui::Edges::all(px(Layout::MENU_EDGE_MARGIN)))
+            .child(mention_panel(popup, handler)),
+    )
+    .with_priority(1)
+    .into_any_element()
+}
+
+/// The picker's panel: a menu's surface and rows, a file's name beside the
+/// directory it is in, and a line under them saying what the rows cannot.
+fn mention_panel(popup: &MentionPopup, handler: Option<ActionHandler>) -> AnyElement {
+    let theme = global::current();
+    let mut rows = div().flex().flex_col().p(px_len(Spacing::XXS));
+    for (index, row) in popup.rows.iter().enumerate() {
+        let highlighted = popup.highlighted.as_deref() == Some(row.key.as_str());
+        let palette = row_palette(
+            &MenuItem::new(row.key.clone(), row.name.to_string()),
+            highlighted,
+            &theme,
+        );
+        let hover = handler.clone();
+        let hover_key = row.key.clone();
+        let choose = handler.clone();
+        let choose_key = row.key.clone();
+        rows = rows.child(
+            div()
+                // The key is the id, as a menu row's is, so the hover state
+                // survives the rows being rebuilt around it.
+                .id(SharedString::from(row.key.clone()))
+                .debug_selector(move || mention_row_selector(index).to_string())
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px_len(Spacing::XS))
+                .h(px_len(Layout::MENU_ROW_HEIGHT))
+                .flex_shrink_0()
+                .px(px_len(Spacing::SM))
+                .rounded(px_len(Radii::SM))
+                .bg(palette.background)
+                .cursor(gpui::CursorStyle::PointingHand)
+                .on_mouse_move(move |_, window, cx| {
+                    if !highlighted && let Some(handler) = &hover {
+                        handler(
+                            ComposerAction::MentionHighlight(hover_key.clone()),
+                            window,
+                            cx,
+                        );
+                    }
+                })
+                .on_click(move |_: &ClickEvent, window, cx| {
+                    if let Some(handler) = &choose {
+                        handler(
+                            ComposerAction::MentionChoose(Some(choose_key.clone())),
+                            window,
+                            cx,
+                        );
+                    }
+                })
+                .child(Icon::DOC_TEXT.render(IconSize::Small, palette.subtitle, &theme))
+                .child(
+                    div()
+                        .flex_shrink_0()
+                        .fx_role(TextRole::CaptionMedium)
+                        .text_color(palette.title)
+                        .child(row.name.clone()),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .truncate()
+                        .fx_caption()
+                        .text_color(palette.subtitle)
+                        .child(row.directory.clone()),
+                ),
+        );
+    }
+
+    let status: SharedString = if popup.rows.is_empty() && popup.loading {
+        "Listing files…".into()
+    } else if popup.rows.is_empty() {
+        format!("No file matches “{}”", popup.query).into()
+    } else if popup.truncated {
+        "Not every file is listed; type more of the name".into()
+    } else {
+        "↑↓ to move · ↩ to insert · ⎋ to close".into()
+    };
+
+    div()
+        .id("composer-mention")
+        .debug_selector(|| MENTION_SELECTOR.into())
+        .flex()
+        .flex_col()
+        .w(px_len(Layout::MENTION_PANEL_WIDTH))
+        .bg(Colors::bg_surface(&theme))
+        .rounded(px_len(Radii::MD))
+        .border_1()
+        .border_color(Colors::border_medium(&theme))
+        .occlude()
+        .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| cx.stop_propagation())
+        .child(rows)
+        .child(
+            div()
+                .px(px_len(Spacing::SM))
+                .py(px_len(Spacing::XS))
+                .border_t_1()
+                .border_color(Colors::border_subtle(&theme))
+                .fx_caption()
+                .text_color(Colors::fg_tertiary(&theme))
+                .child(status),
+        )
+        .into_any_element()
 }
 
 // ── The goal ───────────────────────────────────────────────────────────────
@@ -1436,6 +1679,8 @@ mod tests {
         field: Entity<TextField>,
         chrome: ComposerChrome,
         draft: String,
+        /// Empty space above the composer, for what pops up over it.
+        headroom: Option<gpui::Pixels>,
     }
 
     impl Harness {
@@ -1444,7 +1689,13 @@ mod tests {
                 field,
                 chrome,
                 draft: draft.to_string(),
+                headroom: None,
             }
+        }
+
+        fn with_headroom(mut self, headroom: Option<gpui::Pixels>) -> Self {
+            self.headroom = headroom;
+            self
         }
     }
 
@@ -1452,7 +1703,17 @@ mod tests {
         fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
             self.field
                 .update(cx, |field, cx| field.set_value(self.draft.clone(), cx));
-            view(&self.field, &mut self.chrome, window, cx)
+            let composer = view(&self.field, &mut self.chrome, window, cx);
+            match self.headroom {
+                Some(headroom) => div()
+                    .size_full()
+                    .flex()
+                    .flex_col()
+                    .child(div().h(headroom).flex_shrink_0())
+                    .child(composer)
+                    .into_any_element(),
+                None => composer,
+            }
         }
     }
 
@@ -1822,6 +2083,20 @@ mod tests {
         Entity<TextField>,
         Recorded,
     ) {
+        recording_with_headroom(chrome, draft, None)
+    }
+
+    /// The same, with empty space above the composer.
+    fn recording_with_headroom(
+        chrome: ComposerChrome,
+        draft: &str,
+        headroom: Option<gpui::Pixels>,
+    ) -> (
+        TestAppContext,
+        gpui::WindowHandle<Harness>,
+        Entity<TextField>,
+        Recorded,
+    ) {
         let mut test = TestAppContext::single();
         test.update(|cx| {
             cx.bind_keys([
@@ -1835,7 +2110,8 @@ mod tests {
         let field = test.update(|cx| cx.new(|cx| TextField::new(cx).multiline(4.0)));
         let mounted = field.clone();
         let draft = draft.to_string();
-        let window = test.add_window(move |_, _| Harness::new(mounted, chrome, &draft));
+        let window = test
+            .add_window(move |_, _| Harness::new(mounted, chrome, &draft).with_headroom(headroom));
         test.refresh().expect("the composer painted");
         (test, window, field, actions)
     }
@@ -2152,5 +2428,201 @@ mod tests {
                 "the primary control sits {inset}pt inside the card, not {expected}pt"
             );
         });
+    }
+
+    // ── The @ picker ────────────────────────────────────────────────────────
+
+    fn picker() -> MentionPopup {
+        let row = |path: &str| MentionRow {
+            key: format!("files|{path}"),
+            name: path.rsplit('/').next().unwrap().to_string().into(),
+            directory: path
+                .rsplit_once('/')
+                .map(|(dir, _)| dir)
+                .unwrap_or("")
+                .to_string()
+                .into(),
+            path: path.to_string(),
+        };
+        MentionPopup {
+            query: "comp".into(),
+            rows: vec![
+                row("crates/fx-app/src/composer.rs"),
+                row("crates/fx-app/src/commands.rs"),
+            ],
+            highlighted: Some("files|crates/fx-app/src/composer.rs".into()),
+            loading: false,
+            truncated: false,
+        }
+    }
+
+    #[test]
+    fn the_picker_s_keys_are_only_the_ones_that_work_it() {
+        let key = |key: &str| gpui::Keystroke::parse(key).unwrap();
+        assert_eq!(
+            mention_key_action(&key("down"), true),
+            Some(ComposerAction::MentionMove(1))
+        );
+        assert_eq!(
+            mention_key_action(&key("up"), true),
+            Some(ComposerAction::MentionMove(-1))
+        );
+        assert_eq!(
+            mention_key_action(&key("enter"), true),
+            Some(ComposerAction::MentionChoose(None))
+        );
+        assert_eq!(
+            mention_key_action(&key("tab"), true),
+            Some(ComposerAction::MentionChoose(None))
+        );
+        assert_eq!(
+            mention_key_action(&key("escape"), false),
+            Some(ComposerAction::MentionDismiss),
+            "Escape closes an empty picker too"
+        );
+        for taken_only_with_a_row in ["enter", "tab", "up", "down"] {
+            assert_eq!(
+                mention_key_action(&key(taken_only_with_a_row), false),
+                None,
+                "{taken_only_with_a_row} stays the field's while nothing can be taken"
+            );
+        }
+        assert_eq!(
+            mention_key_action(&key("cmd-enter"), true),
+            None,
+            "⌘↩ still sends"
+        );
+        assert_eq!(mention_key_action(&key("shift-tab"), true), None);
+        assert_eq!(
+            mention_key_action(&key("a"), true),
+            None,
+            "typing grows the token"
+        );
+        assert_eq!(mention_key_action(&key("backspace"), true), None);
+    }
+
+    #[test]
+    fn the_picker_draws_above_the_card_once_the_draft_has_focus_and_a_click_takes_a_row() {
+        // Room above the card, as the transcript leaves; with none the panel
+        // is snapped back into the window, which is also right.
+        let (mut test, window, field, actions) = recording_with_headroom(
+            ComposerChrome {
+                mention: Some(picker()),
+                ..live()
+            },
+            "Fix @comp",
+            Some(px(400.0)),
+        );
+        let mut visual = VisualTestContext::from_window(*window.deref(), &test);
+        assert!(
+            visual.debug_bounds(MENTION_SELECTOR).is_none(),
+            "an unfocused draft shows no picker"
+        );
+        focus(&mut test, &window, &field);
+        let mut visual = VisualTestContext::from_window(*window.deref(), &test);
+        let panel = visual
+            .debug_bounds(MENTION_SELECTOR)
+            .expect("the picker painted");
+        let card = visual.debug_bounds(CARD_SELECTOR).expect("the card");
+        assert!(
+            panel.bottom() <= card.top() && panel.origin.x == card.origin.x,
+            "the picker sits above the card, flush with its left edge: {panel:?} over {card:?}"
+        );
+        assert_eq!(panel.size.width, px(Layout::MENTION_PANEL_WIDTH));
+        let second = visual
+            .debug_bounds(mention_row_selector(1))
+            .expect("the second row");
+        assert!(visual.debug_bounds(mention_row_selector(2)).is_none());
+        visual.simulate_click(second.center(), Default::default());
+        assert_eq!(
+            actions.borrow().last(),
+            Some(&ComposerAction::MentionChoose(Some(
+                "files|crates/fx-app/src/commands.rs".into()
+            ))),
+            "all actions: {:?}",
+            actions.borrow()
+        );
+    }
+
+    #[test]
+    fn the_picker_takes_the_arrows_return_and_escape_while_open() {
+        let (mut test, window, field, actions) = recording(
+            ComposerChrome {
+                mention: Some(picker()),
+                ..live()
+            },
+            "Fix @comp",
+        );
+        focus(&mut test, &window, &field);
+        let mut visual = VisualTestContext::from_window(*window.deref(), &test);
+        visual.simulate_keystrokes("down up enter escape");
+        assert_eq!(
+            *actions.borrow(),
+            vec![
+                ComposerAction::MentionMove(1),
+                ComposerAction::MentionMove(-1),
+                ComposerAction::MentionChoose(None),
+                ComposerAction::MentionDismiss,
+            ]
+        );
+
+        // With nothing highlighted, Return and the arrows are the field's.
+        let (mut test, window, field, actions) = recording(
+            ComposerChrome {
+                mention: Some(MentionPopup {
+                    rows: Vec::new(),
+                    highlighted: None,
+                    loading: true,
+                    ..picker()
+                }),
+                ..live()
+            },
+            "Fix @comp",
+        );
+        focus(&mut test, &window, &field);
+        let mut visual = VisualTestContext::from_window(*window.deref(), &test);
+        visual.simulate_keystrokes("down enter escape");
+        assert_eq!(*actions.borrow(), vec![ComposerAction::MentionDismiss]);
+    }
+
+    #[test]
+    fn a_picker_with_nothing_to_show_says_so() {
+        for (popup, _reason) in [
+            (
+                MentionPopup {
+                    rows: Vec::new(),
+                    highlighted: None,
+                    loading: true,
+                    ..picker()
+                },
+                "listing",
+            ),
+            (
+                MentionPopup {
+                    rows: Vec::new(),
+                    highlighted: None,
+                    ..picker()
+                },
+                "no match",
+            ),
+            (
+                MentionPopup {
+                    truncated: true,
+                    ..picker()
+                },
+                "truncated",
+            ),
+        ] {
+            let (mut test, window, field, _) = recording(
+                ComposerChrome {
+                    mention: Some(popup),
+                    ..live()
+                },
+                "Fix @comp",
+            );
+            focus(&mut test, &window, &field);
+            let mut visual = VisualTestContext::from_window(*window.deref(), &test);
+            assert!(visual.debug_bounds(MENTION_SELECTOR).is_some());
+        }
     }
 }

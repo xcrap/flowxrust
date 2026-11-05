@@ -103,6 +103,17 @@ pub struct AppState {
     /// its threads reported them. Live state, never saved: the next response
     /// says what they are now.
     rate_limits: HashMap<String, fx_agent::provider::RateLimits>,
+    /// The files under each execution root, for the composer's `@` picker,
+    /// by root. Listed off the UI thread, and kept for `INDEX_TTL`.
+    file_indexes: HashMap<String, Arc<crate::file_mentions::FileIndex>>,
+    /// Roots whose listing is running, so a keystroke does not start another.
+    indexing: HashSet<String>,
+    /// The `@` picker open over a composer, if any. One at most: only the
+    /// active thread's composer is on screen.
+    mention: Option<crate::file_mentions::MentionSession>,
+    /// A mention the reader closed with Escape, by thread. It stays closed
+    /// while the token is what it was; typing on, or a new `@`, opens again.
+    dismissed_mention: Option<(Uuid, fx_core::policy::MentionToken)>,
     /// The revision, draft and image ids each transcript was handed to the writer at,
     /// or read from disk at. A version, never the bytes: the writer compares
     /// content by hash, so nothing here grows with the size of a transcript.
@@ -242,6 +253,10 @@ impl AppState {
             panel_save: None,
             context_probed: HashSet::new(),
             rate_limits: HashMap::new(),
+            file_indexes: HashMap::new(),
+            indexing: HashSet::new(),
+            mention: None,
+            dismissed_mention: None,
             saved_conversations: HashMap::new(),
             writer: Default::default(),
             loading: HashSet::new(),
@@ -1400,8 +1415,193 @@ impl AppState {
             },
         )
         .detach();
+        // The `@` picker follows the caret: every edit or caret move the
+        // field reports is checked for a mention being typed.
+        cx.observe(&field, move |state, field, cx| {
+            state.sync_mention(agent_id, &field, cx);
+        })
+        .detach();
         self.drafts.insert(agent_id, field.clone());
         field
+    }
+
+    // ── @-mentions ──────────────────────────────────────────────────────────
+
+    /// Follow a draft: open the `@` picker when the caret is at a mention
+    /// being typed, re-rank it as the token changes, and close it otherwise.
+    /// Runs on every change the field reports, so it does only what changed.
+    pub(crate) fn sync_mention(
+        &mut self,
+        agent_id: Uuid,
+        field: &Entity<TextField>,
+        cx: &mut Context<Self>,
+    ) {
+        use fx_core::policy::mention::mention_at;
+
+        let token = {
+            let field = field.read(cx);
+            field
+                .caret()
+                .and_then(|caret| mention_at(field.value(), caret))
+        };
+        let Some(token) = token else {
+            self.dismissed_mention
+                .take_if(|(dismissed, _)| *dismissed == agent_id);
+            self.close_mention(agent_id, cx);
+            return;
+        };
+        if self
+            .dismissed_mention
+            .as_ref()
+            .is_some_and(|(dismissed, dismissed_token)| {
+                *dismissed == agent_id && *dismissed_token == token
+            })
+        {
+            return;
+        }
+        self.dismissed_mention
+            .take_if(|(dismissed, _)| *dismissed == agent_id);
+        let Some(root) = self.project_root_for(agent_id) else {
+            self.close_mention(agent_id, cx);
+            return;
+        };
+        let changed = match &mut self.mention {
+            Some(session) if session.agent_id == agent_id && session.root == root => {
+                session.retarget(token)
+            }
+            _ => {
+                let index = self
+                    .file_indexes
+                    .get(&root)
+                    .filter(|index| index.is_fresh(Instant::now()))
+                    .cloned();
+                self.mention = Some(crate::file_mentions::MentionSession::open(
+                    agent_id, &root, token, index,
+                ));
+                true
+            }
+        };
+        self.ensure_file_index(&root, cx);
+        if changed {
+            cx.notify();
+        }
+    }
+
+    fn close_mention(&mut self, agent_id: Uuid, cx: &mut Context<Self>) {
+        if self
+            .mention
+            .take_if(|session| session.agent_id == agent_id)
+            .is_some()
+        {
+            cx.notify();
+        }
+    }
+
+    /// List a root's files off the UI thread, unless a fresh listing exists
+    /// or one is already running. A stale listing keeps serving until the new
+    /// one lands, so the picker never empties while a root is re-read.
+    pub(crate) fn ensure_file_index(&mut self, root: &str, cx: &mut Context<Self>) {
+        if self
+            .file_indexes
+            .get(root)
+            .is_some_and(|index| index.is_fresh(Instant::now()))
+            || !self.indexing.insert(root.to_string())
+        {
+            return;
+        }
+        let path = std::path::PathBuf::from(root);
+        let listing = cx.background_spawn(async move {
+            fx_core::services::list_files(&path, crate::file_mentions::MAX_INDEXED_FILES)
+        });
+        let root = root.to_string();
+        cx.spawn(async move |this, cx| {
+            let listing = listing.await;
+            let _ = this.update(cx, |state, cx| {
+                state.indexing.remove(&root);
+                state.adopt_file_index(crate::file_mentions::FileIndex::new(root, listing), cx);
+            });
+        })
+        .detach();
+    }
+
+    /// Keep a root's listing, and hand it to the picker open over that root.
+    pub(crate) fn adopt_file_index(
+        &mut self,
+        index: crate::file_mentions::FileIndex,
+        cx: &mut Context<Self>,
+    ) {
+        let index = Arc::new(index);
+        self.file_indexes.insert(index.root.clone(), index.clone());
+        if let Some(session) = &mut self.mention
+            && session.root == index.root
+        {
+            session.set_index(index);
+            cx.notify();
+        }
+    }
+
+    /// The picker to draw over a thread's composer, if one is open there.
+    pub fn mention_popup(&self, agent_id: Uuid) -> Option<crate::composer::MentionPopup> {
+        self.mention
+            .as_ref()
+            .filter(|session| session.agent_id == agent_id)
+            .map(crate::file_mentions::MentionSession::popup)
+    }
+
+    /// Move the picker's highlight by rows, wrapping. Says whether it moved.
+    pub(crate) fn mention_move(&mut self, delta: isize, cx: &mut Context<Self>) -> bool {
+        let moved = self
+            .mention
+            .as_mut()
+            .is_some_and(|session| session.move_highlight(delta));
+        if moved {
+            cx.notify();
+        }
+        moved
+    }
+
+    /// Highlight the row under the pointer. Says whether the highlight moved.
+    pub(crate) fn mention_highlight(&mut self, key: &str, cx: &mut Context<Self>) -> bool {
+        let moved = self
+            .mention
+            .as_mut()
+            .is_some_and(|session| session.set_highlight(key));
+        if moved {
+            cx.notify();
+        }
+        moved
+    }
+
+    /// Take a row — the one named, or the highlighted one — into the draft:
+    /// the typed token becomes `@path ` in one undoable step, and the picker
+    /// closes. Says whether the draft changed.
+    pub(crate) fn mention_choose(&mut self, key: Option<&str>, cx: &mut Context<Self>) -> bool {
+        let Some(session) = &self.mention else {
+            return false;
+        };
+        let Some(path) = session.path_for(key).map(str::to_string) else {
+            return false;
+        };
+        let agent_id = session.agent_id;
+        let range = session.token.range.clone();
+        self.mention = None;
+        cx.notify();
+        let Some(field) = self.drafts.get(&agent_id).cloned() else {
+            return false;
+        };
+        let mention = fx_core::policy::mention::mention_text(&path);
+        field.update(cx, |field, cx| field.replace_range(range, &mention, cx))
+    }
+
+    /// Close the picker without taking anything. It stays closed for this
+    /// token, so Escape is not undone by the repaint that follows it.
+    pub(crate) fn mention_dismiss(&mut self, cx: &mut Context<Self>) -> bool {
+        let Some(session) = self.mention.take() else {
+            return false;
+        };
+        self.dismissed_mention = Some((session.agent_id, session.token));
+        cx.notify();
+        true
     }
 
     pub(crate) fn append_prompt_context(
@@ -3429,6 +3629,9 @@ impl AppState {
     /// Release the composer's buffers and invalidate in-flight imports before
     /// its conversation is reset or removed. Do not dispatch a deleted queue.
     fn release_composer(&mut self, agent_id: Uuid) {
+        self.mention.take_if(|session| session.agent_id == agent_id);
+        self.dismissed_mention
+            .take_if(|(dismissed, _)| *dismissed == agent_id);
         self.composer.reference_picks.remove(&agent_id);
         if let Some(conversation) = self.conversations.get(&agent_id) {
             let conversation = conversation
@@ -7863,6 +8066,194 @@ mod persistence_tests {
                 assert_eq!(received.try_recv().ok(), Some(approval(true)));
                 assert!(received.try_recv().is_err());
             })
+        });
+    }
+
+    // ── @-mentions ──────────────────────────────────────────────────────────
+
+    fn fresh_index(root: &str, paths: &[&str]) -> crate::file_mentions::FileIndex {
+        crate::file_mentions::FileIndex::new(
+            root,
+            fx_core::services::FileListing {
+                paths: paths.iter().map(|path| path.to_string()).collect(),
+                truncated: false,
+                source: fx_core::services::ListingSource::Walk,
+            },
+        )
+    }
+
+    const PROJECT_FILES: [&str; 3] = [
+        "AGENTS.md",
+        "crates/fx-app/src/commands.rs",
+        "crates/fx-app/src/composer.rs",
+    ];
+
+    #[test]
+    fn typing_an_at_opens_the_file_picker_and_taking_a_row_inserts_the_mention() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = AppPaths::at(temp.path().join("state"));
+        let test = gpui::TestAppContext::single();
+        let (state, _project, agent, _) = test.update(|cx| workspace(cx, &paths));
+        test.update(|cx| {
+            state.update(cx, |state, cx| {
+                let root = state.project_root_for(agent).unwrap();
+                state.adopt_file_index(fresh_index(&root, &PROJECT_FILES), cx);
+                // The field exists before anything is typed into it, as it
+                // does once a thread is shown.
+                state.draft(agent, cx);
+            });
+        });
+        test.update(|cx| {
+            state.update(cx, |state, cx| {
+                let draft = state.draft(agent, cx);
+                draft.update(cx, |field, cx| field.set_value("Fix @co", cx));
+            });
+        });
+        // The field's change reaches the state as an observer, after the
+        // update that made it.
+        let popup = test
+            .update(|cx| state.read(cx).mention_popup(agent))
+            .expect("the picker opened on the `@`");
+        let rows: Vec<&str> = popup.rows.iter().map(|row| row.path.as_str()).collect();
+        assert_eq!(
+            rows,
+            [
+                "crates/fx-app/src/commands.rs",
+                "crates/fx-app/src/composer.rs"
+            ],
+            "both names match alike and read in name order; AGENTS.md does not match"
+        );
+        assert_eq!(popup.query, "co");
+        assert_eq!(
+            popup.highlighted.as_deref(),
+            Some(popup.rows[0].key.as_str()),
+            "the best match is highlighted"
+        );
+        assert!(!popup.loading, "the fresh listing served it at once");
+
+        test.update(|cx| {
+            state.update(cx, |state, cx| {
+                assert!(state.mention_move(1, cx));
+                assert_eq!(
+                    state.mention_popup(agent).unwrap().highlighted.as_deref(),
+                    Some(popup.rows[1].key.as_str())
+                );
+                assert!(
+                    state.mention_highlight(&popup.rows[0].key, cx),
+                    "the pointer moves the same highlight"
+                );
+                assert!(
+                    !state.mention_highlight(&popup.rows[0].key, cx),
+                    "and staying on a row costs nothing"
+                );
+                assert!(state.mention_choose(None, cx));
+            });
+        });
+        test.update(|cx| {
+            let draft = state.update(cx, |state, cx| state.draft(agent, cx));
+            assert_eq!(
+                draft.read(cx).value(),
+                "Fix @crates/fx-app/src/commands.rs "
+            );
+            assert!(
+                state.read(cx).mention_popup(agent).is_none(),
+                "taking a row closes the picker"
+            );
+        });
+    }
+
+    #[test]
+    fn escape_keeps_the_picker_closed_for_that_token_and_an_email_never_opens_it() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = AppPaths::at(temp.path().join("state"));
+        let test = gpui::TestAppContext::single();
+        let (state, _project, agent, _) = test.update(|cx| workspace(cx, &paths));
+        test.update(|cx| {
+            state.update(cx, |state, cx| {
+                let root = state.project_root_for(agent).unwrap();
+                state.adopt_file_index(fresh_index(&root, &PROJECT_FILES), cx);
+                state.draft(agent, cx);
+            });
+        });
+        let type_text = |text: &str| {
+            test.update(|cx| {
+                state.update(cx, |state, cx| {
+                    let draft = state.draft(agent, cx);
+                    draft.update(cx, |field, cx| field.set_value(text, cx));
+                });
+            });
+        };
+        let open = || test.update(|cx| state.read(cx).mention_popup(agent).is_some());
+
+        type_text("See @AG");
+        assert!(open());
+        test.update(|cx| {
+            state.update(cx, |state, cx| {
+                assert!(state.mention_dismiss(cx));
+                assert!(!state.mention_dismiss(cx), "nothing left to close");
+            });
+        });
+        assert!(!open());
+        type_text("See @AG");
+        assert!(!open(), "the same token stays closed");
+        type_text("See @AGE");
+        assert!(open(), "typing on opens it again");
+        type_text("See @AG");
+        assert!(open(), "the change cleared the dismissal");
+        type_text("mail me@example.com");
+        assert!(!open(), "an address is not a mention");
+        type_text("See (@AG");
+        assert!(open(), "an opening bracket may precede the `@`");
+        type_text("See @AG and");
+        assert!(!open(), "the caret has left the token");
+        type_text("");
+        assert!(!open());
+    }
+
+    #[test]
+    fn a_root_not_yet_listed_opens_the_picker_empty_and_fills_it_off_the_ui_thread() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = AppPaths::at(temp.path().join("state"));
+        std::fs::create_dir_all(temp.path().join("src")).unwrap();
+        std::fs::write(temp.path().join("src/main.rs"), "fn main() {}\n").unwrap();
+        std::fs::write(temp.path().join("README.md"), "# Hi\n").unwrap();
+        let mut test = gpui::TestAppContext::single();
+        let (state, _project, agent, _) = test.update(|cx| workspace(cx, &paths));
+        test.update(|cx| {
+            state.update(cx, |state, cx| {
+                state.draft(agent, cx);
+            });
+        });
+        test.update(|cx| {
+            state.update(cx, |state, cx| {
+                let draft = state.draft(agent, cx);
+                draft.update(cx, |field, cx| field.set_value("Read @ma", cx));
+            });
+        });
+        let popup = test
+            .update(|cx| state.read(cx).mention_popup(agent))
+            .expect("the picker opens before the listing lands");
+        assert!(popup.loading && popup.rows.is_empty());
+
+        test.run_until_parked();
+        let popup = test
+            .update(|cx| state.read(cx).mention_popup(agent))
+            .expect("the picker is still open");
+        assert!(!popup.loading, "the listing landed");
+        let rows: Vec<&str> = popup.rows.iter().map(|row| row.path.as_str()).collect();
+        assert_eq!(
+            rows,
+            ["src/main.rs"],
+            "the folder was walked; the saved state is not a match"
+        );
+        test.update(|cx| {
+            state.update(cx, |state, cx| {
+                assert!(state.mention_choose(None, cx));
+                assert_eq!(
+                    state.draft(agent, cx).read(cx).value(),
+                    "Read @src/main.rs "
+                );
+            });
         });
     }
 }

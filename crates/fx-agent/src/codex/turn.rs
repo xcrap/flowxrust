@@ -164,6 +164,9 @@ pub struct CodexSession {
     /// `run_turn_interactive` holds the session mutably.
     steer_turn: std::sync::Arc<std::sync::Mutex<Option<String>>>,
     approvals: ApprovalPolicy,
+    /// The thread's `cwd`, which every turn and steer runs in and which a
+    /// prompt's `@path` mentions are resolved against.
+    working_directory: String,
 }
 
 impl std::fmt::Debug for CodexSession {
@@ -219,6 +222,7 @@ impl CodexSession {
             starting: None,
             steer_turn: Default::default(),
             approvals,
+            working_directory: working_directory.to_string(),
         })
     }
 
@@ -533,6 +537,7 @@ pub struct TurnSteerer {
     requester: Requester,
     thread_id: String,
     turn: std::sync::Arc<std::sync::Mutex<Option<String>>>,
+    working_directory: String,
 }
 
 impl TurnSteerer {
@@ -569,6 +574,7 @@ impl TurnSteerer {
                     id,
                     prompt,
                     image_paths,
+                    &self.working_directory,
                 )),
             )
             .await
@@ -589,6 +595,7 @@ impl CodexSession {
             requester: self.transport.requester(),
             thread_id: self.thread_id.clone(),
             turn: self.steer_turn.clone(),
+            working_directory: self.working_directory.clone(),
         }
     }
 

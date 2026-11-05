@@ -1004,6 +1004,64 @@ up those origins directly and visits only lines and selection rectangles that
 intersect the viewport. Scanning preceding rows for every painted line made a
 large multiline draft quadratic, even when almost all of it was clipped.
 
+### @-mentions
+
+Typing `@` in the composer opens a picker over the files under the thread's
+execution root (`AppState::project_root_for`); a row is taken with Return,
+Tab or a click, and lands in the draft as `@path ` in one undoable step
+(`TextField::replace_range`). The pure halves are in `fx-core`:
+`policy::mention` finds the token at the caret (`mention_at`) and ranks paths
+for it (`rank`), and `services::file_listing` lists a folder. What the two
+CLIs do with a mention was checked live, not read from documentation, and
+each rule below came from that run:
+
+- **Claude reads `@path` out of the text itself.** In print mode and through
+  stream-json user messages alike, Claude Code 2.1.283 expanded `@AGENTS.md`
+  before the model saw the prompt: it answered the file's first heading with
+  no tool call. So the draft is the whole message, and FlowX adds nothing.
+- **Codex does not.** Given the same text, codex-cli 0.164 ran `head` on the
+  file. Given a `{type: "mention", name, path}` input item beside the text, it
+  answered from the file with no command. `turn_input` in `codex/session.rs`
+  adds one per `@path` that names a file, relative to the thread's `cwd` or
+  absolute, with trailing punctuation dropped (`see @src/lib.rs,`); the text
+  keeps its `@path`. Codex records the item in the `userMessage`'s content,
+  and the history reader turns one back into `@path` only where the text does
+  not already name it — a prompt from the Codex app — so FlowX's own prompts
+  still match their history.
+- **Neither reads a mention past whitespace**, so a path with a space in it
+  cannot be mentioned and is not offered. `@` after a letter is an address or
+  a scoped package, not a mention; after whitespace or an opening bracket it
+  is one.
+
+The listing is `git ls-files --cached --others --exclude-standard` minus the
+deleted files, so the repository's ignore rules apply, and for a folder that
+is not a checkout a walk bounded in depth with the Files panel's skip list.
+It runs on the background executor, is kept per root for `INDEX_TTL` (a turn
+writes files for as long as it runs) and is capped at `MAX_INDEXED_FILES`,
+past which the popup says the list is a prefix. A stale listing keeps serving
+until its replacement lands, so the picker never empties while a root is
+re-read. Codex's `fuzzyFileSearch` is not used: the app-server only lives
+during a turn, and a picker that worked only while Codex was busy would be
+two pickers.
+
+The popup is drawn by the composer, never by a layer of its own:
+`deferred(anchored().anchor(Corner::BottomLeft))` as a child of a wrapper
+around the card, so it grows upward over the transcript, paints above the
+rows, and stays inside the window with the menus' margin. Its rows are a
+`MenuModel`, so pointer and keyboard share one highlight and movement wraps
+as in every menu. Its keys are caught by the composer's `capture_key_down`
+on the way down to the field, only while the picker is open under a focused
+draft and only unmodified: the arrows and Return are the field's again as
+soon as there is no row to take, and ⌘↩ still sends. Escape closes the
+picker for that token — the state remembers the dismissed token, because the
+next repaint would otherwise reopen it — and typing on opens it again.
+
+One GPUI detail that bit the tests: an observer registered in the same
+update as the first `notify` it should see misses it. `cx.observe` activates
+through a deferred effect, and `notify` is deduplicated while one is pending,
+so a field created and typed into in one update merges both notifies ahead
+of the activation. Create the field in one update and type in the next.
+
 ### Running a turn
 
 The runner owns a `CodexSession` for a turn's lifetime and writes events into

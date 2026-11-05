@@ -7,15 +7,18 @@
 use std::path::Path;
 
 /// Directories skipped wherever they appear in a relative path.
-pub const SKIPPED_DIRECTORY_NAMES: [&str; 8] = [
+pub const SKIPPED_DIRECTORY_NAMES: [&str; 11] = [
     ".git",
     ".build",
     ".next",
     ".swiftpm",
+    ".venv",
     "DerivedData",
+    "__pycache__",
     "build",
     "dist",
     "node_modules",
+    "target",
 ];
 
 pub struct ProjectFileIndexPolicy;
@@ -63,6 +66,9 @@ mod tests {
             "DerivedData",
             ".next",
             ".build",
+            "target",
+            ".venv",
+            "__pycache__",
         ] {
             assert!(
                 ProjectFileIndexPolicy::should_skip(&PathBuf::from(dir), true),

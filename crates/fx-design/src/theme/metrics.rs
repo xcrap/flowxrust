@@ -212,6 +212,12 @@ impl Layout {
     /// Composer auto-grow bounds.
     pub const COMPOSER_MIN_HEIGHT: f32 = 28.0;
     pub const COMPOSER_MAX_HEIGHT: f32 = 120.0;
+    /// The `@` file picker above the composer: twice a menu, so a nested
+    /// path reads whole beside its file name.
+    pub const MENTION_PANEL_WIDTH: f32 = 440.0;
+    /// Rows the picker shows at most. It ranks rather than scrolls: a reader
+    /// who does not see the file types more of its name.
+    pub const MENTION_MAX_ROWS: usize = 8;
 
     // Diff rows
     /// Height of a file header row in the diff list.
