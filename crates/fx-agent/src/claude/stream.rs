@@ -43,7 +43,7 @@
 //! a subagent owns tells that subagent. Waiting for an answer to any of those
 //! held the input open with nothing left to come.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 
 use serde_json::{Value, json};
 
@@ -71,6 +71,14 @@ pub struct ClaudeStreamParser {
     session_id: Option<String>,
     /// Set once a `text_delta` frame arrives, so the `assistant` echo is dropped.
     saw_text_delta: bool,
+    /// Set once a `thinking_delta` with text arrives, for the same reason: the
+    /// assembled `assistant` frame repeats the whole thought.
+    saw_thinking_delta: bool,
+    /// The content blocks the current message has opened and not yet closed,
+    /// by index. A delta names only its index, so this is how a
+    /// `content_block_stop` is known to end a thought, and how a tool call's
+    /// streamed input finds its call.
+    open_blocks: HashMap<u64, OpenBlock>,
     /// Tool-use ids already reported, because they arrive twice.
     /// Tool ids already reported, oldest first.
     ///
@@ -145,6 +153,26 @@ pub struct ClaudeStreamParser {
     /// it would have the agent ask itself things and guess.
     pub auto_approve: bool,
 }
+
+/// A content block Claude has started streaming and not yet closed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum OpenBlock {
+    /// A thinking block. Whether its text streamed is remembered, so the stop
+    /// of one whose text was withheld ends nothing.
+    Thinking { streamed: bool },
+    /// A tool call reported as its block opened, whose arguments stream in
+    /// `input_json_delta` frames until the assembled frame carries them
+    /// whole, which `finalized` records.
+    Tool { id: String, finalized: bool },
+    /// Any other block: text, a plan call held for its assembled frame, or
+    /// one this build does not know.
+    Other,
+}
+
+/// The most content blocks remembered as open at once. Every block is closed
+/// by its `content_block_stop`, so this is a guard against a stream that
+/// never sends one, not a limit any real message reaches.
+const MAX_OPEN_BLOCKS: usize = 64;
 
 /// One task the parser has seen start.
 #[derive(Debug, Clone)]
@@ -486,8 +514,17 @@ impl ClaudeStreamParser {
                 // and its text has not streamed yet.
                 self.did_finish = false;
                 self.saw_text_delta = false;
+                self.saw_thinking_delta = false;
+                self.open_blocks.clear();
                 vec![ProviderEvent::Lifecycle(Lifecycle::TurnStarted)]
             }
+            // How much the model has thought, estimated as it goes. Sent for
+            // every thinking display, so a withheld thought still has a size.
+            Some("thinking_tokens") => envelope
+                .get("estimated_tokens")
+                .and_then(Value::as_u64)
+                .map(|estimated_tokens| vec![ProviderEvent::ThinkingProgress { estimated_tokens }])
+                .unwrap_or_default(),
             Some("status")
                 if envelope.get("status").and_then(Value::as_str) == Some("compacting") =>
             {
@@ -694,27 +731,144 @@ impl ClaudeStreamParser {
         self.tasks_started
     }
 
-    /// A streamed frame. Only text deltas are meaningful here.
+    /// A streamed frame: the start, deltas and stop of each content block.
+    ///
+    /// Text and thinking deltas are the reply and the reasoning as they are
+    /// written. The thinking is only there under `--thinking-display
+    /// summarized`; the default print-mode display sends every
+    /// `thinking_delta` with empty text, which is nothing to stream. Its
+    /// `estimated_tokens` was `null` on every frame seen from Claude Code
+    /// 2.1.283, which reports the estimate as `system` `thinking_tokens`
+    /// instead; it is read here anyway for a CLI that fills it in.
     fn stream_event(&mut self, envelope: &Value) -> Vec<ProviderEvent> {
         let Some(event) = envelope.get("event") else {
             return Vec::new();
         };
-        if event.get("type").and_then(Value::as_str) != Some("content_block_delta") {
-            return Vec::new();
+        let index = event.get("index").and_then(Value::as_u64);
+        match event.get("type").and_then(Value::as_str) {
+            Some("content_block_start") => {
+                let Some(index) = index else {
+                    return Vec::new();
+                };
+                let mut events = Vec::new();
+                let block = match event.pointer("/content_block/type").and_then(Value::as_str) {
+                    Some("thinking") => OpenBlock::Thinking { streamed: false },
+                    // The call opens now, with no arguments yet, so its row
+                    // is on screen while they stream. A plan call waits for
+                    // its assembled frame: half a plan is not a plan card,
+                    // and it would sit in the group as a bare row until then.
+                    Some("tool_use") => {
+                        let name = event
+                            .pointer("/content_block/name")
+                            .and_then(Value::as_str)
+                            .unwrap_or("Tool");
+                        let id = non_empty(event.pointer("/content_block/id"))
+                            .unwrap_or_else(|| format!("claude-tool-{}", self.sequence));
+                        if fx_core::policy::TurnPlan::is_plan_tool(name) || !self.remember_tool(&id)
+                        {
+                            OpenBlock::Other
+                        } else {
+                            events.push(ProviderEvent::ToolUse {
+                                id: id.clone(),
+                                name: name.to_string(),
+                                input: String::new(),
+                            });
+                            OpenBlock::Tool {
+                                id,
+                                finalized: false,
+                            }
+                        }
+                    }
+                    _ => OpenBlock::Other,
+                };
+                if self.open_blocks.len() >= MAX_OPEN_BLOCKS {
+                    self.open_blocks.clear();
+                }
+                self.open_blocks.insert(index, block);
+                events
+            }
+            Some("content_block_delta") => {
+                let Some(delta) = event.get("delta") else {
+                    return Vec::new();
+                };
+                match delta.get("type").and_then(Value::as_str) {
+                    Some("text_delta") => {
+                        let Some(text) = delta.get("text").and_then(Value::as_str) else {
+                            return Vec::new();
+                        };
+                        // Recorded before returning, because the matching
+                        // `assistant` frame is already on its way and will
+                        // arrive in the same stream.
+                        self.saw_text_delta = true;
+                        vec![ProviderEvent::TextDelta(text.to_string())]
+                    }
+                    Some("thinking_delta") => {
+                        let mut events = Vec::new();
+                        if let Some(text) = delta
+                            .get("thinking")
+                            .and_then(Value::as_str)
+                            .filter(|text| !text.is_empty())
+                        {
+                            self.saw_thinking_delta = true;
+                            // A delta for a block whose start was missed, or
+                            // that names no index, is still a thought: it is
+                            // remembered so that its stop can end it.
+                            self.open_blocks.insert(
+                                index.unwrap_or(u64::MAX),
+                                OpenBlock::Thinking { streamed: true },
+                            );
+                            events.push(ProviderEvent::ThinkingDelta(text.to_string()));
+                        }
+                        if let Some(estimated_tokens) =
+                            delta.get("estimated_tokens").and_then(Value::as_u64)
+                        {
+                            events.push(ProviderEvent::ThinkingProgress { estimated_tokens });
+                        }
+                        events
+                    }
+                    // A call's arguments, a piece at a time, for a call whose
+                    // block was opened here. One opened some other way has
+                    // no row yet, and its assembled frame will carry the lot.
+                    Some("input_json_delta") => {
+                        let Some(partial) = delta
+                            .get("partial_json")
+                            .and_then(Value::as_str)
+                            .filter(|partial| !partial.is_empty())
+                        else {
+                            return Vec::new();
+                        };
+                        match index.and_then(|index| self.open_blocks.get(&index)) {
+                            Some(OpenBlock::Tool { id, .. }) => {
+                                vec![ProviderEvent::ToolInputDelta {
+                                    id: id.clone(),
+                                    delta: partial.to_string(),
+                                }]
+                            }
+                            _ => Vec::new(),
+                        }
+                    }
+                    _ => Vec::new(),
+                }
+            }
+            Some("content_block_stop") => {
+                let block = match index {
+                    Some(index) => self.open_blocks.remove(&index),
+                    None => self.open_blocks.remove(&u64::MAX),
+                };
+                match block {
+                    Some(OpenBlock::Thinking { streamed: true }) => {
+                        vec![ProviderEvent::ThinkingEnd]
+                    }
+                    _ => Vec::new(),
+                }
+            }
+            // The message is over, and with it every block it opened.
+            Some("message_stop") => {
+                self.open_blocks.clear();
+                Vec::new()
+            }
+            _ => Vec::new(),
         }
-        let Some(delta) = event.get("delta") else {
-            return Vec::new();
-        };
-        if delta.get("type").and_then(Value::as_str) != Some("text_delta") {
-            return Vec::new();
-        }
-        let Some(text) = delta.get("text").and_then(Value::as_str) else {
-            return Vec::new();
-        };
-        // Recorded before returning, because the matching `assistant` frame is
-        // already on its way and will arrive in the same stream.
-        self.saw_text_delta = true;
-        vec![ProviderEvent::TextDelta(text.to_string())]
     }
 
     /// The assembled assistant message.
@@ -750,9 +904,30 @@ impl ClaudeStreamParser {
                         events.push(ProviderEvent::Text(text.to_string()));
                     }
                 }
+                // The thought whole, for a run whose deltas carried no text.
+                // Where they did, the stream has already said all of this.
+                Some("thinking") if !self.saw_thinking_delta => {
+                    if let Some(text) = block.get("thinking").and_then(Value::as_str)
+                        && !text.trim().is_empty()
+                    {
+                        events.push(ProviderEvent::Thinking(text.to_string()));
+                    }
+                }
                 Some("tool_use") => {
                     let id = non_empty(block.get("id"))
                         .unwrap_or_else(|| format!("claude-tool-{}", self.sequence));
+                    let input = json_string(block.get("input")).unwrap_or_else(|| "{}".into());
+                    // A call reported as its block opened has its row; this
+                    // frame has its arguments whole, in place of what streamed.
+                    if let Some(OpenBlock::Tool { finalized, .. }) = self
+                        .open_blocks
+                        .values_mut()
+                        .find(|open| matches!(open, OpenBlock::Tool { id: open_id, finalized: false } if *open_id == id))
+                    {
+                        *finalized = true;
+                        events.push(ProviderEvent::ToolInput { id, input });
+                        continue;
+                    }
                     // Claude reports a call in both the stream and the assembled
                     // message; the id is the only thing that tells them apart.
                     if !self.remember_tool(&id) {
@@ -765,7 +940,7 @@ impl ClaudeStreamParser {
                             .and_then(Value::as_str)
                             .unwrap_or("Tool")
                             .to_string(),
-                        input: json_string(block.get("input")).unwrap_or_else(|| "{}".into()),
+                        input,
                     });
                 }
                 _ => {}
@@ -902,6 +1077,8 @@ impl ClaudeStreamParser {
     /// swallow that turn's only text.
     pub fn reset(&mut self) {
         self.saw_text_delta = false;
+        self.saw_thinking_delta = false;
+        self.open_blocks.clear();
         self.seen_tool_ids.clear();
         self.did_finish = false;
         self.prompt_consumed = false;
@@ -2734,10 +2911,247 @@ mod tests {
         assert_eq!(events, vec![ProviderEvent::InputTaken { id: None }]);
     }
 
+    /// What Claude Code 2.1.283 streams for a thought under
+    /// `--thinking-display summarized`, with the signature frames dropped: the
+    /// block opens, the estimate comes as a `system` frame, the text comes in
+    /// deltas, the assembled frame repeats it whole, and the block closes.
+    fn summarized_thought_frames() -> Vec<Value> {
+        vec![
+            json!({"type": "system", "subtype": "init", "session_id": "s1"}),
+            json!({"type": "stream_event", "event": {"type": "content_block_start", "index": 0,
+                   "content_block": {"type": "thinking", "thinking": "", "signature": ""}}}),
+            json!({"type": "system", "subtype": "thinking_tokens",
+                   "estimated_tokens": 6, "estimated_tokens_delta": 6}),
+            json!({"type": "stream_event", "event": {"type": "content_block_delta", "index": 0,
+                   "delta": {"type": "thinking_delta", "thinking": "I'm counting ",
+                             "estimated_tokens": null}}}),
+            json!({"type": "stream_event", "event": {"type": "content_block_delta", "index": 0,
+                   "delta": {"type": "thinking_delta", "thinking": "the letter r.",
+                             "estimated_tokens": null}}}),
+            json!({"type": "stream_event", "event": {"type": "content_block_delta", "index": 0,
+                   "delta": {"type": "signature_delta", "signature": "CAQ"}}}),
+            json!({"type": "assistant", "message": {"content": [
+                {"type": "thinking", "thinking": "I'm counting the letter r.", "signature": "CAQ"}
+            ]}}),
+            json!({"type": "stream_event", "event": {"type": "content_block_stop", "index": 0}}),
+            json!({"type": "stream_event", "event": {"type": "content_block_start", "index": 1,
+                   "content_block": {"type": "text", "text": ""}}}),
+            json!({"type": "stream_event", "event": {"type": "content_block_delta", "index": 1,
+                   "delta": {"type": "text_delta", "text": "3"}}}),
+            json!({"type": "assistant", "message": {"content": [{"type": "text", "text": "3"}]}}),
+            json!({"type": "stream_event", "event": {"type": "content_block_stop", "index": 1}}),
+            json!({"type": "stream_event", "event": {"type": "message_stop"}}),
+        ]
+    }
+
+    #[test]
+    fn a_summarized_thought_streams_once_and_ends_at_its_block_stop() {
+        let mut parser = ClaudeStreamParser::new();
+        let mut events = Vec::new();
+        for frame in summarized_thought_frames() {
+            events.extend(parser.events(&line(frame)));
+        }
+        assert_eq!(
+            events,
+            vec![
+                ProviderEvent::Lifecycle(Lifecycle::TurnStarted),
+                ProviderEvent::ThinkingProgress {
+                    estimated_tokens: 6
+                },
+                ProviderEvent::ThinkingDelta("I'm counting ".into()),
+                ProviderEvent::ThinkingDelta("the letter r.".into()),
+                ProviderEvent::ThinkingEnd,
+                ProviderEvent::TextDelta("3".into()),
+            ],
+            "the assembled thinking block must not repeat the thought, and the \
+             text block's stop must not end anything"
+        );
+        assert!(parser.open_blocks.is_empty(), "every block was closed");
+    }
+
+    #[test]
+    fn a_tool_call_opens_at_its_block_start_and_streams_its_arguments() {
+        // Shapes from Claude Code 2.1.283: the block opens with an empty
+        // `input`, the arguments come as partial JSON, the assembled frame
+        // repeats the call with them whole, and the block closes.
+        let mut parser = ClaudeStreamParser::new();
+        let mut events = Vec::new();
+        for frame in [
+            json!({"type": "system", "subtype": "init", "session_id": "s1"}),
+            json!({"type": "stream_event", "event": {"type": "content_block_start", "index": 0,
+                   "content_block": {"type": "tool_use", "id": "t1", "name": "Read", "input": {}}}}),
+            json!({"type": "stream_event", "event": {"type": "content_block_delta", "index": 0,
+                   "delta": {"type": "input_json_delta", "partial_json": ""}}}),
+            json!({"type": "stream_event", "event": {"type": "content_block_delta", "index": 0,
+                   "delta": {"type": "input_json_delta", "partial_json": "{\"file_path\": "}}}),
+            json!({"type": "stream_event", "event": {"type": "content_block_delta", "index": 0,
+                   "delta": {"type": "input_json_delta", "partial_json": "\"/a.rs\"}"}}}),
+            json!({"type": "assistant", "message": {"content": [
+                {"type": "tool_use", "id": "t1", "name": "Read", "input": {"file_path": "/a.rs"}}
+            ]}}),
+            json!({"type": "stream_event", "event": {"type": "content_block_stop", "index": 0}}),
+            json!({"type": "stream_event", "event": {"type": "message_stop"}}),
+            json!({"type": "user", "message": {"content": [
+                {"type": "tool_result", "tool_use_id": "t1", "content": "fn a() {}"}
+            ]}}),
+        ] {
+            events.extend(parser.events(&line(frame)));
+        }
+        assert_eq!(
+            events,
+            vec![
+                ProviderEvent::Lifecycle(Lifecycle::TurnStarted),
+                ProviderEvent::ToolUse {
+                    id: "t1".into(),
+                    name: "Read".into(),
+                    input: String::new(),
+                },
+                ProviderEvent::ToolInputDelta {
+                    id: "t1".into(),
+                    delta: "{\"file_path\": ".into(),
+                },
+                ProviderEvent::ToolInputDelta {
+                    id: "t1".into(),
+                    delta: "\"/a.rs\"}".into(),
+                },
+                ProviderEvent::ToolInput {
+                    id: "t1".into(),
+                    input: r#"{"file_path":"/a.rs"}"#.into(),
+                },
+                ProviderEvent::ToolResult {
+                    id: "t1".into(),
+                    content: "fn a() {}".into(),
+                    is_error: false,
+                },
+            ],
+            "the assembled frame must finish the call it opened, not repeat it"
+        );
+        // Repeated once more, the assembled frame is the duplicate it always was.
+        assert!(
+            parser
+                .events(&line(json!({"type": "assistant", "message": {"content": [
+                    {"type": "tool_use", "id": "t1", "name": "Read", "input": {"file_path": "/a.rs"}}
+                ]}})))
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn a_plan_call_waits_for_its_assembled_frame() {
+        // Half a plan is not a plan card, so the block's start says nothing
+        // and its deltas go unread; the assembled frame is the call.
+        let mut parser = ClaudeStreamParser::new();
+        let mut events = Vec::new();
+        for frame in [
+            json!({"type": "stream_event", "event": {"type": "content_block_start", "index": 0,
+                   "content_block": {"type": "tool_use", "id": "p1", "name": "TodoWrite", "input": {}}}}),
+            json!({"type": "stream_event", "event": {"type": "content_block_delta", "index": 0,
+                   "delta": {"type": "input_json_delta", "partial_json": "{\"todos\": []}"}}}),
+            json!({"type": "assistant", "message": {"content": [
+                {"type": "tool_use", "id": "p1", "name": "TodoWrite", "input": {"todos": []}}
+            ]}}),
+            json!({"type": "stream_event", "event": {"type": "content_block_stop", "index": 0}}),
+        ] {
+            events.extend(parser.events(&line(frame)));
+        }
+        assert_eq!(
+            events,
+            vec![ProviderEvent::ToolUse {
+                id: "p1".into(),
+                name: "TodoWrite".into(),
+                input: r#"{"todos":[]}"#.into(),
+            }]
+        );
+    }
+
+    #[test]
+    fn a_withheld_thought_is_a_size_and_nothing_else() {
+        // The default print-mode display: empty deltas, an empty assembled
+        // block, and only the estimate to show for it.
+        let mut parser = ClaudeStreamParser::new();
+        let mut events = Vec::new();
+        for frame in [
+            json!({"type": "system", "subtype": "init", "session_id": "s1"}),
+            json!({"type": "stream_event", "event": {"type": "content_block_start", "index": 0,
+                   "content_block": {"type": "thinking", "thinking": "", "signature": ""}}}),
+            json!({"type": "system", "subtype": "thinking_tokens",
+                   "estimated_tokens": 40, "estimated_tokens_delta": 40}),
+            json!({"type": "stream_event", "event": {"type": "content_block_delta", "index": 0,
+                   "delta": {"type": "thinking_delta", "thinking": "", "estimated_tokens": 41}}}),
+            json!({"type": "assistant", "message": {"content": [
+                {"type": "thinking", "thinking": "", "signature": "CAQ"}
+            ]}}),
+            json!({"type": "stream_event", "event": {"type": "content_block_stop", "index": 0}}),
+        ] {
+            events.extend(parser.events(&line(frame)));
+        }
+        assert_eq!(
+            events,
+            vec![
+                ProviderEvent::Lifecycle(Lifecycle::TurnStarted),
+                ProviderEvent::ThinkingProgress {
+                    estimated_tokens: 40
+                },
+                ProviderEvent::ThinkingProgress {
+                    estimated_tokens: 41
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn a_thought_that_did_not_stream_arrives_whole_from_the_assembled_frame() {
+        let mut parser = ClaudeStreamParser::new();
+        let events = parser.events(&line(json!({"type": "assistant", "message": {"content": [
+            {"type": "thinking", "thinking": "Whole thought.", "signature": "CAQ"},
+            {"type": "redacted_thinking", "data": "opaque"},
+            {"type": "text", "text": "Reply."}
+        ]}})));
+        assert_eq!(
+            events,
+            vec![
+                ProviderEvent::Thinking("Whole thought.".into()),
+                ProviderEvent::Text("Reply.".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_subagents_thought_is_not_the_turns() {
+        let mut parser = ClaudeStreamParser::new();
+        let events = parser.events(&line(
+            json!({"type": "stream_event", "parent_tool_use_id": "t9",
+            "event": {"type": "content_block_delta", "index": 0,
+                      "delta": {"type": "thinking_delta", "thinking": "sub thinks"}}}),
+        ));
+        assert!(events.is_empty());
+    }
+
+    #[test]
+    fn a_thought_whose_start_was_missed_still_ends() {
+        // A delta with no index, as a hand-written or older stream might send.
+        let mut parser = ClaudeStreamParser::new();
+        let mut events = Vec::new();
+        for frame in [
+            json!({"type": "stream_event", "event": {"type": "content_block_delta",
+                   "delta": {"type": "thinking_delta", "thinking": "hmm"}}}),
+            json!({"type": "stream_event", "event": {"type": "content_block_stop"}}),
+        ] {
+            events.extend(parser.events(&line(frame)));
+        }
+        assert_eq!(
+            events,
+            vec![
+                ProviderEvent::ThinkingDelta("hmm".into()),
+                ProviderEvent::ThinkingEnd,
+            ]
+        );
+    }
+
     #[test]
     fn any_answering_frame_proves_the_prompt_was_read() {
-        // Thinking produces no event at all, and usage and lifecycle frames are
-        // not content, but each shows Claude read the prompt.
+        // A thought, usage and lifecycle frames are not the reply, but each
+        // shows Claude read the prompt.
         for frame in [
             json!({"type": "system", "subtype": "status", "status": "requesting"}),
             json!({"type": "system", "subtype": "status", "status": "compacting"}),

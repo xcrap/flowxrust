@@ -184,6 +184,15 @@ pub enum MessageContent {
         #[serde(rename = "isError", default)]
         is_error: bool,
     },
+    /// The model's reasoning, as far as its provider lets it be seen: Codex's
+    /// summary of it, Claude's summarized thinking.
+    ///
+    /// Not prose. [`Self::as_text`] does not read it, so it is neither
+    /// searched, previewed, nor compared against a provider's history, and
+    /// the transcript draws it dimmed among the work it belongs to.
+    Thinking {
+        text: String,
+    },
 }
 
 impl MessageContent {
@@ -209,6 +218,11 @@ impl MessageContent {
     /// Whether this block is a tool result.
     pub fn is_tool_result(&self) -> bool {
         matches!(self, Self::ToolResult { .. })
+    }
+
+    /// Whether this block is the model's reasoning.
+    pub fn is_thinking(&self) -> bool {
+        matches!(self, Self::Thinking { .. })
     }
 }
 
@@ -331,6 +345,9 @@ mod tests {
                 content: "done".into(),
                 is_error: false,
             },
+            MessageContent::Thinking {
+                text: "Checking the tests first.".into(),
+            },
         ];
         for content in cases {
             let json = serde_json::to_string(&content).unwrap();
@@ -360,6 +377,23 @@ mod tests {
             MessageContent::Image { data, .. } => assert_eq!(data, bytes),
             other => panic!("decoded as {other:?}"),
         }
+    }
+
+    #[test]
+    fn reasoning_is_not_text() {
+        // Searched, previewed and matched against a provider's history by
+        // text, none of which should read what the model said to itself.
+        let m = ConversationMessage::new(
+            MessageRole::Assistant,
+            vec![
+                MessageContent::Thinking { text: "hmm".into() },
+                MessageContent::Text {
+                    text: "Done.".into(),
+                },
+            ],
+        );
+        assert_eq!(m.text_content(), "Done.");
+        assert!(m.content[0].is_thinking());
     }
 
     #[test]

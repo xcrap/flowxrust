@@ -921,9 +921,19 @@ fn contents(value: &Value, assistant: bool) -> Result<Vec<MessageContent>, Provi
                     });
                 }
             }
-            // Thinking and signed/redacted thinking are provider internals, not
-            // visible dialogue. Unknown blocks remain explicit as JSON text.
-            "thinking" | "redacted_thinking" => {}
+            // What the model said to itself, as far as Claude lets it be seen.
+            // A session run under `--thinking-display summarized` records the
+            // summary; one run with the text withheld records an empty block,
+            // which is nothing to show. Redacted thinking is never readable.
+            "thinking" => {
+                if let Some(text) = block["thinking"]
+                    .as_str()
+                    .filter(|text| !text.trim().is_empty())
+                {
+                    out.push(MessageContent::Thinking { text: text.into() });
+                }
+            }
+            "redacted_thinking" => {}
             _ => out.push(MessageContent::Text {
                 text: content_string(block),
             }),
@@ -1602,6 +1612,9 @@ mod tests {
         assistant["message"]["model"] = json!("claude-sonnet-4-6");
         assistant["message"]["usage"] = json!({"input_tokens":10,"cache_creation_input_tokens":20,"cache_read_input_tokens":30,"output_tokens":5});
         assistant["message"]["content"] = json!([
+            {"type":"thinking","thinking":"Plan the edit.","signature":"sig"},
+            {"type":"thinking","thinking":"","signature":"sig"},
+            {"type":"redacted_thinking","data":"opaque"},
             {"type":"text","text":"Before"},
             {"type":"tool_use","id":"tool-1","name":"Edit","input":{"file_path":"file.rs"}},
             {"type":"text","text":"After"}
@@ -1637,11 +1650,21 @@ mod tests {
                 .collect::<Vec<_>>(),
             [MessageRole::User, MessageRole::Assistant, MessageRole::Tool]
         );
+        // The summarized thought is kept; a withheld one and redacted thinking
+        // are nothing to show.
+        assert_eq!(thread.messages[1].content.len(), 4);
+        assert_eq!(
+            thread.messages[1].content[0],
+            MessageContent::Thinking {
+                text: "Plan the edit.".into()
+            }
+        );
+        assert_eq!(thread.messages[1].text_content(), "BeforeAfter");
         assert!(
-            matches!(&thread.messages[1].content[1], MessageContent::ToolUse { id, input, .. } if id == "tool-1" && input.contains("file.rs"))
+            matches!(&thread.messages[1].content[2], MessageContent::ToolUse { id, input, .. } if id == "tool-1" && input.contains("file.rs"))
         );
         assert!(
-            matches!(&thread.messages[1].content[1], MessageContent::ToolUse { input, .. } if input.contains("_flowxStructuredPatch"))
+            matches!(&thread.messages[1].content[2], MessageContent::ToolUse { input, .. } if input.contains("_flowxStructuredPatch"))
         );
         assert!(
             matches!(&thread.messages[2].content[0], MessageContent::ToolResult { content, .. } if content == "line1\nline2")

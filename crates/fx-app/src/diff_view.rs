@@ -294,8 +294,9 @@ fn visible_text(text: &str) -> SharedString {
     out.into()
 }
 
-/// Text and fill for one kind of line.
-pub(super) fn line_palette(kind: DiffLineKind, theme: &Theme) -> (gpui::Rgba, gpui::Rgba) {
+/// Text and fill for one kind of line. The transcript's edit previews draw
+/// with the same palette, so a change reads the same wherever it is shown.
+pub(crate) fn line_palette(kind: DiffLineKind, theme: &Theme) -> (gpui::Rgba, gpui::Rgba) {
     match kind {
         DiffLineKind::Meta => (Colors::fg_tertiary(theme), Colors::bg_surface(theme)),
         // Banner text is what is guaranteed legible on a muted wash.

@@ -246,6 +246,12 @@ impl TurnRequest {
     /// `--permission-prompt-tool stdio` is what routes every tool request to
     /// FlowX as a `control_request` instead of a prompt nobody can answer; and
     /// `--include-partial-messages` produces nothing at all without `--verbose`.
+    /// `--thinking-display summarized` is what makes the thinking visible at
+    /// all: a print-mode run defaults to `updates`, under which every
+    /// `thinking_delta` carries empty text and only a token estimate, as
+    /// Claude Code 2.1.283 on Opus 5.5 was seen to do. Asked for a summary,
+    /// the same frames stream the model's summarized thinking, and the
+    /// history records it, so a restored thread reads the same.
     pub fn arguments(&self) -> Vec<String> {
         let mut arguments = vec![
             "-p".to_string(),
@@ -257,6 +263,8 @@ impl TurnRequest {
             "stdio".to_string(),
             "--verbose".to_string(),
             "--include-partial-messages".to_string(),
+            "--thinking-display".to_string(),
+            THINKING_DISPLAY.to_string(),
         ];
         if let Some(model) = non_empty(self.model.as_deref()) {
             arguments.push("--model".into());
@@ -295,6 +303,12 @@ impl TurnRequest {
         arguments
     }
 }
+
+/// The thinking display every turn asks for. `summarized` is the one mode
+/// that both shows text and is accepted for every model: `highlights` is
+/// refused by the API for some, and the default print-mode `updates`
+/// withholds the text.
+pub const THINKING_DISPLAY: &str = "summarized";
 
 fn push_permission_mode(arguments: &mut Vec<String>, mode: &str) {
     arguments.push("--permission-mode".into());
@@ -1285,6 +1299,8 @@ mod tests {
             "stdio",
             "--verbose",
             "--include-partial-messages",
+            "--thinking-display",
+            "summarized",
         ]
         .into_iter()
         .map(String::from)

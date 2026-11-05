@@ -15,7 +15,7 @@ pub(crate) mod monitor;
 mod commit_composer;
 
 #[path = "diff_view.rs"]
-mod diff_view;
+pub(crate) mod diff_view;
 
 use fx_core::GitRepositoryInfo;
 use fx_design::components::{

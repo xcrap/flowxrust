@@ -334,6 +334,11 @@ impl UsageTotals {
     }
 }
 
+/// The most running calls whose output is kept while they run.
+pub const MAX_LIVE_OUTPUTS: usize = 8;
+/// The most of one running call's output that is kept: its tail.
+pub const MAX_LIVE_OUTPUT_BYTES: usize = 16 * 1024;
+
 /// The per-thread conversation state.
 #[derive(Debug, Clone, Default)]
 pub struct Conversation {
@@ -355,6 +360,19 @@ pub struct Conversation {
     /// new one begins. Every segment is drawn in the same place, so this is
     /// what tells one reply's text from the next.
     streaming_segment: u64,
+    /// The reasoning the provider is streaming, as far as it shows it. Kept
+    /// apart from the reply: it is drawn dimmed among the turn's work, and
+    /// committed as a thought of its own before the reply or the next call.
+    streaming_thinking: String,
+    /// The provider's latest estimate of how much the model has thought in
+    /// the current stretch. Claude reports it even where the thinking itself
+    /// is withheld. Cleared when the thought ends, and with each turn.
+    thinking_tokens: Option<u64>,
+    /// What running calls have printed so far, by call id, oldest call first.
+    /// Never recorded: a call's result carries the whole, and this is dropped
+    /// when it arrives. Bounded in calls and in bytes per call, so a build
+    /// that logs for an hour costs a fixed amount of memory.
+    live_outputs: VecDeque<(String, String)>,
     /// Guidance the provider has taken but not read yet, in the order sent.
     steers: Vec<Arc<ConversationMessage>>,
     /// Ids the provider said it read before anything was held under them.
@@ -562,6 +580,117 @@ impl Conversation {
         !self.streaming_text.is_empty()
     }
 
+    /// The reasoning streamed so far and not yet committed.
+    pub fn streaming_thinking(&self) -> &str {
+        &self.streaming_thinking
+    }
+
+    pub fn is_thinking(&self) -> bool {
+        !self.streaming_thinking.is_empty()
+    }
+
+    /// The provider's estimate of the current thought's size, in tokens.
+    pub fn thinking_tokens(&self) -> Option<u64> {
+        self.thinking_tokens
+    }
+
+    /// What a running call has printed so far, if it has printed anything.
+    pub fn live_output(&self, id: &str) -> Option<&str> {
+        self.live_outputs
+            .iter()
+            .find(|(call, _)| call == id)
+            .map(|(_, text)| text.as_str())
+    }
+
+    /// Every running call's output so far, oldest call first.
+    pub fn live_outputs(&self) -> impl Iterator<Item = (&str, &str)> {
+        self.live_outputs
+            .iter()
+            .map(|(id, text)| (id.as_str(), text.as_str()))
+    }
+
+    /// Add to what a running call has printed, keeping the tail.
+    fn append_live_output(&mut self, id: &str, delta: &str) {
+        if delta.is_empty() {
+            return;
+        }
+        let position = match self.live_outputs.iter().position(|(call, _)| call == id) {
+            Some(position) => position,
+            None => {
+                while self.live_outputs.len() >= MAX_LIVE_OUTPUTS {
+                    self.live_outputs.pop_front();
+                }
+                self.live_outputs.push_back((id.to_owned(), String::new()));
+                self.live_outputs.len() - 1
+            }
+        };
+        let text = &mut self.live_outputs[position].1;
+        text.push_str(delta);
+        if text.len() > MAX_LIVE_OUTPUT_BYTES {
+            // Keep the end: what a running command printed last is what says
+            // where it is. Cut on a character boundary, at a line where one is
+            // near.
+            let mut cut = text.len() - MAX_LIVE_OUTPUT_BYTES;
+            while !text.is_char_boundary(cut) {
+                cut += 1;
+            }
+            if let Some(newline) = text[cut..].find('\n').filter(|offset| *offset < 256) {
+                cut += newline + 1;
+            }
+            text.drain(..cut);
+        }
+        self.streaming_revision += 1;
+        self.touch();
+    }
+
+    /// Forget what a call printed: its result has the whole.
+    fn clear_live_output(&mut self, id: &str) {
+        if let Some(position) = self.live_outputs.iter().position(|(call, _)| call == id) {
+            self.live_outputs.remove(position);
+            self.streaming_revision += 1;
+            self.touch();
+        }
+    }
+
+    /// Change the arguments of a call already recorded.
+    ///
+    /// The call's message is shared with any view holding the last pass's
+    /// messages, so it is copied on write and the view's copy goes stale,
+    /// which the message revision tells it. A call this conversation no longer
+    /// holds, or one whose arguments `edit` leaves as they were, changes
+    /// nothing.
+    fn update_tool_input(&mut self, id: &str, edit: impl FnOnce(&mut String)) {
+        let Some(message) = self.messages.iter_mut().rev().find(|message| {
+            message
+                .content
+                .iter()
+                .any(|block| matches!(block, fx_core::MessageContent::ToolUse { id: call, .. } if call == id))
+        }) else {
+            return;
+        };
+        let current = message.content.iter().find_map(|block| match block {
+            fx_core::MessageContent::ToolUse {
+                id: call, input, ..
+            } if call == id => Some(input),
+            _ => None,
+        });
+        let mut next = current.cloned().unwrap_or_default();
+        edit(&mut next);
+        if current.is_some_and(|current| *current == next) {
+            return;
+        }
+        let message = Arc::make_mut(message);
+        if let Some(fx_core::MessageContent::ToolUse { input, .. }) =
+            message.content.iter_mut().find(
+                |block| matches!(block, fx_core::MessageContent::ToolUse { id: call, .. } if call == id),
+            )
+        {
+            *input = next;
+        }
+        self.message_revision += 1;
+        self.touch();
+    }
+
     /// Which streamed segment the live text belongs to.
     pub fn streaming_segment(&self) -> u64 {
         self.streaming_segment
@@ -570,6 +699,9 @@ impl Conversation {
     /// Begin streaming, discarding any leftover text from a previous turn.
     pub fn begin_streaming(&mut self) {
         self.streaming_text.clear();
+        self.streaming_thinking.clear();
+        self.thinking_tokens = None;
+        self.live_outputs.clear();
         self.streaming_revision += 1;
         self.streaming_segment += 1;
         self.touch();
@@ -581,13 +713,36 @@ impl Conversation {
         self.touch();
     }
 
+    /// Add to the thought being streamed. A thought that starts after the
+    /// reply began ends that reply's message first: what follows the thought
+    /// is a message of its own, as the provider's history records it.
+    pub fn append_thinking(&mut self, delta: &str) {
+        if self.streaming_thinking.is_empty() {
+            // The reply only: the thought's size may already have been
+            // reported, as Claude does before the first word of it.
+            self.commit_text();
+        }
+        self.streaming_thinking.push_str(delta);
+        self.streaming_revision += 1;
+        self.touch();
+    }
+
     /// Commit whatever has streamed into one message, and start a new segment.
     ///
     /// This is the whole of the interleaving mechanism: text accumulates here,
     /// and a tool call forces a commit so the prose before it and the prose
     /// after it become separate messages. Without that, one turn would be one
     /// message with the calls buried in the middle of it.
+    ///
+    /// A thought still streaming is committed first. A reply follows the
+    /// thinking that led to it, so a commit that reaches the reply has reached
+    /// the end of the thought, however the turn ended.
     pub fn commit_streaming(&mut self) {
+        self.commit_thinking();
+        self.commit_text();
+    }
+
+    fn commit_text(&mut self) {
         if self.streaming_text.is_empty() {
             return;
         }
@@ -600,9 +755,25 @@ impl Conversation {
         self.streaming_segment += 1;
     }
 
+    /// Commit the thought being streamed as a message of its own.
+    pub fn commit_thinking(&mut self) {
+        self.thinking_tokens = None;
+        if self.streaming_thinking.is_empty() {
+            return;
+        }
+        let text = std::mem::take(&mut self.streaming_thinking);
+        self.append(ConversationMessage::new(
+            fx_core::MessageRole::Assistant,
+            vec![fx_core::MessageContent::Thinking { text }],
+        ));
+        self.streaming_revision += 1;
+    }
+
     pub fn clear_streaming(&mut self) {
-        if !self.streaming_text.is_empty() {
+        if !self.streaming_text.is_empty() || !self.streaming_thinking.is_empty() {
             self.streaming_text.clear();
+            self.streaming_thinking.clear();
+            self.thinking_tokens = None;
             self.streaming_revision += 1;
             self.streaming_segment += 1;
             self.touch();
@@ -957,6 +1128,7 @@ impl Conversation {
             ProviderEvent::ToolUse { .. } | ProviderEvent::ToolResult { .. } => true,
             // Only the first delta of a reply starts a step; the rest continue it.
             ProviderEvent::TextDelta(_) => self.streaming_text.is_empty(),
+            ProviderEvent::ThinkingDelta(_) => self.streaming_thinking.is_empty(),
             _ => false,
         };
         if moved_on {
@@ -1147,7 +1319,38 @@ impl Conversation {
                 if self.phase == Phase::Starting {
                     self.set_phase(self.working_phase());
                 }
+                // The reply follows the thought that led to it, which is over
+                // whether or not the provider said so.
+                if self.streaming_text.is_empty() {
+                    self.commit_thinking();
+                }
                 self.append_streaming(&delta);
+            }
+            ProviderEvent::ThinkingDelta(delta) => {
+                if self.phase == Phase::Starting {
+                    self.set_phase(self.working_phase());
+                }
+                self.append_thinking(&delta);
+            }
+            ProviderEvent::ThinkingEnd => self.commit_thinking(),
+            ProviderEvent::Thinking(text) => {
+                if !text.is_empty() {
+                    if self.phase == Phase::Starting {
+                        self.set_phase(self.working_phase());
+                    }
+                    self.commit_streaming();
+                    self.append(ConversationMessage::new(
+                        fx_core::MessageRole::Assistant,
+                        vec![fx_core::MessageContent::Thinking { text }],
+                    ));
+                }
+            }
+            ProviderEvent::ThinkingProgress { estimated_tokens } => {
+                if self.thinking_tokens != Some(estimated_tokens) {
+                    self.thinking_tokens = Some(estimated_tokens);
+                    self.streaming_revision += 1;
+                    self.touch();
+                }
             }
             // The streamed message is whole. Committing here is what keeps two
             // consecutive messages from running together into one row.
@@ -1187,12 +1390,22 @@ impl Conversation {
                 self.record_activity(format!("Running {name}"), false);
                 self.set_phase(self.working_phase());
             }
+            ProviderEvent::ToolInputDelta { id, delta } => {
+                if !delta.is_empty() {
+                    self.update_tool_input(&id, |input| input.push_str(&delta));
+                }
+            }
+            ProviderEvent::ToolInput { id, input } => {
+                self.update_tool_input(&id, |current| *current = input);
+            }
+            ProviderEvent::ToolOutputDelta { id, delta } => self.append_live_output(&id, &delta),
             ProviderEvent::ToolResult {
                 id,
                 content,
                 is_error,
             } => {
                 self.claim_tool_id(&id);
+                self.clear_live_output(&id);
                 // A successful result with nothing to say is not recorded. The
                 // Swift drops these deliberately: a `Bash` that returned empty,
                 // or the literal "Completed", would otherwise add a row per tool
@@ -1313,6 +1526,7 @@ impl Conversation {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fx_core::MessageContent;
 
     fn user_message(text: &str) -> ConversationMessage {
         ConversationMessage::text(MessageRole::User, text)
@@ -1628,6 +1842,254 @@ mod tests {
             message.content.as_slice(),
             [fx_core::MessageContent::ToolResult { content, .. }] if content == "file contents"
         ));
+    }
+
+    #[test]
+    fn a_thought_streams_apart_from_the_reply_and_is_committed_before_it() {
+        let mut c = Conversation::new(Uuid::nil());
+        c.apply(ProviderEvent::Lifecycle(
+            crate::provider::Lifecycle::TurnStarted,
+        ));
+        c.apply(ProviderEvent::ThinkingProgress {
+            estimated_tokens: 12,
+        });
+        c.apply(ProviderEvent::ThinkingDelta("Check the ".into()));
+        c.apply(ProviderEvent::ThinkingDelta("tests first.".into()));
+        assert!(c.is_thinking());
+        assert!(!c.is_streaming(), "a thought is not the reply");
+        assert_eq!(c.streaming_thinking(), "Check the tests first.");
+        assert_eq!(c.thinking_tokens(), Some(12));
+        assert_eq!(c.message_count(), 0);
+
+        c.apply(ProviderEvent::ThinkingEnd);
+        assert!(!c.is_thinking());
+        assert_eq!(c.thinking_tokens(), None, "the count is the live thought's");
+        assert_eq!(c.message_count(), 1);
+        let thought = c.messages().next().unwrap();
+        assert_eq!(thought.role, MessageRole::Assistant);
+        assert_eq!(
+            thought.content,
+            vec![MessageContent::Thinking {
+                text: "Check the tests first.".into()
+            }]
+        );
+        assert_eq!(thought.text_content(), "", "a thought is not prose");
+
+        c.apply(ProviderEvent::TextDelta("Done.".into()));
+        c.apply(ProviderEvent::Done {
+            stop_reason: "end_turn".into(),
+        });
+        assert_eq!(c.message_count(), 2);
+        assert_eq!(c.messages().nth(1).unwrap().text_content(), "Done.");
+    }
+
+    #[test]
+    fn a_thought_the_provider_never_ended_is_committed_by_what_follows_it() {
+        // Reply text, a call, and the turn's end each close an open thought,
+        // in that order, so a provider that names no end still reads right.
+        let mut c = Conversation::new(Uuid::nil());
+        c.apply(ProviderEvent::Lifecycle(
+            crate::provider::Lifecycle::TurnStarted,
+        ));
+        c.apply(ProviderEvent::ThinkingDelta("first".into()));
+        c.apply(ProviderEvent::TextDelta("reply".into()));
+        assert!(!c.is_thinking());
+        assert_eq!(c.message_count(), 1);
+
+        c.apply(ProviderEvent::ThinkingDelta("second".into()));
+        assert_eq!(
+            c.message_count(),
+            2,
+            "a thought after the reply ends the reply's message"
+        );
+        assert!(!c.is_streaming());
+        c.apply(ProviderEvent::ToolUse {
+            id: "t1".into(),
+            name: "Read".into(),
+            input: "{}".into(),
+        });
+        assert_eq!(c.message_count(), 4);
+
+        c.apply(ProviderEvent::ThinkingDelta("third".into()));
+        c.apply(ProviderEvent::Done {
+            stop_reason: "end_turn".into(),
+        });
+        let kinds: Vec<_> = c
+            .messages()
+            .map(|m| match &m.content[0] {
+                MessageContent::Thinking { text } => format!("thought:{text}"),
+                MessageContent::Text { text } => format!("text:{text}"),
+                MessageContent::ToolUse { name, .. } => format!("call:{name}"),
+                other => format!("{other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            kinds,
+            [
+                "thought:first",
+                "text:reply",
+                "thought:second",
+                "call:Read",
+                "thought:third"
+            ]
+        );
+        assert!(!c.is_thinking());
+    }
+
+    #[test]
+    fn a_whole_thought_is_a_row_and_a_new_turn_drops_a_stale_one() {
+        let mut c = Conversation::new(Uuid::nil());
+        c.apply(ProviderEvent::Lifecycle(
+            crate::provider::Lifecycle::TurnStarted,
+        ));
+        c.apply(ProviderEvent::Thinking("Whole.".into()));
+        c.apply(ProviderEvent::Thinking(String::new()));
+        assert_eq!(c.message_count(), 1, "an empty thought is nothing to show");
+
+        c.apply(ProviderEvent::ThinkingDelta("half a".into()));
+        c.apply(ProviderEvent::ThinkingProgress {
+            estimated_tokens: 3,
+        });
+        c.clear_streaming();
+        assert!(!c.is_thinking());
+        assert_eq!(c.thinking_tokens(), None);
+        c.apply(ProviderEvent::ThinkingDelta("half b".into()));
+        c.apply(ProviderEvent::Lifecycle(
+            crate::provider::Lifecycle::TurnStarted,
+        ));
+        assert!(!c.is_thinking(), "a new turn starts with no thought");
+        assert_eq!(c.message_count(), 1);
+    }
+
+    #[test]
+    fn the_first_thinking_delta_is_a_step_and_the_rest_continue_it() {
+        let mut c = Conversation::new(Uuid::nil());
+        c.apply(ProviderEvent::Lifecycle(
+            crate::provider::Lifecycle::TurnStarted,
+        ));
+        let started = c.step_started_at();
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        c.apply(ProviderEvent::ThinkingDelta("a".into()));
+        let first = c.step_started_at();
+        assert!(first > started, "the thought is a step of the turn");
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        c.apply(ProviderEvent::ThinkingDelta("b".into()));
+        assert_eq!(c.step_started_at(), first);
+    }
+
+    #[test]
+    fn a_calls_arguments_stream_into_its_row_and_are_replaced_whole() {
+        let mut c = Conversation::new(Uuid::nil());
+        c.apply(ProviderEvent::Lifecycle(
+            crate::provider::Lifecycle::TurnStarted,
+        ));
+        c.apply(ProviderEvent::ToolUse {
+            id: "t1".into(),
+            name: "Read".into(),
+            input: String::new(),
+        });
+        let input = |c: &Conversation| match &c.messages().last().unwrap().content[0] {
+            MessageContent::ToolUse { input, .. } => input.clone(),
+            other => panic!("{other:?}"),
+        };
+        let before = c.message_revision();
+        c.apply(ProviderEvent::ToolInputDelta {
+            id: "t1".into(),
+            delta: r#"{"file_path":"#.into(),
+        });
+        c.apply(ProviderEvent::ToolInputDelta {
+            id: "t1".into(),
+            delta: r#""/a.rs"}"#.into(),
+        });
+        assert_eq!(input(&c), r#"{"file_path":"/a.rs"}"#);
+        assert!(c.message_revision() > before, "a view could not tell");
+        assert_eq!(c.message_count(), 1, "a delta is not a row");
+
+        // The whole replaces the stream, and the same whole again is nothing.
+        c.apply(ProviderEvent::ToolInput {
+            id: "t1".into(),
+            input: r#"{"file_path": "/a.rs"}"#.into(),
+        });
+        assert_eq!(input(&c), r#"{"file_path": "/a.rs"}"#);
+        let settled = c.message_revision();
+        c.apply(ProviderEvent::ToolInput {
+            id: "t1".into(),
+            input: r#"{"file_path": "/a.rs"}"#.into(),
+        });
+        c.apply(ProviderEvent::ToolInputDelta {
+            id: "t1".into(),
+            delta: String::new(),
+        });
+        assert_eq!(c.message_revision(), settled);
+        // A call this conversation does not hold changes nothing.
+        c.apply(ProviderEvent::ToolInput {
+            id: "elsewhere".into(),
+            input: "{}".into(),
+        });
+        assert_eq!(c.message_revision(), settled);
+        assert_eq!(c.message_count(), 1);
+    }
+
+    #[test]
+    fn a_running_calls_output_is_held_apart_until_its_result() {
+        let mut c = Conversation::new(Uuid::nil());
+        c.apply(ProviderEvent::Lifecycle(
+            crate::provider::Lifecycle::TurnStarted,
+        ));
+        c.apply(ProviderEvent::ToolUse {
+            id: "t1".into(),
+            name: "Bash".into(),
+            input: r#"{"command":"cargo build"}"#.into(),
+        });
+        let before = c.streaming_revision();
+        c.apply(ProviderEvent::ToolOutputDelta {
+            id: "t1".into(),
+            delta: "Compiling a\n".into(),
+        });
+        c.apply(ProviderEvent::ToolOutputDelta {
+            id: "t1".into(),
+            delta: "Compiling b\n".into(),
+        });
+        assert_eq!(c.live_output("t1"), Some("Compiling a\nCompiling b\n"));
+        assert!(c.streaming_revision() > before, "a view could not tell");
+        assert_eq!(c.message_count(), 1, "live output is not a row");
+
+        // The result carries the whole, so the live copy goes.
+        c.apply(ProviderEvent::ToolResult {
+            id: "t1".into(),
+            content: "Compiling a\nCompiling b\nFinished".into(),
+            is_error: false,
+        });
+        assert_eq!(c.live_output("t1"), None);
+        assert_eq!(c.message_count(), 2);
+
+        // Bounded: the oldest call's output goes when too many run, and a
+        // call keeps only the end of what it printed.
+        for call in 0..MAX_LIVE_OUTPUTS + 1 {
+            c.apply(ProviderEvent::ToolOutputDelta {
+                id: format!("c{call}"),
+                delta: "x".into(),
+            });
+        }
+        assert_eq!(c.live_output("c0"), None);
+        assert_eq!(c.live_outputs().count(), MAX_LIVE_OUTPUTS);
+        let line = "0123456789abcdef\n";
+        for _ in 0..(MAX_LIVE_OUTPUT_BYTES / line.len()) + 10 {
+            c.apply(ProviderEvent::ToolOutputDelta {
+                id: "c1".into(),
+                delta: line.into(),
+            });
+        }
+        let kept = c.live_output("c1").unwrap();
+        assert!(kept.len() <= MAX_LIVE_OUTPUT_BYTES);
+        assert!(kept.starts_with("0123456789abcdef\n"), "cut mid-line");
+        assert!(kept.ends_with(line));
+
+        // A new turn starts with none of it.
+        c.apply(ProviderEvent::Lifecycle(
+            crate::provider::Lifecycle::TurnStarted,
+        ));
+        assert_eq!(c.live_outputs().count(), 0);
     }
 
     #[test]

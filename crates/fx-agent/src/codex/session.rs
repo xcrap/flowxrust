@@ -458,9 +458,11 @@ pub(super) enum ItemKind {
     ToolOutput,
     /// A compaction: a phase change while it runs, and no row afterwards.
     Compaction,
-    /// Nothing to show: reasoning, hook prompts, sub-agent activity, the
-    /// review-mode markers, and a type this build does not know that names no
-    /// tool.
+    /// The model's reasoning: its summary, streamed while it thinks and
+    /// recorded as a thought among the turn's work.
+    Reasoning,
+    /// Nothing to show: hook prompts, sub-agent activity, the review-mode
+    /// markers, and a type this build does not know that names no tool.
     Hidden,
 }
 
@@ -472,8 +474,10 @@ pub(super) fn item_kind(item: &Value) -> ItemKind {
         "agentMessage" | "plan" => ItemKind::Text,
         "functionCallOutput" => ItemKind::ToolOutput,
         "contextCompaction" => ItemKind::Compaction,
-        "reasoning" | "hookPrompt" | "subAgentActivity" | "enteredReviewMode"
-        | "exitedReviewMode" => ItemKind::Hidden,
+        "reasoning" => ItemKind::Reasoning,
+        "hookPrompt" | "subAgentActivity" | "enteredReviewMode" | "exitedReviewMode" => {
+            ItemKind::Hidden
+        }
         _ if is_tool_item(item_type) => ItemKind::Tool,
         // A type newer than this build is still a call if it names one, as
         // every tool item does. Anything else it says is not this build's to
@@ -547,6 +551,41 @@ pub fn is_read_only_command_value(command: &Value) -> bool {
 
 /// What a failed tool that said nothing is recorded as.
 pub(super) const TOOL_FAILED: &str = "Tool failed";
+
+/// What a reasoning item lets be read: its summary, one paragraph per part,
+/// or the reasoning itself where a model exposes it. The raw reasoning is
+/// otherwise encrypted, so the summary is usually all there is.
+///
+/// Shared by live items and native history, so a thought reads the same after
+/// a restart as it did while it streamed.
+pub(super) fn reasoning_text(item: &Value) -> String {
+    let parts = |key: &str| -> Vec<String> {
+        item.get(key)
+            .and_then(Value::as_array)
+            .map(|parts| {
+                parts
+                    .iter()
+                    .filter_map(|part| {
+                        // The v2 shape is a list of strings; the Responses API
+                        // shape underneath it is `{type: summary_text, text}`.
+                        part.as_str()
+                            .or_else(|| part.get("text").and_then(Value::as_str))
+                    })
+                    .map(str::trim)
+                    .filter(|text| !text.is_empty())
+                    .map(str::to_owned)
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let summary = parts("summary");
+    let parts = if summary.is_empty() {
+        parts("content")
+    } else {
+        summary
+    };
+    parts.join("\n\n")
+}
 
 /// What a completed tool item produced, and whether it failed.
 ///
@@ -681,6 +720,69 @@ pub fn parse_notification(method: &str, params: &Value) -> Vec<ProviderEvent> {
             .map(|d| vec![ProviderEvent::TextDelta(d.to_string())])
             .unwrap_or_default(),
 
+        // The summary streams a part at a time; a part after the first is a
+        // paragraph of its own, which is how the completed item joins them.
+        "item/reasoning/summaryPartAdded" => params
+            .get("summaryIndex")
+            .and_then(Value::as_u64)
+            .filter(|index| *index > 0)
+            .map(|_| vec![ProviderEvent::ThinkingDelta("\n\n".to_string())])
+            .unwrap_or_default(),
+        "item/reasoning/summaryTextDelta" | "item/reasoning/textDelta" => params
+            .get("delta")
+            .and_then(Value::as_str)
+            .filter(|delta| !delta.is_empty())
+            .map(|delta| vec![ProviderEvent::ThinkingDelta(delta.to_string())])
+            .unwrap_or_default(),
+
+        // What a running command or patch has printed so far. The completed
+        // item carries the whole as `aggregatedOutput`, so this is shown and
+        // never recorded.
+        "item/commandExecution/outputDelta" | "item/fileChange/outputDelta" => {
+            match (
+                params.get("itemId").and_then(Value::as_str),
+                params.get("delta").and_then(Value::as_str),
+            ) {
+                (Some(id), Some(delta)) if !delta.is_empty() => {
+                    vec![ProviderEvent::ToolOutputDelta {
+                        id: id.to_string(),
+                        delta: delta.to_string(),
+                    }]
+                }
+                _ => Vec::new(),
+            }
+        }
+        // An MCP tool's progress notices, a line each, in the same place.
+        "item/mcpToolCall/progress" => match (
+            params.get("itemId").and_then(Value::as_str),
+            params.get("message").and_then(Value::as_str),
+        ) {
+            (Some(id), Some(message)) if !message.trim().is_empty() => {
+                vec![ProviderEvent::ToolOutputDelta {
+                    id: id.to_string(),
+                    delta: format!("{}\n", message.trim_end()),
+                }]
+            }
+            _ => Vec::new(),
+        },
+        // A patch as it is written: the call's arguments, replaced whole each
+        // time, in the shape the completed item's arguments take.
+        "item/fileChange/patchUpdated" => match (
+            params.get("itemId").and_then(Value::as_str),
+            params.get("changes"),
+        ) {
+            (Some(id), Some(changes)) if changes.is_array() => vec![ProviderEvent::ToolInput {
+                id: id.to_string(),
+                input: tool_input(&json!({
+                    "type": "fileChange",
+                    "id": id,
+                    "changes": changes,
+                }))
+                .to_string(),
+            }],
+            _ => Vec::new(),
+        },
+
         "item/started" | "item/completed" => {
             let Some(item) = params.get("item") else {
                 return Vec::new();
@@ -700,6 +802,18 @@ pub fn parse_notification(method: &str, params: &Value) -> Vec<ProviderEvent> {
                     vec![ProviderEvent::Lifecycle(Lifecycle::Compacting)]
                 }
                 ItemKind::Compaction => vec![ProviderEvent::Lifecycle(Lifecycle::Compacted)],
+                // Starting says nothing yet; the deltas do. Completed, the item
+                // is the thought whole, which the stateful reader turns into
+                // the end of the stream when the deltas already carried it.
+                ItemKind::Reasoning if started => Vec::new(),
+                ItemKind::Reasoning => {
+                    let text = reasoning_text(item);
+                    if text.is_empty() {
+                        Vec::new()
+                    } else {
+                        vec![ProviderEvent::Thinking(text)]
+                    }
+                }
                 ItemKind::Tool if started => {
                     let input = tool_input(item);
                     vec![ProviderEvent::ToolUse {
@@ -953,12 +1067,30 @@ impl TurnNotifications {
     pub fn parse(&mut self, method: &str, params: &Value) -> Vec<ProviderEvent> {
         let events = parse_notification(method, params);
         match method {
-            "item/agentMessage/delta" if !events.is_empty() => {
+            "item/agentMessage/delta"
+            | "item/reasoning/summaryTextDelta"
+            | "item/reasoning/textDelta"
+                if !events.is_empty() =>
+            {
                 match params.get("itemId").and_then(Value::as_str) {
                     Some(id) => {
                         self.streamed.insert(id.to_owned());
                     }
                     None => self.streamed_without_id = true,
+                }
+            }
+            // A thought that streamed is complete; one that did not arrives
+            // whole, as the parsed event already says.
+            "item/completed"
+                if params.pointer("/item/type").and_then(Value::as_str) == Some("reasoning") =>
+            {
+                let id = params
+                    .pointer("/item/id")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                let streamed = self.streamed.remove(id);
+                if std::mem::take(&mut self.streamed_without_id) || streamed {
+                    return vec![ProviderEvent::ThinkingEnd];
                 }
             }
             "item/started"
@@ -1389,7 +1521,6 @@ mod tests {
         // A type this build does not know is included: it used to become prose
         // whenever it carried a `text`, where history showed it as raw JSON.
         for item_type in [
-            "reasoning",
             "hookPrompt",
             "subAgentActivity",
             "enteredReviewMode",
@@ -1404,6 +1535,151 @@ mod tests {
                 assert!(events.is_empty(), "{item_type} was surfaced");
             }
         }
+    }
+
+    #[test]
+    fn a_thought_streams_its_summary_and_ends_when_the_item_completes() {
+        // Shapes from codex-cli 0.164: the summary streams a part at a time,
+        // and the completed item carries every part. The raw reasoning is
+        // encrypted, so the summary is the thought.
+        let mut turn = TurnNotifications::new();
+        let mut events = Vec::new();
+        for (method, params) in [
+            (
+                "item/started",
+                json!({ "item": { "type": "reasoning", "id": "r1", "summary": [], "content": [] } }),
+            ),
+            (
+                "item/reasoning/summaryPartAdded",
+                json!({ "itemId": "r1", "summaryIndex": 0 }),
+            ),
+            (
+                "item/reasoning/summaryTextDelta",
+                json!({ "itemId": "r1", "summaryIndex": 0, "delta": "**Reading the parser**" }),
+            ),
+            (
+                "item/reasoning/summaryPartAdded",
+                json!({ "itemId": "r1", "summaryIndex": 1 }),
+            ),
+            (
+                "item/reasoning/summaryTextDelta",
+                json!({ "itemId": "r1", "summaryIndex": 1, "delta": "Then the tests." }),
+            ),
+            (
+                "item/completed",
+                json!({ "item": { "type": "reasoning", "id": "r1",
+                                  "summary": ["**Reading the parser**", "Then the tests."], "content": [] } }),
+            ),
+        ] {
+            events.extend(turn.parse(method, &params));
+        }
+        assert_eq!(
+            events,
+            vec![
+                ProviderEvent::ThinkingDelta("**Reading the parser**".into()),
+                ProviderEvent::ThinkingDelta("\n\n".into()),
+                ProviderEvent::ThinkingDelta("Then the tests.".into()),
+                ProviderEvent::ThinkingEnd,
+            ],
+            "a streamed thought must not be repeated whole when its item completes"
+        );
+
+        // One that did not stream arrives whole, joined as the stream would
+        // have been; one with nothing readable is nothing.
+        assert_eq!(
+            turn.parse(
+                "item/completed",
+                &json!({ "item": { "type": "reasoning", "id": "r2",
+                                   "summary": ["Whole.", "Thought."], "content": [] } })
+            ),
+            vec![ProviderEvent::Thinking("Whole.\n\nThought.".into())]
+        );
+        assert!(
+            turn.parse(
+                "item/completed",
+                &json!({ "item": { "type": "reasoning", "id": "r3", "summary": [], "content": [] } })
+            )
+            .is_empty()
+        );
+        // A model that exposes its reasoning gives it as `content`.
+        assert_eq!(
+            parse_notification(
+                "item/completed",
+                &json!({ "item": { "type": "reasoning", "id": "r4", "summary": [],
+                                   "content": ["Raw reasoning."] } })
+            ),
+            vec![ProviderEvent::Thinking("Raw reasoning.".into())]
+        );
+        assert!(
+            parse_notification(
+                "item/reasoning/summaryTextDelta",
+                &json!({ "itemId": "r5", "summaryIndex": 0, "delta": "" })
+            )
+            .is_empty(),
+            "an empty delta is nothing"
+        );
+    }
+
+    #[test]
+    fn a_running_calls_output_and_patch_stream_into_its_row() {
+        // Shapes from codex-cli 0.164's notifications.
+        assert_eq!(
+            parse_notification(
+                "item/commandExecution/outputDelta",
+                &json!({ "itemId": "c1", "delta": "Compiling fx-core\n", "turnId": "t" })
+            ),
+            vec![ProviderEvent::ToolOutputDelta {
+                id: "c1".into(),
+                delta: "Compiling fx-core\n".into(),
+            }]
+        );
+        assert_eq!(
+            parse_notification(
+                "item/fileChange/outputDelta",
+                &json!({ "itemId": "f1", "delta": "Success. Updated the following files:\n" })
+            ),
+            vec![ProviderEvent::ToolOutputDelta {
+                id: "f1".into(),
+                delta: "Success. Updated the following files:\n".into(),
+            }]
+        );
+        assert!(
+            parse_notification(
+                "item/commandExecution/outputDelta",
+                &json!({ "itemId": "c1", "delta": "" })
+            )
+            .is_empty()
+        );
+        assert_eq!(
+            parse_notification(
+                "item/mcpToolCall/progress",
+                &json!({ "itemId": "m1", "message": "Fetched 3 of 10 pages" })
+            ),
+            vec![ProviderEvent::ToolOutputDelta {
+                id: "m1".into(),
+                delta: "Fetched 3 of 10 pages\n".into(),
+            }]
+        );
+        // A patch in progress is the call's arguments, in the shape the
+        // completed item's arguments take, so the row reads the same before
+        // and after.
+        let changes = json!([{ "path": "/p/a.rs", "kind": { "type": "update", "move_path": null },
+                               "diff": "@@ -1 +1 @@\n-old\n+new\n" }]);
+        let events = parse_notification(
+            "item/fileChange/patchUpdated",
+            &json!({ "itemId": "f1", "changes": changes, "turnId": "t" }),
+        );
+        let [ProviderEvent::ToolInput { id, input }] = events.as_slice() else {
+            panic!("{events:?}");
+        };
+        assert_eq!(id, "f1");
+        let completed = tool_input(
+            &json!({ "type": "fileChange", "id": "f1", "changes": changes,
+                                           "status": "completed" }),
+        );
+        let streamed: Value = serde_json::from_str(input).unwrap();
+        assert_eq!(streamed["changes"], completed["changes"]);
+        assert_eq!(streamed["type"], "fileChange");
     }
 
     #[test]

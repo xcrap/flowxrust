@@ -521,6 +521,26 @@ Two more, for how a turn ends:
   completion it showed the Ready check and the unseen-completion dot for a turn
   that never answered. FlowX's own Stop never sees that status, because it
   drops the turn first.
+- **Thinking is asked for, or it is not there.** A print-mode `claude` run
+  defaults to `thinking_display: updates`, under which every `thinking_delta`
+  carries empty text and only `system` `thinking_tokens` estimates arrive.
+  Every turn passes `--thinking-display summarized`, which streams the
+  model's summarized thinking in the same frames and records it in the
+  history, so a restored thread reads the same as it did live. The assembled
+  `assistant` frame repeats the thought whole, so it is dropped once a delta
+  carried text, as the reply's is. Codex's reasoning is its summary
+  (`item/reasoning/summaryTextDelta`, a `summaryPartAdded` per paragraph);
+  the raw reasoning is encrypted, and `reasoning_text` in `codex/session.rs`
+  reads the live item and the rollout's `summary_text` parts alike.
+- **A tool call opens at its block start.** Claude's `content_block_start`
+  for a `tool_use` is the call, with no arguments yet; `input_json_delta`
+  frames grow them, and the assembled frame replaces them whole
+  (`ToolInput`). A plan call (`TodoWrite`) waits for its assembled frame: half
+  a plan is not a plan card. Codex streams a command's output as
+  `item/commandExecution/outputDelta` and a patch as `fileChange/patchUpdated`,
+  which is the call's arguments in the completed item's shape; both are
+  `ToolOutputDelta` / `ToolInput`, and the live output is never recorded,
+  because the completed item carries the whole.
 - **Stop ends the tools too.** Each provider runs in its own process group
   (`fx-agent::process`), but its tools do not stay in it: `claude` starts each
   `Bash` call in a session of its own and `codex app-server` gives each command
@@ -736,6 +756,43 @@ strip above it. Five rules, each of which is a bug that was written first:
   steer nothing names lands when the turn ends. An id read before its steer
   is held (Codex's record can overtake its reply to `turn/steer`) places the
   steer as soon as it is.
+
+Three more, for what a turn shows of itself while it works:
+
+- **A thought is a block of its own, and never text.** `MessageContent::
+  Thinking` is what both providers' reasoning becomes; `as_text()` does not
+  read it, so search, previews and native sync (`native_contains_local_tail`,
+  `carry_message_ids`) never see it, and the grouping policy counts it as
+  activity. The conversation streams it apart from the reply
+  (`streaming_thinking`), commits it as a message when the provider ends it,
+  and commits it anyway before the reply's first delta, a call or `Done`, so a
+  provider that names no end still reads right. The first thinking delta is a
+  step; the first text delta commits the thought but keeps its token estimate,
+  which Claude reports before the first word.
+- **Thoughts sit among their calls.** An activity group places each recorded
+  thought before the call that followed it (`Thought::position`), dimmed
+  (`THOUGHT_OPACITY`) rather than recoloured, since Markdown draws in `fg`. A
+  group of nothing but thinking is "Thought", not "Worked". The live thought
+  is drawn in the tail while nothing is recorded and inside the live group
+  afterwards; closed, the group's live step shows the thought's latest line,
+  or its size in tokens where the text is withheld. `RowStamp::Activity::live`
+  carries the streaming revision only while live text is drawn inside a
+  group, so a tick still re-measures nothing.
+- **A call's row opens to what it is.** An edit tool's row opens to the
+  change it described (`fx_core::policy::EditPreview`: Claude's `Edit`
+  old/new as a line diff, `Write` as additions, `MultiEdit` a section per
+  edit, Codex's `fileChange` from its unified diffs, and a recorded edit's
+  `_flowxStructuredPatch` over its intent), drawn with the inspector's
+  `line_palette`; any other call's to its arguments; both to the output once
+  it has one. While a call runs, what it has printed so far is under its row,
+  the last few lines closed and more open, and the live step's detail ends
+  with the latest line, so a closed group still shows a build going by. The
+  buffer behind it is bounded in calls and bytes (`MAX_LIVE_OUTPUTS`,
+  `MAX_LIVE_OUTPUT_BYTES`) and dropped at the result. A row's detail is read
+  from the arguments as they are: `partial_json_string` finds a path in JSON
+  that has not finished arriving. Every panel a row draws is in
+  `group_paragraphs` too, in draw order, so an off-screen selection copies
+  what the row would have shown.
 
 Tool output is read from `aggregatedOutput` first, then `output`, `result`,
 `error`, `contentItems`, `changes`, `results`, `agentsStates` — that order is the

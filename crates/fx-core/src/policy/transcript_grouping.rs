@@ -108,6 +108,10 @@ impl TranscriptActivityGroupingPolicy {
                 // call, and becomes readable as a row inside the group that
                 // shows what was called.
                 MessageContent::ToolResult { .. } => true,
+                // Reasoning is the turn's working, not its reply. Among calls it
+                // is one step of them; on its own it is a turn that thought
+                // before it answered, which is still a group, not a message.
+                MessageContent::Thinking { .. } => true,
                 // Any prose at all — even in the same message as a tool call —
                 // keeps the message narrative. Collapsing the two together
                 // would bury the words the model just said.
@@ -138,6 +142,27 @@ mod tests {
 
     fn message(role: MessageRole, block: MessageContent) -> ConversationMessage {
         ConversationMessage::new(role, vec![block])
+    }
+
+    #[test]
+    fn reasoning_is_activity_unless_prose_shares_its_message() {
+        let thought = message(
+            MessageRole::Assistant,
+            MessageContent::Thinking {
+                text: "Checking the tests first.".into(),
+            },
+        );
+        assert!(TranscriptActivityGroupingPolicy::is_activity_only(&thought));
+        let mixed = ConversationMessage::new(
+            MessageRole::Assistant,
+            vec![
+                MessageContent::Thinking { text: "hmm".into() },
+                MessageContent::Text {
+                    text: "Done.".into(),
+                },
+            ],
+        );
+        assert!(!TranscriptActivityGroupingPolicy::is_activity_only(&mixed));
     }
 
     fn tool_use(role: MessageRole, id: &str, name: &str) -> ConversationMessage {

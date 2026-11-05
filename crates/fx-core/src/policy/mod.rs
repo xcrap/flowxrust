@@ -8,6 +8,7 @@ pub mod conversation_scroll;
 pub mod diff_budget;
 pub mod diff_disclosure;
 pub mod diff_row_layout;
+pub mod edit_preview;
 pub mod file_index;
 pub mod image_correlation;
 pub mod message_search;
@@ -25,6 +26,7 @@ pub use diff_budget::{
 };
 pub use diff_disclosure::DiffDisclosureState;
 pub use diff_row_layout::{DiffRowLayout, Location};
+pub use edit_preview::{EditPreview, EditSection};
 pub use file_index::{ProjectFileIndexPolicy, SKIPPED_DIRECTORY_NAMES};
 pub use image_correlation::{ConversationImageCorrelation, ImageCorrelationKey};
 pub use transcript_grouping::{TranscriptActivityGroupingPolicy, TranscriptActivitySegment};

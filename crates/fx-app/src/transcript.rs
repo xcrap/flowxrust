@@ -65,7 +65,7 @@ use fx_core::Timestamp;
 use fx_core::policy::conversation_scroll::{ConversationScrollPolicy, ScrollMetrics};
 use fx_core::policy::transcript_grouping::{QUESTION_TOOL_NAME, TranscriptActivityGroupingPolicy};
 use fx_core::policy::transcript_presentation::{MentionedAttachment, user_prompt};
-use fx_core::policy::{PlanStatus, TurnPlan};
+use fx_core::policy::{EditPreview, PlanStatus, TurnPlan};
 use fx_core::{ConversationMessage, MessageContent, MessageRole};
 use fx_design::components::button::text_disclosure;
 use fx_design::components::surface::banner;
@@ -101,6 +101,10 @@ const PROMPT_BODY_SELECTOR: &str = "transcript.prompt-body";
 const PROMPT_TOGGLE_SELECTOR: &str = "transcript.prompt-toggle";
 const MESSAGE_COPY_SELECTOR: &str = "transcript.copy-message";
 const STREAMING_SELECTOR: &str = "transcript.streaming";
+/// The model's reasoning as it streams, in the tail or under a live group.
+const THINKING_SELECTOR: &str = "transcript.thinking";
+/// What a running call has printed so far, under its row.
+const LIVE_OUTPUT_SELECTOR: &str = "transcript.live-output";
 const HELD_STEER_SELECTOR: &str = "transcript.held-steer";
 /// What a steer waiting for the provider to read it says about itself.
 const HELD_STEER_NOTE: &str = "Read at the next step";
@@ -188,6 +192,16 @@ const OPTION_MARKER_WIDTH: f32 = 16.0;
 /// Not a theme token: a caret is an animation frame, and the animation system
 /// owns its own constants.
 const CARET_FADED_OPACITY: f32 = 0.25;
+/// How far a thought is dimmed against the reply. Markdown draws in `fg`, and
+/// a thought is the same prose at a remove: read when wanted, never mistaken
+/// for the answer.
+const THOUGHT_OPACITY: f32 = 0.68;
+/// How many lines of a running call's output a closed row shows, and how many
+/// an open one does. The buffer behind them is already a tail.
+const LIVE_OUTPUT_TAIL_LINES: usize = 6;
+const LIVE_OUTPUT_EXPANDED_LINES: usize = 60;
+/// The most characters of one diff line a preview draws.
+const PREVIEW_LINE_CHARACTERS: usize = 400;
 
 /// How many rendered passes make up one half of the caret's blink.
 ///
@@ -266,8 +280,8 @@ struct ThreadMemory {
     /// thread on screen keeps these: a handle held for a thread the reader
     /// left would keep messages alive that its conversation has since dropped.
     messages: Option<SharedMessages>,
-    /// The streamed text the last pass rendered, with its revision.
-    streaming: Option<(u64, Rc<str>)>,
+    /// The live text the last pass rendered, at its streaming revision.
+    streaming: Option<LiveText>,
     /// The background tasks the last pass rendered, with their revision.
     tasks: Option<(u64, Rc<[BackgroundTask]>)>,
     /// Whether a redraw for a running task's clock is already on its way.
@@ -313,6 +327,17 @@ impl ThreadMemory {
 struct SharedMessages {
     revision: u64,
     messages: Rc<[Arc<ConversationMessage>]>,
+}
+
+/// Everything a conversation streams, read once per streaming revision: the
+/// reply, the thought, and what each running call has printed.
+#[derive(Clone)]
+struct LiveText {
+    revision: u64,
+    text: Rc<str>,
+    thinking: Rc<str>,
+    /// By call id, oldest call first.
+    outputs: Rc<[(Rc<str>, Rc<str>)]>,
 }
 
 /// The rows a conversation's messages resolve to.
@@ -744,6 +769,14 @@ impl Rows {
                         first: Arc::downgrade(first),
                         messages: messages.len(),
                         is_active,
+                        // A live group draws the thought streaming into it and
+                        // what its calls print, so its height follows that
+                        // text while there is any.
+                        live: if is_active && snapshot.has_live_text() {
+                            snapshot.streaming_revision
+                        } else {
+                            0
+                        },
                     }
                 }
                 RowPlan::Plan { message, is_live } => RowStamp::Plan {
@@ -799,6 +832,10 @@ enum RowStamp {
         first: Weak<ConversationMessage>,
         messages: usize,
         is_active: bool,
+        /// The streaming revision, while a thought is streaming into a live
+        /// group; zero otherwise. The live step line is one fixed line, so
+        /// nothing else live changes the row's height.
+        live: u64,
     },
     Plan {
         /// The turn's, so every update of one card is the same row.
@@ -847,15 +884,22 @@ impl PartialEq for RowStamp {
                     first: a,
                     messages: a_messages,
                     is_active: a_active,
+                    live: a_live,
                     ..
                 },
                 Self::Activity {
                     first: b,
                     messages: b_messages,
                     is_active: b_active,
+                    live: b_live,
                     ..
                 },
-            ) => Weak::ptr_eq(a, b) && a_messages == b_messages && a_active == b_active,
+            ) => {
+                Weak::ptr_eq(a, b)
+                    && a_messages == b_messages
+                    && a_active == b_active
+                    && a_live == b_live
+            }
             (
                 Self::Plan {
                     message: a,
@@ -973,9 +1017,22 @@ struct ActivityGroup<'a> {
     /// expansion survives new messages landing.
     key: String,
     calls: Vec<ToolCall<'a>>,
+    /// What the model said to itself between the calls, in order.
+    thoughts: Vec<Thought<'a>>,
     summary: ActivitySummary,
     /// Whether this is the tail of a turn that is still running.
     is_active: bool,
+}
+
+/// One recorded thought in a group, placed among its calls.
+struct Thought<'a> {
+    /// The message and block it came from, which key its paragraphs.
+    message: Uuid,
+    index: usize,
+    text: &'a str,
+    /// How many of the group's calls come before it: it is drawn before the
+    /// call at this position, or after every call when it is the count.
+    position: usize,
 }
 
 /// One tool call and, when it arrived, its result.
@@ -1002,6 +1059,8 @@ struct ActivitySummary {
     calls: usize,
     edits: usize,
     failures: usize,
+    /// Recorded thoughts with something in them.
+    thoughts: usize,
     /// Elapsed wall time across the group, when the timestamps say so.
     seconds: Option<u64>,
 }
@@ -1157,9 +1216,11 @@ fn group_for<'a>(
     index: usize,
     is_active: bool,
 ) -> ActivityGroup<'a> {
+    let (calls, thoughts) = calls_and_thoughts(messages);
     ActivityGroup {
         key: activity_key(conversation, messages, index),
-        calls: tool_calls(messages),
+        calls,
+        thoughts,
         summary: summarize(messages),
         is_active,
     }
@@ -1221,9 +1282,12 @@ fn activity_key(conversation: Uuid, messages: &[&ConversationMessage], index: us
     format!("{conversation}:work:{first}:{index}")
 }
 
-/// Pair each call with its result.
-fn tool_calls<'a>(messages: &[&'a ConversationMessage]) -> Vec<ToolCall<'a>> {
+/// Pair each call with its result, and place each thought among the calls.
+fn calls_and_thoughts<'a>(
+    messages: &[&'a ConversationMessage],
+) -> (Vec<ToolCall<'a>>, Vec<Thought<'a>>) {
     let mut calls: Vec<ToolCall<'a>> = Vec::new();
+    let mut thoughts: Vec<Thought<'a>> = Vec::new();
     // Calls with no id cannot be keyed, and two of them would collide on an empty
     // string. They keep their own row instead, which is what the id is for.
     let mut index_by_id: HashMap<&str, usize> = HashMap::new();
@@ -1232,7 +1296,7 @@ fn tool_calls<'a>(messages: &[&'a ConversationMessage]) -> Vec<ToolCall<'a>> {
     let mut plans: HashSet<&str> = HashSet::new();
 
     for message in messages {
-        for block in &message.content {
+        for (index, block) in message.content.iter().enumerate() {
             match block {
                 MessageContent::ToolUse { id, name, input } => {
                     if is_plan_call(name, input) {
@@ -1277,11 +1341,19 @@ fn tool_calls<'a>(messages: &[&'a ConversationMessage]) -> Vec<ToolCall<'a>> {
                     call.is_error = *is_error;
                     call.result_recorded = true;
                 }
+                MessageContent::Thinking { text } if !text.trim().is_empty() => {
+                    thoughts.push(Thought {
+                        message: message.id,
+                        index,
+                        text,
+                        position: calls.len(),
+                    });
+                }
                 _ => {}
             }
         }
     }
-    calls
+    (calls, thoughts)
 }
 
 fn summarize(messages: &[&ConversationMessage]) -> ActivitySummary {
@@ -1307,13 +1379,16 @@ fn summarize(messages: &[&ConversationMessage]) -> ActivitySummary {
                         continue;
                     }
                     summary.calls += 1;
-                    if name.eq_ignore_ascii_case("Edit") || name.eq_ignore_ascii_case("Write") {
+                    if EditPreview::is_edit_tool(name) {
                         summary.edits += 1;
                     }
                 }
                 MessageContent::ToolResult {
                     id, is_error: true, ..
                 } if !plans.contains(id.as_str()) => summary.failures += 1,
+                MessageContent::Thinking { text } if !text.trim().is_empty() => {
+                    summary.thoughts += 1
+                }
                 _ => {}
             }
         }
@@ -1358,6 +1433,14 @@ pub(crate) struct Snapshot {
     streaming_revision: u64,
     streaming: Rc<str>,
     streaming_segment: u64,
+    /// The thought streaming in, as far as the provider shows it. Drawn
+    /// dimmed in the tail, or under the live group when there is one.
+    thinking: Rc<str>,
+    /// The provider's estimate of that thought's size so far, where the
+    /// thought itself is withheld or has not started arriving.
+    thinking_tokens: Option<u64>,
+    /// What each running call has printed so far, by call id.
+    live_outputs: Rc<[(Rc<str>, Rc<str>)]>,
     /// Guidance taken but not read yet, drawn after the live reply.
     steers: Rc<[Arc<ConversationMessage>]>,
     phase: Phase,
@@ -1385,6 +1468,25 @@ pub(crate) struct Snapshot {
 impl Snapshot {
     fn is_streaming(&self) -> bool {
         !self.streaming.is_empty()
+    }
+
+    fn is_thinking(&self) -> bool {
+        !self.thinking.trim().is_empty()
+    }
+
+    /// What a running call has printed so far, if anything.
+    fn live_output(&self, id: &str) -> Option<&str> {
+        self.live_outputs
+            .iter()
+            .find(|(call, _)| &**call == id)
+            .map(|(_, text)| &**text)
+    }
+
+    /// Whether anything live is drawn inside a group: a thought streaming
+    /// in, or a call's output so far. The live step line is one fixed line,
+    /// so these are what change a live group's height between messages.
+    fn has_live_text(&self) -> bool {
+        self.is_thinking() || !self.live_outputs.is_empty()
     }
 
     fn has_running_tasks(&self) -> bool {
@@ -1478,7 +1580,7 @@ pub(crate) fn snapshot(conversation: &crate::Conversation) -> Snapshot {
     let message_revision = conversation.message_revision();
     let streaming_revision = conversation.streaming_revision();
     let tasks_revision = conversation.tasks_revision();
-    let (messages, streaming, tasks) = with_thread(conversation.id, |thread| {
+    let (messages, live, tasks) = with_thread(conversation.id, |thread| {
         thread.agent = conversation.agent_id;
         let messages = match thread
             .messages
@@ -1496,12 +1598,20 @@ pub(crate) fn snapshot(conversation: &crate::Conversation) -> Snapshot {
                 messages
             }
         };
-        let streaming = match &thread.streaming {
-            Some((revision, text)) if *revision == streaming_revision => text.clone(),
+        let live = match &thread.streaming {
+            Some(live) if live.revision == streaming_revision => live.clone(),
             _ => {
-                let text: Rc<str> = conversation.streaming_text().into();
-                thread.streaming = Some((streaming_revision, text.clone()));
-                text
+                let live = LiveText {
+                    revision: streaming_revision,
+                    text: conversation.streaming_text().into(),
+                    thinking: conversation.streaming_thinking().into(),
+                    outputs: conversation
+                        .live_outputs()
+                        .map(|(id, text)| (Rc::from(id), Rc::from(text)))
+                        .collect(),
+                };
+                thread.streaming = Some(live.clone());
+                live
             }
         };
         let tasks = match &thread.tasks {
@@ -1512,7 +1622,7 @@ pub(crate) fn snapshot(conversation: &crate::Conversation) -> Snapshot {
                 tasks
             }
         };
-        (messages, streaming, tasks)
+        (messages, live, tasks)
     });
 
     let busy = conversation.is_busy();
@@ -1550,8 +1660,11 @@ pub(crate) fn snapshot(conversation: &crate::Conversation) -> Snapshot {
         revision: conversation.revision(),
         message_revision,
         streaming_revision,
-        streaming,
+        streaming: live.text,
         streaming_segment: conversation.streaming_segment(),
+        thinking: live.thinking,
+        thinking_tokens: conversation.thinking_tokens(),
+        live_outputs: live.outputs,
         steers: conversation.held_steers().iter().cloned().collect(),
         phase: conversation.phase(),
         busy,
@@ -2476,6 +2589,14 @@ fn content_block(
         MessageContent::ToolResult {
             content, is_error, ..
         } => Some(inline_tool_result(content, *is_error, place)),
+        // A thought recorded in the same message as the reply, as Claude's
+        // history keeps them: dimmed, ahead of the prose it led to.
+        MessageContent::Thinking { text } => {
+            if text.trim().is_empty() {
+                return None;
+            }
+            Some(thought_block(text, place.key("thought")))
+        }
     }
 }
 
@@ -2668,7 +2789,10 @@ fn has_copyable_text(message: &ConversationMessage) -> bool {
         MessageContent::Text { text } => !text.trim().is_empty(),
         MessageContent::Code { code, .. } => !code.is_empty(),
         MessageContent::ToolUse { .. } | MessageContent::ToolResult { .. } => true,
-        MessageContent::Image { .. } | MessageContent::ImageAsset(_) => false,
+        // What the model said to itself is not the answer a copy carries.
+        MessageContent::Image { .. }
+        | MessageContent::ImageAsset(_)
+        | MessageContent::Thinking { .. } => false,
     })
 }
 
@@ -2688,7 +2812,9 @@ fn copyable_text(message: &ConversationMessage) -> String {
             MessageContent::Code { code, .. } => Some(code.clone()),
             MessageContent::ToolUse { name, input, .. } => Some(format!("{name}\n{input}")),
             MessageContent::ToolResult { content, .. } => Some(content.clone()),
-            MessageContent::Image { .. } | MessageContent::ImageAsset(_) => None,
+            MessageContent::Image { .. }
+            | MessageContent::ImageAsset(_)
+            | MessageContent::Thinking { .. } => None,
         })
         .filter(|part| !part.trim().is_empty())
         .collect();
@@ -2872,12 +2998,16 @@ impl selection::Document for TranscriptDocument {
                 is_active,
             }) => {
                 let messages = group_messages(snapshot, &messages);
-                group_paragraphs(&group_for(snapshot.id, &messages, index, is_active))
+                let group = group_for(snapshot.id, &messages, index, is_active);
+                group_paragraphs(&group, snapshot)
             }
             // The plan card draws no selectable text.
             Some(RowPlan::Plan { .. }) => Vec::new(),
             Some(RowPlan::Tail) if !snapshot.streaming.trim().is_empty() => {
                 crate::markdown::paragraphs(&snapshot.streaming, streaming_id(snapshot))
+            }
+            Some(RowPlan::Tail) if snapshot.is_thinking() => {
+                crate::markdown::paragraphs(&snapshot.thinking, live_thought_id(snapshot))
             }
             Some(RowPlan::Steer(index)) => message_paragraphs(&snapshot.steers[index], snapshot.id),
             // Status, not prose: the block is read, not copied from.
@@ -2934,6 +3064,13 @@ fn message_paragraphs(message: &ConversationMessage, conversation: Uuid) -> Vec<
             MessageContent::ToolResult { content, .. } => {
                 ("output", bounded_detail(content).into())
             }
+            MessageContent::Thinking { text } => {
+                if text.trim().is_empty() {
+                    continue;
+                }
+                paragraphs.extend(crate::markdown::paragraphs(text, place.key("thought")));
+                continue;
+            }
             MessageContent::Image { .. } | MessageContent::ImageAsset(_) => continue,
         };
         paragraphs.push(Paragraph {
@@ -2945,27 +3082,221 @@ fn message_paragraphs(message: &ConversationMessage, conversation: Uuid) -> Vec<
     paragraphs
 }
 
-/// The paragraphs [`activity_group`] makes selectable: the failures among the
-/// calls it shows, and nothing while it is closed.
-fn group_paragraphs(group: &ActivityGroup<'_>) -> Vec<Paragraph> {
+/// The paragraphs [`activity_group`] makes selectable, in the order it draws
+/// them: the thoughts, and for each call what its row shows — its preview,
+/// arguments and output when the row is open, what it is printing while it
+/// runs, and its failure — and nothing while the group is closed.
+fn group_paragraphs(group: &ActivityGroup<'_>, snapshot: &Snapshot) -> Vec<Paragraph> {
     if !is_disclosed(&group.key) {
         return Vec::new();
     }
-    let hidden = group.calls.len().saturating_sub(detail_limit(&group.key));
-    group
-        .calls
+    let mut paragraphs = Vec::new();
+    for entry in group_entries(group) {
+        match entry {
+            GroupEntry::Thought(thought) => {
+                paragraphs.extend(crate::markdown::paragraphs(
+                    thought.text,
+                    thought_key(group, thought),
+                ));
+            }
+            GroupEntry::Call(position) => {
+                let call = &group.calls[position];
+                let key = call_key(group, position);
+                let open = is_disclosed(&key);
+                if open {
+                    match call_body(call) {
+                        Some(CallBody::Edit(preview)) => {
+                            paragraphs.extend(preview_paragraphs(&preview, &key));
+                        }
+                        Some(CallBody::Arguments) => paragraphs.push(Paragraph {
+                            key: SharedString::from(format!("{key}:arguments")),
+                            text: bounded_detail(call.input).into(),
+                            tight: false,
+                        }),
+                        None => {}
+                    }
+                    if let (false, Some(output)) = (call.is_error, call.output) {
+                        paragraphs.push(Paragraph {
+                            key: SharedString::from(format!("{key}:output")),
+                            text: bounded_detail(output).into(),
+                            tight: false,
+                        });
+                    }
+                }
+                if let Some(output) = live_output_of(call, group, snapshot) {
+                    paragraphs.push(Paragraph {
+                        key: SharedString::from(format!("{key}:live")),
+                        text: live_output_shown(output, open).into(),
+                        tight: false,
+                    });
+                }
+                if let (true, Some(output)) = (call.is_error, call.output) {
+                    paragraphs.push(Paragraph {
+                        key: failure_key(group, position),
+                        text: bounded_detail(output).into(),
+                        tight: false,
+                    });
+                }
+            }
+        }
+    }
+    if let Some(text) = live_thought_in(group, snapshot) {
+        paragraphs.extend(crate::markdown::paragraphs(
+            text,
+            group_live_thought_key(group),
+        ));
+    }
+    paragraphs
+}
+
+/// The selection key a call's row is opened and keyed under.
+fn call_key(group: &ActivityGroup<'_>, position: usize) -> String {
+    format!("{}:{position}:call", group.key)
+}
+
+/// What an open call row shows above its output.
+enum CallBody {
+    /// The change an edit tool described, as a diff.
+    Edit(EditPreview),
+    /// The call's arguments, for a tool with any worth reading.
+    Arguments,
+}
+
+fn call_body(call: &ToolCall<'_>) -> Option<CallBody> {
+    if let Some(preview) = EditPreview::from_tool(call.name, call.input) {
+        return Some(CallBody::Edit(preview));
+    }
+    (!call.input.is_empty() && call.input != "{}").then_some(CallBody::Arguments)
+}
+
+/// What a call is printing, while it runs in a live group.
+fn live_output_of<'s>(
+    call: &ToolCall<'_>,
+    group: &ActivityGroup<'_>,
+    snapshot: &'s Snapshot,
+) -> Option<&'s str> {
+    if !group.is_active || call_finished(call, snapshot) {
+        return None;
+    }
+    snapshot
+        .live_output(&call.id)
+        .filter(|output| !output.trim().is_empty())
+}
+
+/// The lines of a running call's output a row shows: the last few while the
+/// row is closed, more while it is open, and a mark where more came before.
+fn live_output_shown(output: &str, open: bool) -> String {
+    let keep = if open {
+        LIVE_OUTPUT_EXPANDED_LINES
+    } else {
+        LIVE_OUTPUT_TAIL_LINES
+    };
+    let lines: Vec<&str> = output.trim_end_matches('\n').lines().collect();
+    let skipped = lines.len().saturating_sub(keep);
+    let shown = lines[skipped..].join("\n");
+    if skipped > 0 {
+        format!("…\n{shown}")
+    } else {
+        shown
+    }
+}
+
+/// The last thing a running call printed, for the live step line.
+fn last_output_line(output: Option<&str>) -> Option<String> {
+    let line = output?
+        .lines()
+        .rev()
+        .map(str::trim)
+        .find(|line| !line.is_empty())?;
+    Some(summarize_line(line, SUMMARY_CHARACTER_LIMIT))
+}
+
+/// One preview line as drawn: tabs as four spaces, bounded, never empty so
+/// the row keeps its height.
+fn preview_line_text(line: &fx_core::git::diff::DiffLine) -> SharedString {
+    let mut out = String::with_capacity(line.text.len().min(PREVIEW_LINE_CHARACTERS + 4));
+    for (count, character) in line.text.chars().enumerate() {
+        if count >= PREVIEW_LINE_CHARACTERS {
+            out.push_str(" …");
+            break;
+        }
+        if character == '\t' {
+            out.push_str("    ");
+        } else {
+            out.push(character);
+        }
+    }
+    if out.is_empty() {
+        out.push(' ');
+    }
+    out.into()
+}
+
+/// The paragraphs [`edit_preview_panel`] makes selectable: every line, the
+/// lines of one section joined as lines.
+fn preview_paragraphs(preview: &EditPreview, key: &str) -> Vec<Paragraph> {
+    preview
+        .sections
         .iter()
         .enumerate()
-        .skip(hidden)
-        .filter_map(|(position, call)| match (call.is_error, call.output) {
-            (true, Some(output)) => Some(Paragraph {
-                key: failure_key(group, position),
-                text: bounded_detail(output).into(),
-                tight: false,
-            }),
-            _ => None,
+        .flat_map(|(section_index, section)| {
+            section
+                .lines
+                .iter()
+                .enumerate()
+                .map(move |(line_index, line)| Paragraph {
+                    key: SharedString::from(format!("{key}:diff:{section_index}:{line_index}")),
+                    text: preview_line_text(line),
+                    tight: line_index > 0,
+                })
         })
         .collect()
+}
+
+/// What an open group draws, in order: each thought before the call it
+/// preceded, and the calls past the paging limit left out along with the
+/// thoughts among them.
+fn group_entries<'g, 'a>(group: &'g ActivityGroup<'a>) -> Vec<GroupEntry<'g, 'a>> {
+    let hidden = group.calls.len().saturating_sub(detail_limit(&group.key));
+    let mut entries = Vec::with_capacity(group.calls.len() + group.thoughts.len());
+    let mut thoughts = group
+        .thoughts
+        .iter()
+        .filter(|thought| thought.position >= hidden)
+        .peekable();
+    for position in hidden..group.calls.len() {
+        while let Some(thought) = thoughts.next_if(|thought| thought.position <= position) {
+            entries.push(GroupEntry::Thought(thought));
+        }
+        entries.push(GroupEntry::Call(position));
+    }
+    entries.extend(thoughts.map(GroupEntry::Thought));
+    entries
+}
+
+/// One thing an open group draws.
+enum GroupEntry<'g, 'a> {
+    Call(usize),
+    Thought(&'g Thought<'a>),
+}
+
+/// The selection key a recorded thought's paragraphs start with: the group's
+/// key, so the selection finds the row, then the block the thought came from.
+fn thought_key(group: &ActivityGroup<'_>, thought: &Thought<'_>) -> String {
+    format!(
+        "{}:{}:{}:thought",
+        group.key, thought.message, thought.index
+    )
+}
+
+/// The selection key of the thought streaming into a live group.
+fn group_live_thought_key(group: &ActivityGroup<'_>) -> String {
+    format!("{}:live:thought", group.key)
+}
+
+/// The thought streaming into this group, when it is the live one.
+fn live_thought_in<'s>(group: &ActivityGroup<'_>, snapshot: &'s Snapshot) -> Option<&'s str> {
+    (group.is_active && snapshot.is_thinking()).then(|| &*snapshot.thinking)
 }
 
 /// The selection key of one call's failure panel.
@@ -3018,6 +3349,40 @@ fn streaming_id(snapshot: &Snapshot) -> String {
         "{STREAMING_PREFIX}{}:{}",
         snapshot.id, snapshot.streaming_segment
     )
+}
+
+/// The id the thought streaming into the tail is rendered under.
+fn live_thought_id(snapshot: &Snapshot) -> String {
+    format!("{}:thought", streaming_id(snapshot))
+}
+
+/// A thought, dimmed: the reply's Markdown at a remove.
+fn thought_block(text: &str, key: impl Into<SharedString>) -> AnyElement {
+    div()
+        .w_full()
+        .min_w_0()
+        .opacity(THOUGHT_OPACITY)
+        .child(crate::markdown::render(text, key))
+        .into_any_element()
+}
+
+/// The thought still arriving, dimmed, with the selector tests look for.
+fn live_thought(text: &str, key: impl Into<SharedString>) -> AnyElement {
+    div()
+        .debug_selector(|| THINKING_SELECTOR.to_string())
+        .w_full()
+        .min_w_0()
+        .child(thought_block(text, key))
+        .into_any_element()
+}
+
+/// "~1.2k tokens": how much the model has thought, by its provider's estimate.
+fn thinking_tokens_label(tokens: u64) -> String {
+    if tokens < 1_000 {
+        format!("~{tokens} tokens")
+    } else {
+        format!("~{:.1}k tokens", tokens as f64 / 1_000.0)
+    }
 }
 
 /// The reply still being written, or the indicator that stands in for one before
@@ -3074,40 +3439,55 @@ fn streaming_tail(snapshot: &Snapshot, frame: u32, has_active_group: bool) -> Op
         );
     }
 
+    // How long the turn has been at it, before there is any work to show for
+    // it, and how much it has thought where the provider says.
+    let thinking = snapshot.is_thinking();
+    let mut caption = match (thinking, snapshot.turn_seconds()) {
+        (true, Some(seconds)) => format!("Thinking {}", duration_label(seconds)),
+        (true, None) => "Thinking…".to_string(),
+        (false, Some(seconds)) => {
+            format!("{} {}", snapshot.phase.label(), duration_label(seconds))
+        }
+        (false, None) => snapshot.phase.label().to_string(),
+    };
+    if let Some(tokens) = snapshot.thinking_tokens {
+        caption.push_str(" · ");
+        caption.push_str(&thinking_tokens_label(tokens));
+    }
+    let indicator = div()
+        .w_full()
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap(px_len(Spacing::SM))
+        .child(
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px_len(Spacing::MD))
+                .py(px_len(Spacing::SM))
+                .child(typing_indicator(typing_phase(frame), false))
+                .child(
+                    div()
+                        .fx_caption()
+                        .text_color(Colors::fg_secondary(&theme))
+                        .child(SharedString::from(caption)),
+                ),
+        );
+    if !thinking {
+        return Some(indicator.pb(px_len(Spacing::XXL)).into_any_element());
+    }
     Some(
         div()
             .w_full()
+            .min_w_0()
             .flex()
-            .flex_row()
-            .items_center()
-            .gap(px_len(Spacing::SM))
+            .flex_col()
+            .gap(px_len(Spacing::XS))
             .pb(px_len(Spacing::XXL))
-            .child(
-                div()
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .gap(px_len(Spacing::MD))
-                    .py(px_len(Spacing::SM))
-                    .child(typing_indicator(typing_phase(frame), false))
-                    .child(
-                        div()
-                            .fx_caption()
-                            .text_color(Colors::fg_secondary(&theme))
-                            // How long the turn has been at it, before there is
-                            // any work to show for it.
-                            .child(SharedString::from(match snapshot.turn_seconds() {
-                                Some(seconds) => {
-                                    format!(
-                                        "{} {}",
-                                        snapshot.phase.label(),
-                                        duration_label(seconds)
-                                    )
-                                }
-                                None => snapshot.phase.label().to_string(),
-                            })),
-                    ),
-            )
+            .child(indicator)
+            .child(live_thought(&snapshot.thinking, live_thought_id(snapshot)))
             .into_any_element(),
     )
 }
@@ -3653,9 +4033,18 @@ fn activity_group(group: &ActivityGroup<'_>, snapshot: &Snapshot, frame: u32) ->
                     )),
             );
         }
-        for (position, call) in group.calls.iter().enumerate().skip(hidden) {
-            let key = failure_key(group, position);
-            details = details.child(tool_row(call, group.is_active, snapshot, frame, key));
+        for entry in group_entries(group) {
+            details = details.child(match entry {
+                GroupEntry::Thought(thought) => {
+                    thought_block(thought.text, thought_key(group, thought))
+                }
+                GroupEntry::Call(position) => tool_row(group, position, snapshot, frame),
+            });
+        }
+        // The thought arriving now, after everything recorded: it is
+        // committed as a thought of its own when it ends, in this place.
+        if let Some(text) = live_thought_in(group, snapshot) {
+            details = details.child(live_thought(text, group_live_thought_key(group)));
         }
         column = column.child(details);
     }
@@ -3664,15 +4053,21 @@ fn activity_group(group: &ActivityGroup<'_>, snapshot: &Snapshot, frame: u32) ->
 }
 
 /// One call inside a group, with its state at the trailing edge.
+///
+/// The row opens on a click to what the call is: an edit's diff, or any other
+/// call's arguments, and its output once it has one. While it runs in a live
+/// group, what it has printed so far is drawn under it, open or closed.
 fn tool_row(
-    call: &ToolCall<'_>,
-    group_is_active: bool,
+    group: &ActivityGroup<'_>,
+    position: usize,
     snapshot: &Snapshot,
     frame: u32,
-    failure_key: SharedString,
 ) -> AnyElement {
     let theme = global::current();
-    let running = !call_finished(call, snapshot) && group_is_active;
+    let call = &group.calls[position];
+    let running = !call_finished(call, snapshot) && group.is_active;
+    let key = call_key(group, position);
+    let open = is_disclosed(&key);
 
     let status: AnyElement = if call.is_error {
         Icon::XMARK_CIRCLE_FILL.render(IconSize::Small, Colors::error(&theme), &theme)
@@ -3683,6 +4078,7 @@ fn tool_row(
     };
 
     let title = div()
+        .id(SharedString::from(format!("call:{key}")))
         .debug_selector({
             let id = call.id.clone();
             move || format!("transcript.activity-call:{id}")
@@ -3693,6 +4089,17 @@ fn tool_row(
         .items_center()
         .gap(px_len(Spacing::SM))
         .py(px_len(Spacing::XXXS))
+        .px(px_len(Spacing::XS))
+        .rounded(px_len(Radii::SM))
+        .cursor(CursorStyle::PointingHand)
+        .hover(|style| style.fx_background(Colors::bg_hover(&theme)))
+        .on_click({
+            let key = key.clone();
+            move |_, _window, cx| {
+                toggle_disclosure(&key);
+                cx.refresh_windows();
+            }
+        })
         .child(div().flex_shrink_0().child(tool_glyph(call.name)))
         .child(
             div()
@@ -3724,6 +4131,37 @@ fn tool_row(
         .gap(px_len(Spacing::XXS))
         .child(title);
 
+    if open {
+        match call_body(call) {
+            Some(CallBody::Edit(preview)) => {
+                column = column.child(edit_preview_panel(&preview, &key));
+            }
+            Some(CallBody::Arguments) => {
+                column = column.child(mono_panel(
+                    "Arguments",
+                    call.input,
+                    BlockTone::Standard,
+                    SharedString::from(format!("{key}:arguments")),
+                    false,
+                ));
+            }
+            None => {}
+        }
+        if let (false, Some(output)) = (call.is_error, call.output) {
+            column = column.child(mono_panel(
+                "Output",
+                output,
+                BlockTone::Standard,
+                SharedString::from(format!("{key}:output")),
+                true,
+            ));
+        }
+    }
+
+    if let Some(output) = live_output_of(call, group, snapshot) {
+        column = column.child(live_output_panel(output, format!("{key}:live"), open));
+    }
+
     // A failure is shown whole rather than summarized. The one line is what makes
     // a row fit; the failure is the one thing in the group the reader came for,
     // and truncating it is how "permission denied" becomes "perm…".
@@ -3732,7 +4170,7 @@ fn tool_row(
             "Failure",
             output,
             BlockTone::Failure,
-            failure_key,
+            failure_key(group, position),
             false,
         ));
     }
@@ -3740,12 +4178,132 @@ fn tool_row(
     column.into_any_element()
 }
 
+/// The change an edit described, drawn as the diff viewer draws a file: a
+/// header per section, then its lines on their own fills.
+fn edit_preview_panel(preview: &EditPreview, key: &str) -> AnyElement {
+    let theme = global::current();
+    let mut panel = div()
+        .w_full()
+        .min_w_0()
+        .flex()
+        .flex_col()
+        .rounded(px_len(Radii::MD))
+        .overflow_hidden()
+        .border(px_len(BorderWidth::HAIRLINE))
+        .border_color(Colors::border_subtle(&theme));
+    for (section_index, section) in preview.sections.iter().enumerate() {
+        let mut header = div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px_len(Spacing::SM))
+            .px(px_len(Spacing::MD))
+            .py(px_len(Spacing::XS))
+            .bg(Colors::bg_elevated(&theme))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .fx_role(TextRole::MonoSmall)
+                    .truncate()
+                    .text_color(Colors::fg_secondary(&theme))
+                    .child(SharedString::from(
+                        section.path.clone().unwrap_or_else(|| "Edit".to_string()),
+                    )),
+            );
+        if section.added > 0 {
+            header = header.child(
+                div()
+                    .flex_shrink_0()
+                    .fx_role(TextRole::MonoSmall)
+                    .text_color(Colors::diff_added_fg(&theme))
+                    .child(SharedString::from(format!("+{}", section.added))),
+            );
+        }
+        if section.removed > 0 {
+            header = header.child(
+                div()
+                    .flex_shrink_0()
+                    .fx_role(TextRole::MonoSmall)
+                    .text_color(Colors::diff_removed_fg(&theme))
+                    .child(SharedString::from(format!("−{}", section.removed))),
+            );
+        }
+        panel = panel.child(header);
+        for (line_index, line) in section.lines.iter().enumerate() {
+            let (fg, bg) = crate::inspector::diff_view::line_palette(line.kind, &theme);
+            let text = preview_line_text(line);
+            panel = panel.child(
+                div()
+                    .w_full()
+                    .min_w_0()
+                    .px(px_len(Spacing::MD))
+                    .bg(bg)
+                    .fx_role(TextRole::MonoSmall)
+                    .text_color(fg)
+                    .child(
+                        SelectableText::new(
+                            SharedString::from(format!("{key}:diff:{section_index}:{line_index}")),
+                            text.clone(),
+                            StyledText::new(text),
+                        )
+                        .tight(line_index > 0),
+                    ),
+            );
+        }
+        if section.omitted > 0 {
+            panel = panel.child(
+                div()
+                    .px(px_len(Spacing::MD))
+                    .py(px_len(Spacing::XS))
+                    .bg(Colors::bg_surface(&theme))
+                    .fx_caption()
+                    .text_color(Colors::fg_tertiary(&theme))
+                    .child(SharedString::from(format!(
+                        "… {} more {}",
+                        section.omitted,
+                        if section.omitted == 1 {
+                            "line"
+                        } else {
+                            "lines"
+                        }
+                    ))),
+            );
+        }
+    }
+    panel.into_any_element()
+}
+
+/// What a running call has printed so far, dimmed under its row.
+fn live_output_panel(output: &str, key: String, open: bool) -> AnyElement {
+    let theme = global::current();
+    let shown = SharedString::from(live_output_shown(output, open));
+    div()
+        .debug_selector(|| LIVE_OUTPUT_SELECTOR.into())
+        .w_full()
+        .min_w_0()
+        .rounded(px_len(Radii::MD))
+        .border(px_len(BorderWidth::HAIRLINE))
+        .border_color(Colors::border_subtle(&theme))
+        .bg(Colors::bg_surface(&theme))
+        .px(px_len(Spacing::MD))
+        .py(px_len(Spacing::SM))
+        .fx_role(TextRole::MonoSmall)
+        .text_color(Colors::fg_tertiary(&theme))
+        .child(SelectableText::new(
+            SharedString::from(key),
+            shown.clone(),
+            StyledText::new(shown),
+        ))
+        .into_any_element()
+}
+
 /// The glyph that names what kind of call this is.
 fn tool_glyph(name: &str) -> AnyElement {
     let theme = global::current();
     let icon = if name.eq_ignore_ascii_case("Read") {
         Icon::DOC_TEXT
-    } else if name.eq_ignore_ascii_case("Edit") || name.eq_ignore_ascii_case("Write") {
+    } else if EditPreview::is_edit_tool(name) {
         Icon::PENCIL_LINE
     } else if name.eq_ignore_ascii_case("Grep") || name.eq_ignore_ascii_case("Glob") {
         Icon::MAGNIFYINGGLASS
@@ -3780,7 +4338,7 @@ enum Tense {
 fn tool_title(call: &ToolCall<'_>, tense: Tense) -> String {
     let (past, present) = match call.name.to_ascii_lowercase().as_str() {
         "read" => ("Read", "Reading"),
-        "edit" => ("Edited", "Editing"),
+        "edit" | "multiedit" | "filechange" | "apply_patch" | "applypatch" => ("Edited", "Editing"),
         // Not "Writing", which is what the model is doing when it writes prose.
         "write" => ("Wrote", "Writing file"),
         "grep" => ("Searched", "Searching"),
@@ -3798,12 +4356,67 @@ fn tool_title(call: &ToolCall<'_>, tense: Tense) -> String {
 }
 
 /// The one line that says what the call was pointed at.
+///
+/// Read from the arguments as they are, which while Claude streams them is a
+/// prefix of the JSON: a path that has arrived is shown before the rest has.
 fn tool_detail(call: &ToolCall<'_>) -> Option<String> {
     let argument = json_string(call.input, "file_path")
         .or_else(|| json_string(call.input, "pattern"))
-        .or_else(|| json_string(call.input, "command"))?;
+        .or_else(|| json_string(call.input, "command"))
+        .or_else(|| changed_paths(call.input))
+        .or_else(|| partial_json_string(call.input, "file_path"))
+        .or_else(|| partial_json_string(call.input, "pattern"))
+        .or_else(|| partial_json_string(call.input, "command"))?;
     let summarized = summarize_line(&argument, SUMMARY_CHARACTER_LIMIT);
     (!summarized.is_empty()).then_some(summarized)
+}
+
+/// The files a Codex `fileChange` touches: the first, and how many more.
+fn changed_paths(input: &str) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_str(input).ok()?;
+    let paths: Vec<&str> = value
+        .get("changes")?
+        .as_array()?
+        .iter()
+        .filter_map(|change| change.get("path").and_then(serde_json::Value::as_str))
+        .collect();
+    let first = paths.first()?;
+    Some(match paths.len() {
+        1 => (*first).to_string(),
+        more => format!("{first} +{}", more - 1),
+    })
+}
+
+/// A string field out of arguments that do not parse yet: the value after
+/// `"key":`, up to its closing quote or as far as it has come.
+fn partial_json_string(input: &str, key: &str) -> Option<String> {
+    let needle = format!("\"{key}\"");
+    let start = input.find(&needle)? + needle.len();
+    let rest = input[start..].trim_start().strip_prefix(':')?.trim_start();
+    let rest = rest.strip_prefix('"')?;
+    let mut out = String::new();
+    let mut characters = rest.chars();
+    while let Some(character) = characters.next() {
+        match character {
+            '"' => break,
+            '\\' => match characters.next() {
+                Some('n') => out.push('\n'),
+                Some('t') => out.push('\t'),
+                Some('u') => {
+                    let code: String = characters.by_ref().take(4).collect();
+                    if let Some(decoded) =
+                        u32::from_str_radix(&code, 16).ok().and_then(char::from_u32)
+                    {
+                        out.push(decoded);
+                    }
+                }
+                Some(other) => out.push(other),
+                None => break,
+            },
+            other => out.push(other),
+        }
+    }
+    (!out.is_empty()).then_some(out)
 }
 
 /// A group's header line.
@@ -3811,11 +4424,17 @@ fn tool_detail(call: &ToolCall<'_>) -> Option<String> {
 /// `turn_seconds` is the running turn's elapsed time, which a live group shows
 /// in place of the ellipsis: "Working 1m 23s · 5 actions".
 fn group_title(group: &ActivityGroup<'_>, phase_label: &str, turn_seconds: Option<u64>) -> String {
+    // A group with nothing in it but thinking did no work to speak of.
+    let past = if group.summary.calls == 0 && group.summary.thoughts > 0 {
+        "Thought"
+    } else {
+        "Worked"
+    };
     let mut title = match (group.is_active, turn_seconds, group.summary.seconds) {
         (true, Some(seconds), _) => format!("{phase_label} {}", duration_label(seconds)),
         (true, None, _) => format!("{phase_label}…"),
-        (false, _, Some(seconds)) => format!("Worked for {}", duration_label(seconds)),
-        (false, _, None) => "Worked".to_string(),
+        (false, _, Some(seconds)) => format!("{past} for {}", duration_label(seconds)),
+        (false, _, None) => past.to_string(),
     };
     if group.summary.calls > 0 {
         title.push_str(" · ");
@@ -3888,6 +4507,9 @@ enum LiveStep<'a> {
     /// waiting on something.
     Between {
         label: String,
+        /// The latest line of the thought arriving, or its size, while the
+        /// model thinks.
+        detail: Option<String>,
         since: Option<Timestamp>,
     },
 }
@@ -3903,6 +4525,7 @@ fn live_step<'a>(group: &ActivityGroup<'a>, snapshot: &Snapshot) -> LiveStep<'a>
     if snapshot.waiting_for_user {
         return LiveStep::Between {
             label: format!("{}…", snapshot.phase.label()),
+            detail: None,
             since: None,
         };
     }
@@ -3912,23 +4535,50 @@ fn live_step<'a>(group: &ActivityGroup<'a>, snapshot: &Snapshot) -> LiveStep<'a>
         .rev()
         .find(|call| !call_finished(call, snapshot))
     {
+        // What the call is pointed at, and the last thing it printed, so a
+        // closed group still shows a build going by.
+        let detail = match (
+            tool_detail(call),
+            last_output_line(live_output_of(call, group, snapshot)),
+        ) {
+            (Some(detail), Some(line)) => Some(format!("{detail} · {line}")),
+            (detail, None) => detail,
+            (None, line) => line,
+        };
         return LiveStep::Call {
             name: call.name,
             title: tool_title(call, Tense::Present),
-            detail: tool_detail(call),
+            detail,
             started: call.started,
         };
     }
-    let label = match snapshot.phase {
+    let (label, detail) = match snapshot.phase {
         Phase::Running | Phase::Starting if !snapshot.streaming.trim().is_empty() => {
-            "Writing…".to_string()
+            ("Writing…".to_string(), None)
         }
-        Phase::Running | Phase::Starting => "Thinking…".to_string(),
-        phase => format!("{}…", phase.label()),
+        Phase::Running | Phase::Starting => ("Thinking…".to_string(), thinking_detail(snapshot)),
+        phase => (format!("{}…", phase.label()), None),
     };
     LiveStep::Between {
         label,
+        detail,
         since: snapshot.step_started_at,
+    }
+}
+
+/// What the live step says about a thought in progress: its latest line, so
+/// a closed group still shows the thinking going by, or its size where the
+/// provider withholds the text.
+fn thinking_detail(snapshot: &Snapshot) -> Option<String> {
+    let line = snapshot
+        .thinking
+        .lines()
+        .rev()
+        .map(str::trim)
+        .find(|line| !line.is_empty());
+    match line {
+        Some(line) => Some(summarize_line(line, SUMMARY_CHARACTER_LIMIT)),
+        None => snapshot.thinking_tokens.map(thinking_tokens_label),
     }
 }
 
@@ -3940,17 +4590,29 @@ fn live_step<'a>(group: &ActivityGroup<'a>, snapshot: &Snapshot) -> LiveStep<'a>
 /// nothing.
 fn live_step_line(group: &ActivityGroup<'_>, snapshot: &Snapshot) -> AnyElement {
     let theme = global::current();
-    let (glyph, label, detail, since) = match live_step(group, snapshot) {
+    // A call's detail is a path or a command; a thought's is prose.
+    let (glyph, label, detail, detail_role, since) = match live_step(group, snapshot) {
         LiveStep::Call {
             name,
             title,
             detail,
             started,
-        } => (tool_glyph(name), title, detail, Some(started)),
-        LiveStep::Between { label, since } => (
+        } => (
+            tool_glyph(name),
+            title,
+            detail,
+            TextRole::MonoSmall,
+            Some(started),
+        ),
+        LiveStep::Between {
+            label,
+            detail,
+            since,
+        } => (
             Icon::ELLIPSIS.render(IconSize::Small, Colors::fg_tertiary(&theme), &theme),
             label,
-            None,
+            detail,
+            TextRole::Caption,
             since,
         ),
     };
@@ -3990,7 +4652,7 @@ fn live_step_line(group: &ActivityGroup<'_>, snapshot: &Snapshot) -> AnyElement 
                 .flex_1()
                 .min_w_0()
                 .truncate()
-                .fx_role(TextRole::MonoSmall)
+                .fx_role(detail_role)
                 .text_color(Colors::fg_tertiary(&theme))
                 .child(SharedString::from(detail))
                 .into_any_element(),
@@ -5014,6 +5676,8 @@ mod tests {
             ("Grep", "Searched", "Searching"),
             ("Glob", "Matched files", "Matching files"),
             ("Bash", "Ran command", "Running command"),
+            ("fileChange", "Edited", "Editing"),
+            ("MultiEdit", "Edited", "Editing"),
             ("Frobnicate", "Frobnicate", "Frobnicate"),
             (ORPHAN_TOOL, "Tool result", "Tool result"),
         ];
@@ -5053,6 +5717,35 @@ mod tests {
             // Not JSON: the row still has to say something.
             ("Custom", "not json at all", None),
             ("Read", "{}", None),
+            // Arguments still streaming: a path that has arrived is shown.
+            (
+                "Read",
+                "{\"file_path\": \"/a/b.rs",
+                Some("/a/b.rs".to_string()),
+            ),
+            (
+                "Edit",
+                "{\"file_path\":\"/a.rs\",\"old_string\":\"x",
+                Some("/a.rs".to_string()),
+            ),
+            ("Read", "{\"file_path\": \"", None),
+            ("Read", "{\"file_pa", None),
+            (
+                "Bash",
+                "{\"command\": \"echo \\\"hi\\\" \\u0026 ls",
+                Some("echo \"hi\" & ls".to_string()),
+            ),
+            // A Codex patch names its files.
+            (
+                "fileChange",
+                r#"{"type":"fileChange","changes":[{"path":"/p/a.rs"}]}"#,
+                Some("/p/a.rs".to_string()),
+            ),
+            (
+                "fileChange",
+                r#"{"changes":[{"path":"/p/a.rs"},{"path":"/p/b.rs"},{"path":"/p/c.rs"}]}"#,
+                Some("/p/a.rs +2".to_string()),
+            ),
         ];
         for (name, input, expected) in cases {
             let call = ToolCall {
@@ -6984,6 +7677,9 @@ mod tests {
         conversation.append(message(
             MessageRole::Assistant,
             vec![
+                MessageContent::Thinking {
+                    text: "A thought kept in the reply's own message.".into(),
+                },
                 MessageContent::Text {
                     text: "Here is the plan:".into(),
                 },
@@ -7016,6 +7712,10 @@ mod tests {
         ));
         conversation.append(text(MessageRole::User, "Run it."));
         conversation.apply(ProviderEvent::Lifecycle(Lifecycle::TurnStarted));
+        conversation.apply(ProviderEvent::ThinkingDelta(
+            "Run the tests, then read the failure.".into(),
+        ));
+        conversation.apply(ProviderEvent::ThinkingEnd);
         conversation.apply(ProviderEvent::ToolUse {
             id: "t1".into(),
             name: "Bash".into(),
@@ -7048,7 +7748,13 @@ mod tests {
                 && painted
                     .iter()
                     .any(|(key, ..)| key.starts_with(STREAMING_PREFIX))
-                && painted.iter().any(|(key, ..)| key.ends_with(":arguments")),
+                && painted.iter().any(|(key, ..)| key.ends_with(":arguments"))
+                && painted
+                    .iter()
+                    .any(|(key, ..)| key.contains(":work:") && key.contains(":thought:"))
+                && painted
+                    .iter()
+                    .any(|(key, ..)| !key.contains(":work:") && key.contains(":thought:")),
             "the fixture no longer reaches every kind of paragraph: {painted:#?}"
         );
         assert_eq!(document, painted);
@@ -7580,6 +8286,517 @@ mod tests {
         assert!(drew(&mut visual, &plan_step("active", "Fixing the bug")));
         assert!(!drew(&mut visual, LIVE_STEP_SELECTOR), "nothing is live");
         assert!(drew(&mut visual, &title("Worked · 2 actions")));
+    }
+
+    // ── Thoughts ────────────────────────────────────────────────────────────
+
+    /// A finished turn that thought before each of its two calls.
+    fn thinking_between_calls() -> Conversation {
+        let mut conversation = Conversation::new(Uuid::new_v4());
+        conversation.append(text(MessageRole::User, "Fix the parser"));
+        conversation.apply(ProviderEvent::Lifecycle(Lifecycle::TurnStarted));
+        conversation.apply(ProviderEvent::ThinkingDelta(
+            "Check the parser first.".into(),
+        ));
+        conversation.apply(ProviderEvent::ThinkingEnd);
+        conversation.apply(ProviderEvent::ToolUse {
+            id: "read".into(),
+            name: "Read".into(),
+            input: r#"{"file_path":"/src/parser.rs"}"#.into(),
+        });
+        conversation.apply(ProviderEvent::ToolResult {
+            id: "read".into(),
+            content: "fn parse() {}".into(),
+            is_error: false,
+        });
+        conversation.apply(ProviderEvent::ThinkingDelta("Now the tests.".into()));
+        conversation.apply(ProviderEvent::ThinkingEnd);
+        conversation.apply(ProviderEvent::ToolUse {
+            id: "test".into(),
+            name: "Bash".into(),
+            input: r#"{"command":"cargo test"}"#.into(),
+        });
+        conversation.apply(ProviderEvent::ToolResult {
+            id: "test".into(),
+            content: "Completed".into(),
+            is_error: false,
+        });
+        conversation.apply(ProviderEvent::TextDelta("All green.".into()));
+        conversation.apply(ProviderEvent::Done {
+            stop_reason: "end_turn".into(),
+        });
+        conversation
+    }
+
+    #[test]
+    fn thoughts_sit_among_the_calls_of_their_group() {
+        let conversation = thinking_between_calls();
+        let id = conversation.id;
+        let key = {
+            let messages: Vec<_> = conversation.messages().collect();
+            let rows = build_rows(&messages, false, id);
+            let [Row::Message(_), Row::Activity(group), Row::Message(answer)] = rows.as_slice()
+            else {
+                panic!("the thoughts did not join the calls' group");
+            };
+            assert_eq!(answer.text_content(), "All green.");
+            assert_eq!((group.summary.calls, group.summary.thoughts), (2, 2));
+            assert_eq!(
+                group
+                    .thoughts
+                    .iter()
+                    .map(|thought| (thought.position, thought.text))
+                    .collect::<Vec<_>>(),
+                [(0, "Check the parser first."), (1, "Now the tests.")]
+            );
+            // The title counts the work, not the thinking that went into it.
+            let title = group_title(group, "Working", None);
+            assert!(
+                title.starts_with("Worked") && title.ends_with("· 2 actions"),
+                "{title}"
+            );
+            toggle_disclosure(&group.key);
+            let order: Vec<String> = group_entries(group)
+                .iter()
+                .map(|entry| match entry {
+                    GroupEntry::Call(position) => format!("call {position}"),
+                    GroupEntry::Thought(thought) => format!("thought {}", thought.position),
+                })
+                .collect();
+            assert_eq!(order, ["thought 0", "call 0", "thought 1", "call 1"]);
+            group.key.clone()
+        };
+
+        let (_test, _visual) = open(conversation, 900.0, 2_000.0);
+        let painted = crate::selection::tests::painted_paragraphs();
+        let thoughts: Vec<&(String, String, bool)> = painted
+            .iter()
+            .filter(|(paragraph, ..)| paragraph.contains(":thought:"))
+            .collect();
+        assert_eq!(
+            thoughts
+                .iter()
+                .map(|(_, text, _)| text.as_str())
+                .collect::<Vec<_>>(),
+            ["Check the parser first.", "Now the tests."]
+        );
+        assert!(
+            thoughts
+                .iter()
+                .all(|(paragraph, ..)| paragraph.starts_with(&key)),
+            "a thought's paragraphs must find their group's row: {thoughts:#?}"
+        );
+        assert_eq!(crate::selection::tests::document_paragraphs(), painted);
+    }
+
+    #[test]
+    fn a_turn_that_only_thought_is_titled_as_a_thought() {
+        let mut conversation = Conversation::new(Uuid::new_v4());
+        conversation.append(text(MessageRole::User, "What is 2 + 2?"));
+        conversation.apply(ProviderEvent::Lifecycle(Lifecycle::TurnStarted));
+        conversation.apply(ProviderEvent::ThinkingDelta("Four.".into()));
+        conversation.apply(ProviderEvent::ThinkingEnd);
+        conversation.apply(ProviderEvent::TextDelta("4".into()));
+        conversation.apply(ProviderEvent::Done {
+            stop_reason: "end_turn".into(),
+        });
+        let id = conversation.id;
+        let messages: Vec<_> = conversation.messages().collect();
+        let rows = build_rows(&messages, false, id);
+        let [Row::Message(_), Row::Activity(group), Row::Message(_)] = rows.as_slice() else {
+            panic!("a thought on its own is a group, not a message");
+        };
+        assert_eq!((group.summary.calls, group.summary.thoughts), (0, 1));
+        let title = group_title(group, "Working", None);
+        assert!(
+            title.starts_with("Thought") && !title.contains("action"),
+            "{title}"
+        );
+        // Live, it is the phase and its clock, as any group is.
+        let mut running = Conversation::new(id);
+        running.append(text(MessageRole::User, "What is 2 + 2?"));
+        running.apply(ProviderEvent::Lifecycle(Lifecycle::TurnStarted));
+        running.apply(ProviderEvent::ThinkingDelta("Four.".into()));
+        running.apply(ProviderEvent::ThinkingEnd);
+        let messages: Vec<_> = running.messages().collect();
+        let rows = build_rows(&messages, true, id);
+        let Row::Activity(group) = &rows[1] else {
+            panic!("not a group");
+        };
+        assert!(group.is_active);
+        assert_eq!(group_title(group, "Working", Some(3)), "Working 3s");
+
+        // A thought kept in the reply's own message, as Claude's history keeps
+        // them, is part of that message: drawn dimmed above the prose, and
+        // left out of a copy of it.
+        let mixed = message(
+            MessageRole::Assistant,
+            vec![
+                MessageContent::Thinking { text: "hmm".into() },
+                MessageContent::Text {
+                    text: "Done.".into(),
+                },
+            ],
+        );
+        assert!(matches!(
+            build_rows(&[&mixed], false, id).as_slice(),
+            [Row::Message(_)]
+        ));
+        assert!(has_copyable_text(&mixed));
+        assert_eq!(copyable_text(&mixed), "Done.");
+        let thought = message(
+            MessageRole::Assistant,
+            vec![MessageContent::Thinking { text: "hmm".into() }],
+        );
+        assert!(!has_copyable_text(&thought));
+        assert_eq!(
+            message_paragraphs(&mixed, id)
+                .iter()
+                .map(|paragraph| paragraph.key.to_string())
+                .collect::<Vec<_>>(),
+            [
+                format!("{}:0:thought:0", mixed.id),
+                format!("{}:1:md:0", mixed.id)
+            ]
+        );
+    }
+
+    #[test]
+    fn live_thinking_shows_in_the_tail_and_then_under_the_live_group() {
+        let mut conversation = Conversation::new(Uuid::new_v4());
+        conversation.append(text(MessageRole::User, "Fix the parser"));
+        conversation.apply(ProviderEvent::Lifecycle(Lifecycle::TurnStarted));
+        conversation.apply(ProviderEvent::ThinkingProgress {
+            estimated_tokens: 1_200,
+        });
+        conversation.apply(ProviderEvent::ThinkingDelta(
+            "Reading the parser.\n\nThen the tests.".into(),
+        ));
+        let mut test = TestAppContext::single();
+        let window = test.add_window(move |_, _| Harness { conversation });
+        let mut visual = VisualTestContext::from_window(*window.deref(), &test);
+        visual.simulate_resize(size(px(900.0), px(2_000.0)));
+        redraw(&mut test);
+
+        // Nothing is recorded yet, so the thought is the tail, selectable like
+        // the reply it stands in for.
+        assert!(drew(&mut visual, THINKING_SELECTOR));
+        assert!(
+            !drew(&mut visual, STREAMING_SELECTOR),
+            "a thought is not the reply"
+        );
+        let painted = crate::selection::tests::painted_paragraphs();
+        let tail: Vec<&str> = painted
+            .iter()
+            .filter(|(key, ..)| key.starts_with(STREAMING_PREFIX) && key.contains(":thought:"))
+            .map(|(_, text, _)| text.as_str())
+            .collect();
+        assert_eq!(tail, ["Reading the parser.", "Then the tests."]);
+        assert_eq!(crate::selection::tests::document_paragraphs(), painted);
+
+        // The thought ends and a call follows it: the two are a live group,
+        // closed by default, whose step reports the next thought's size until
+        // its text arrives, and then its latest line.
+        window
+            .update(&mut test, |view, _, cx| {
+                view.conversation.apply(ProviderEvent::ThinkingEnd);
+                view.conversation.apply(ProviderEvent::ToolUse {
+                    id: "read".into(),
+                    name: "Read".into(),
+                    input: r#"{"file_path":"/src/parser.rs"}"#.into(),
+                });
+                view.conversation.apply(ProviderEvent::ToolResult {
+                    id: "read".into(),
+                    content: "Completed".into(),
+                    is_error: false,
+                });
+                view.conversation.apply(ProviderEvent::ThinkingProgress {
+                    estimated_tokens: 1_200,
+                });
+                cx.notify();
+            })
+            .unwrap();
+        redraw(&mut test);
+        // A selector drawn once stays visible to `debug_bounds`, so absence
+        // is read off the paragraphs this frame painted.
+        let no_thought_painted = || {
+            crate::selection::tests::painted_paragraphs()
+                .iter()
+                .all(|(key, ..)| !key.contains(":thought"))
+        };
+        assert!(no_thought_painted(), "nothing is streaming");
+        assert!(drew(&mut visual, &live("label", "Thinking…")));
+        assert!(drew(&mut visual, &live("detail", "~1.2k tokens")));
+
+        window
+            .update(&mut test, |view, _, cx| {
+                view.conversation.apply(ProviderEvent::ThinkingDelta(
+                    "Now the tests.\n\nThen fix it.".into(),
+                ));
+                cx.notify();
+            })
+            .unwrap();
+        redraw(&mut test);
+        assert!(drew(&mut visual, &live("detail", "Then fix it.")));
+        assert!(
+            no_thought_painted(),
+            "a closed group shows the step, not the thought"
+        );
+
+        // Opened, the group draws the recorded thought before its call and the
+        // one arriving after everything, each keyed to the group's row.
+        let key = window
+            .update(&mut test, |view, _, cx| {
+                let first = view.conversation.messages().nth(1).unwrap().id;
+                let key = format!("{}:work:{first}:0", view.conversation.id);
+                toggle_disclosure(&key);
+                cx.notify();
+                key
+            })
+            .unwrap();
+        redraw(&mut test);
+        assert!(drew(&mut visual, ACTIVITY_DETAILS_SELECTOR));
+        assert!(drew(&mut visual, THINKING_SELECTOR));
+        let painted = crate::selection::tests::painted_paragraphs();
+        let thoughts: Vec<(&str, &str)> = painted
+            .iter()
+            .filter(|(paragraph, ..)| paragraph.contains(":thought"))
+            .map(|(paragraph, text, _)| (paragraph.as_str(), text.as_str()))
+            .collect();
+        assert_eq!(thoughts.len(), 4, "{thoughts:#?}");
+        assert!(
+            thoughts
+                .iter()
+                .all(|(paragraph, _)| paragraph.starts_with(&key)),
+            "{thoughts:#?}"
+        );
+        assert_eq!(
+            thoughts.iter().map(|(_, text)| *text).collect::<Vec<_>>(),
+            [
+                "Reading the parser.",
+                "Then the tests.",
+                "Now the tests.",
+                "Then fix it."
+            ]
+        );
+        assert!(
+            thoughts[2].0.starts_with(&format!("{key}:live:thought")),
+            "{:?}",
+            thoughts[2].0
+        );
+        assert_eq!(crate::selection::tests::document_paragraphs(), painted);
+    }
+
+    #[test]
+    fn a_call_row_opens_to_its_diff_or_its_arguments_and_output() {
+        let mut conversation = Conversation::new(Uuid::new_v4());
+        conversation.append(text(MessageRole::User, "Rename it"));
+        conversation.apply(ProviderEvent::Lifecycle(Lifecycle::TurnStarted));
+        conversation.apply(ProviderEvent::ToolUse {
+            id: "edit".into(),
+            name: "Edit".into(),
+            input: serde_json::json!({
+                "file_path": "/p/a.rs",
+                "old_string": "fn a() {\n    one();\n}\n",
+                "new_string": "fn a() {\n    two();\n}\n",
+            })
+            .to_string(),
+        });
+        conversation.apply(ProviderEvent::ToolResult {
+            id: "edit".into(),
+            content: "Completed".into(),
+            is_error: false,
+        });
+        conversation.apply(ProviderEvent::ToolUse {
+            id: "test".into(),
+            name: "Bash".into(),
+            input: r#"{"command":"cargo test"}"#.into(),
+        });
+        conversation.apply(ProviderEvent::ToolResult {
+            id: "test".into(),
+            content: "running 3 tests\nok".into(),
+            is_error: false,
+        });
+        conversation.apply(ProviderEvent::TextDelta("Done.".into()));
+        conversation.apply(ProviderEvent::Done {
+            stop_reason: "end_turn".into(),
+        });
+        let id = conversation.id;
+        let key = {
+            let messages: Vec<_> = conversation.messages().collect();
+            let rows = build_rows(&messages, false, id);
+            let Row::Activity(group) = &rows[1] else {
+                panic!("not a group");
+            };
+            assert_eq!(group.summary.edits, 1);
+            toggle_disclosure(&group.key);
+            group.key.clone()
+        };
+        let (mut test, mut visual) = open(conversation, 900.0, 2_000.0);
+        // Closed rows show nothing of their bodies.
+        assert!(
+            crate::selection::tests::painted_paragraphs()
+                .iter()
+                .all(|(paragraph, ..)| !paragraph.contains(":call:")),
+        );
+
+        // A click on the edit's row opens its diff, drawn line by line.
+        let row = visual
+            .debug_bounds("transcript.activity-call:edit")
+            .expect("the edit's row is drawn")
+            .center();
+        visual.simulate_mouse_down(row, gpui::MouseButton::Left, Default::default());
+        visual.simulate_mouse_up(row, gpui::MouseButton::Left, Default::default());
+        test.refresh().unwrap();
+        let painted = crate::selection::tests::painted_paragraphs();
+        let diff: Vec<(&str, &str)> = painted
+            .iter()
+            .filter(|(paragraph, ..)| paragraph.contains(":call:diff:"))
+            .map(|(paragraph, text, _)| (paragraph.as_str(), text.as_str()))
+            .collect();
+        assert_eq!(
+            diff.iter().map(|(_, text)| *text).collect::<Vec<_>>(),
+            [" fn a() {", "-    one();", "+    two();", " }"]
+        );
+        let prefix = format!("{key}:0:call:diff:0:");
+        assert!(
+            diff.iter()
+                .all(|(paragraph, _)| paragraph.starts_with(&prefix)),
+            "{diff:#?}"
+        );
+        assert!(
+            !painted
+                .iter()
+                .any(|(paragraph, ..)| paragraph.ends_with(":call:output")),
+            "a result that said nothing is no output"
+        );
+
+        // The command's row opens to its arguments and what it printed.
+        toggle_disclosure(&format!("{key}:1:call"));
+        redraw(&mut test);
+        let painted = crate::selection::tests::painted_paragraphs();
+        let find = |suffix: &str| {
+            painted
+                .iter()
+                .find(|(paragraph, ..)| paragraph.ends_with(suffix))
+                .map(|(_, text, _)| text.as_str())
+        };
+        assert_eq!(
+            find(":1:call:arguments"),
+            Some(r#"{"command":"cargo test"}"#)
+        );
+        assert_eq!(find(":1:call:output"), Some("running 3 tests\nok"));
+        assert_eq!(crate::selection::tests::document_paragraphs(), painted);
+    }
+
+    #[test]
+    fn a_running_commands_output_streams_under_its_row() {
+        let mut conversation = Conversation::new(Uuid::new_v4());
+        conversation.append(text(MessageRole::User, "Build it"));
+        conversation.apply(ProviderEvent::Lifecycle(Lifecycle::TurnStarted));
+        conversation.apply(ProviderEvent::ToolUse {
+            id: "build".into(),
+            name: "Bash".into(),
+            input: r#"{"command":"cargo build"}"#.into(),
+        });
+        conversation.apply(ProviderEvent::ToolOutputDelta {
+            id: "build".into(),
+            delta: "Compiling fx-core\n".into(),
+        });
+        conversation.apply(ProviderEvent::ToolOutputDelta {
+            id: "build".into(),
+            delta: "Compiling fx-agent\n".into(),
+        });
+        let mut test = TestAppContext::single();
+        let window = test.add_window(move |_, _| Harness { conversation });
+        let mut visual = VisualTestContext::from_window(*window.deref(), &test);
+        visual.simulate_resize(size(px(900.0), px(2_000.0)));
+        redraw(&mut test);
+
+        // Closed, the step says what the call last printed.
+        assert!(drew(&mut visual, &live("label", "Running command")));
+        assert!(drew(
+            &mut visual,
+            &live("detail", "cargo build · Compiling fx-agent")
+        ));
+        let live_paragraph = |key: &str| {
+            crate::selection::tests::painted_paragraphs()
+                .into_iter()
+                .find(|(paragraph, ..)| paragraph == key)
+                .map(|(_, text, _)| text)
+        };
+        assert!(
+            crate::selection::tests::painted_paragraphs()
+                .iter()
+                .all(|(paragraph, ..)| !paragraph.ends_with(":live"))
+        );
+
+        // Open, what the call has printed so far sits under its row.
+        let key = window
+            .update(&mut test, |view, _, cx| {
+                let first = view.conversation.messages().nth(1).unwrap().id;
+                let key = format!("{}:work:{first}:0", view.conversation.id);
+                toggle_disclosure(&key);
+                cx.notify();
+                key
+            })
+            .unwrap();
+        redraw(&mut test);
+        assert!(drew(&mut visual, LIVE_OUTPUT_SELECTOR));
+        let live_key = format!("{key}:0:call:live");
+        assert_eq!(
+            live_paragraph(&live_key).as_deref(),
+            Some("Compiling fx-core\nCompiling fx-agent")
+        );
+        assert_eq!(
+            crate::selection::tests::document_paragraphs(),
+            crate::selection::tests::painted_paragraphs()
+        );
+
+        // A closed row keeps the tail of a long output.
+        window
+            .update(&mut test, |view, _, cx| {
+                for line in 0..10 {
+                    view.conversation.apply(ProviderEvent::ToolOutputDelta {
+                        id: "build".into(),
+                        delta: format!("line {line}\n"),
+                    });
+                }
+                cx.notify();
+            })
+            .unwrap();
+        redraw(&mut test);
+        assert_eq!(
+            live_paragraph(&live_key).as_deref(),
+            Some("…\nline 4\nline 5\nline 6\nline 7\nline 8\nline 9")
+        );
+        assert!(drew(&mut visual, &live("detail", "cargo build · line 9")));
+
+        // The result carries the whole, so the live copy goes.
+        window
+            .update(&mut test, |view, _, cx| {
+                view.conversation.apply(ProviderEvent::ToolResult {
+                    id: "build".into(),
+                    content: "Finished".into(),
+                    is_error: false,
+                });
+                cx.notify();
+            })
+            .unwrap();
+        redraw(&mut test);
+        assert_eq!(live_paragraph(&live_key), None);
+        assert_eq!(
+            crate::selection::tests::document_paragraphs(),
+            crate::selection::tests::painted_paragraphs()
+        );
+    }
+
+    #[test]
+    fn a_thoughts_size_reads_in_tokens() {
+        assert_eq!(thinking_tokens_label(0), "~0 tokens");
+        assert_eq!(thinking_tokens_label(999), "~999 tokens");
+        assert_eq!(thinking_tokens_label(1_000), "~1.0k tokens");
+        assert_eq!(thinking_tokens_label(12_345), "~12.3k tokens");
     }
 
     // ── Background tasks ────────────────────────────────────────────────────

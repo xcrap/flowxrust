@@ -906,6 +906,16 @@ fn convert_turns(
                         )?;
                     }
                 }
+                ItemKind::Reasoning => {
+                    let text = session::reasoning_text(item);
+                    if !text.is_empty() {
+                        push(
+                            MessageRole::Assistant,
+                            vec![MessageContent::Thinking { text }],
+                            false,
+                        )?;
+                    }
+                }
                 kind @ (ItemKind::Tool | ItemKind::ToolOutput) => {
                     // An output's call never arrived as an item, so it is a
                     // result with no call row, as it is live.
@@ -1470,11 +1480,51 @@ for line in sys.stdin:
             [
                 MessageRole::User,
                 MessageRole::Assistant,
+                MessageRole::Assistant,
                 MessageRole::Tool,
                 MessageRole::Tool,
                 MessageRole::Assistant,
                 MessageRole::Assistant,
             ]
+        );
+        // The thought is the summary, a row of its own among the work.
+        assert_eq!(
+            restored[1].content,
+            vec![MessageContent::Thinking {
+                text: "Reading".into()
+            }]
+        );
+    }
+
+    #[test]
+    fn a_recorded_thought_reads_its_summary_in_either_shape() {
+        // A rollout records `summary` as the Responses API does, as
+        // `summary_text` parts with the raw reasoning encrypted; `thread/read`
+        // flattens it to strings. Both are the same thought.
+        let rollout = json!([{"id":"turn","items":[
+            {"type":"reasoning","id":"r1","summary":[{"type":"summary_text","text":"First part."},{"type":"summary_text","text":"Second part."}],"content":null,"encrypted_content":"opaque"}
+        ]}]);
+        let flat = json!([{"id":"turn","items":[
+            {"type":"reasoning","id":"r1","summary":["First part.","Second part."],"content":[]}
+        ]}]);
+        let empty = json!([{"id":"turn","items":[
+            {"type":"reasoning","id":"r1","summary":[],"content":[]}
+        ]}]);
+        let text = |turns: &Value| {
+            convert_turns("thread", turns.as_array().unwrap(), &json!({}))
+                .unwrap()
+                .into_iter()
+                .map(|message| message.content)
+                .collect::<Vec<_>>()
+        };
+        let expected = vec![vec![MessageContent::Thinking {
+            text: "First part.\n\nSecond part.".into(),
+        }]];
+        assert_eq!(text(&rollout), expected);
+        assert_eq!(text(&flat), expected);
+        assert!(
+            text(&empty).is_empty(),
+            "a thought with no summary is no row"
         );
     }
 

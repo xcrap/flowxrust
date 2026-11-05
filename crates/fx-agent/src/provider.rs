@@ -92,10 +92,43 @@ pub enum ProviderEvent {
     TextEnd,
     /// A whole message that did not stream.
     Text(String),
+    /// A piece of the model's reasoning, as far as its provider shows it:
+    /// Codex streams its summary, Claude its summarized thinking.
+    ThinkingDelta(String),
+    /// The reasoning the deltas were building is complete.
+    ThinkingEnd,
+    /// Reasoning that did not stream.
+    Thinking(String),
+    /// How much the model has thought so far, by the provider's estimate.
+    /// Claude reports it even where the thinking itself is withheld, so a
+    /// long think has something to show for itself.
+    ThinkingProgress {
+        estimated_tokens: u64,
+    },
+    /// A tool call. `input` is what the provider has said of its arguments so
+    /// far: Claude reports a call as its block opens, before the arguments
+    /// stream, so it can be empty and grow by [`Self::ToolInputDelta`].
     ToolUse {
         id: String,
         name: String,
         input: String,
+    },
+    /// More of a call's arguments, appended to what the call was reported
+    /// with. Partial JSON until the call is whole.
+    ToolInputDelta {
+        id: String,
+        delta: String,
+    },
+    /// A call's arguments whole, replacing whatever streamed.
+    ToolInput {
+        id: String,
+        input: String,
+    },
+    /// A piece of a running call's output. Shown while the call runs and
+    /// never recorded: its result carries the whole.
+    ToolOutputDelta {
+        id: String,
+        delta: String,
     },
     ToolResult {
         id: String,
