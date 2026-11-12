@@ -186,6 +186,19 @@ for line in sys.stdin:
     message = json.loads(line)
     record(message)
 
+    if (message.get("type") == "control_request"
+            and (message.get("request") or {}).get("subtype") == "get_context_usage"):
+        # Claude Code 2.1.322 answers this from its own count, after the
+        # `result` it was written at and before it exits. A fake that said
+        # nothing here let two defects in how FlowX reads that answer ship.
+        send({"type": "control_response", "response": {
+            "subtype": "success", "request_id": message.get("request_id"),
+            "response": {"categories": [
+                {"name": "Messages", "tokens": 1200, "kind": "used"},
+                {"name": "Free space", "tokens": 198800, "kind": "free"}],
+                "totalTokens": 1200, "maxTokens": 200000}}})
+        continue
+
     if message.get("type") == "user" and held:
         # The steer arrived before the turn ended, so Claude ends the turn
         # with it still queued and answers it next as a turn of its own, which

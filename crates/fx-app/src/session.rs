@@ -31,6 +31,7 @@
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
+use fx_agent::claude::transport::CLOSE_GRACE as CLAUDE_CLOSE_GRACE;
 use fx_agent::claude::{
     ClaudeTransport, Launch as ClaudeLaunch, StreamItem, TransportError as ClaudeTransportError,
     TurnRequest as ClaudeTurnRequest,
@@ -913,6 +914,9 @@ impl Job {
         // turn that gave up on its background tasks has to: they are still
         // running, in Claude's group.
         let mut stop_group = false;
+        // Whether the loop ended at a `result` with the process still to
+        // exit, which is when its answer to the context question is unread.
+        let mut ended_at_result = false;
         // Silence is not a failure: thinking and long tools can take minutes,
         // and the parser intentionally omits non-display frames. Only a result
         // with no background work outstanding, a provider/process error, a
@@ -1014,6 +1018,7 @@ impl Job {
                                 ProviderEvent::Done { stop_reason } => match background.result(stop_reason.clone(), transport.input_open().await) {
                                     AfterResult::End => {
                                         self.apply(ProviderEvent::Done { stop_reason: stop_reason.clone() });
+                                        ended_at_result = true;
                                         break TurnOutcome::Completed { thread_id, stop_reason };
                                     }
                                     // The prose so far is whole, but the thread is
@@ -1042,6 +1047,17 @@ impl Job {
                                 // that asks the model nothing included, so it is
                                 // not a sign a follow-up is under way.
                                 event @ ProviderEvent::Lifecycle(_) => self.apply(event),
+                                // Neither is the turn saying something: the
+                                // context report answers the question FlowX
+                                // wrote as the input closed, after the last
+                                // `result`, and the limits are the account's.
+                                // Counted as content, the report marked a
+                                // follow-up as under way, and every turn that
+                                // reads to the process's exit (one that was
+                                // steered, or started a background task) then
+                                // ended as a failure, with whatever a
+                                // SessionEnd hook had printed as its reason.
+                                event @ (ProviderEvent::ContextBreakdown(_) | ProviderEvent::RateLimits(_)) => self.apply(event),
                                 event => {
                                     background.content();
                                     self.apply(event);
@@ -1066,7 +1082,38 @@ impl Job {
             emit(&self.on_update, SessionUpdate::Accepted);
         }
         match ending {
-            TurnOutcome::Completed { .. } if !stop_group => transport.close().await,
+            TurnOutcome::Completed { .. } if !stop_group => {
+                // What fills the context was asked as the input closed, and
+                // Claude answers after the `result` the loop ended at: 0.6 s
+                // later on 2.1.322. Nothing read for it, so no turn that
+                // ended there ever recorded it. It is read inside the moment
+                // the process is given to exit anyway, so a CLI that never
+                // answers costs nothing more.
+                let closing = tokio::time::Instant::now();
+                if ended_at_result {
+                    let _ = tokio::time::timeout(CLAUDE_CLOSE_GRACE, async {
+                        loop {
+                            match reader.next_event().await {
+                                Some(StreamItem::Event(
+                                    event @ ProviderEvent::ContextBreakdown(_),
+                                )) => {
+                                    self.apply(event);
+                                    break;
+                                }
+                                Some(StreamItem::Event(event @ ProviderEvent::RateLimits(_))) => {
+                                    self.apply(event)
+                                }
+                                Some(StreamItem::Event(_)) => {}
+                                Some(StreamItem::Exited(_)) | None => break,
+                            }
+                        }
+                    })
+                    .await;
+                }
+                transport
+                    .close_within(CLAUDE_CLOSE_GRACE.saturating_sub(closing.elapsed()))
+                    .await
+            }
             // Interrupted first, so Claude can end its own turn and tools;
             // then the process group, for whatever did not.
             TurnOutcome::Completed { .. } | TurnOutcome::Cancelled { .. } => {
@@ -2523,6 +2570,13 @@ record({"args":sys.argv[1:]})
 for line in sys.stdin:
     message=json.loads(line)
     record(message)
+    if message.get("type")=="control_request" and (message.get("request") or {}).get("subtype")=="get_context_usage":
+        # Claude Code 2.1.322 answers this after the `result` it was written
+        # at, and before it exits.
+        send({"type":"control_response","response":{"subtype":"success","request_id":message.get("request_id"),
+              "response":{"categories":[{"name":"Messages","tokens":1200,"kind":"used"},{"name":"Free space","tokens":198800,"kind":"free"}],
+                          "totalTokens":1200,"maxTokens":200000}}})
+        continue
     if message.get("type")=="user":
         prompt=message["message"]["content"][0]["text"]
         if prompt=="think":
@@ -4293,6 +4347,44 @@ for line in sys.stdin:
         });
         // Long enough for a runner that wrongly ended at that `result` to say so.
         std::thread::sleep(Duration::from_millis(300));
+    }
+
+    #[test]
+    fn a_claude_turn_records_what_fills_the_context_and_ends_as_it_ended() {
+        // Claude answers the context question after the `result` it was
+        // written at. Read live on Claude Code 2.1.322, a plain turn never
+        // recorded the answer, because the loop had ended at the `result`,
+        // and a turn that reads to the process's exit took the answer for a
+        // follow-up under way and ended as a failure.
+        let Some(server) = ClaudeFixture::new() else {
+            return;
+        };
+        let conversation = conversation();
+        let (_runner, recorder) = server.start(&conversation, "hello", AgentAccess::FullAccess);
+        let updates = recorder.wait_for_end(TURN_BUDGET);
+        assert!(
+            matches!(updates.last(), Some(SessionUpdate::Finished { outcome }) if outcome.is_completed()),
+            "{updates:?}"
+        );
+        let breakdown = lock(&conversation)
+            .context_breakdown()
+            .cloned()
+            .expect("the report written after the result was read");
+        assert_eq!((breakdown.total_tokens, breakdown.window), (1200, 200_000));
+
+        // The same report, in a turn that reads to the exit.
+        let conversation = self::conversation();
+        let (_runner, recorder) =
+            server.start(&conversation, "background", AgentAccess::FullAccess);
+        wait_for_the_background_wait(&conversation, &recorder);
+        std::fs::write(server.dir.path().join("release-background"), "go").unwrap();
+        let updates = recorder.wait_for_end(TURN_BUDGET);
+        assert!(
+            matches!(updates.last(), Some(SessionUpdate::Finished { outcome }) if outcome.is_completed()),
+            "{updates:?}"
+        );
+        assert!(lock(&conversation).context_breakdown().is_some());
+        assert_eq!(lock(&conversation).error(), None);
     }
 
     #[test]

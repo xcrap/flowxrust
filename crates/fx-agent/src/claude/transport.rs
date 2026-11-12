@@ -91,7 +91,7 @@ pub const MAX_IMAGE_BYTES: usize = 25 * 1024 * 1024;
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(2);
 
 /// How long a closing process is given to end on its own before it is killed.
-const CLOSE_GRACE: Duration = Duration::from_millis(750);
+pub const CLOSE_GRACE: Duration = Duration::from_millis(750);
 
 /// How long a stopped turn's process group gets to exit on SIGTERM before it
 /// is killed.
@@ -863,12 +863,16 @@ impl ClaudeTransport {
     /// original escalated the same way — interrupt, then terminate, then kill —
     /// over about a second and a quarter.
     pub async fn close(&self) {
+        self.close_within(CLOSE_GRACE).await;
+    }
+
+    /// [`Self::close`], for a caller that has already spent part of the
+    /// process's moment reading what it said after its input closed.
+    pub async fn close_within(&self, grace: Duration) {
         self.close_input().await;
         let mut slot = self.inner.child.lock().await;
         if let Some(mut child) = slot.take()
-            && tokio::time::timeout(CLOSE_GRACE, child.wait())
-                .await
-                .is_err()
+            && tokio::time::timeout(grace, child.wait()).await.is_err()
         {
             crate::process::stop_leader(&mut child, CLOSE_GRACE).await;
         }

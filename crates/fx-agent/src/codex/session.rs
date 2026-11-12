@@ -204,6 +204,11 @@ pub fn turn_params(request: &TurnRequest<'_>) -> Value {
         "sandboxPolicy": sandbox_policy(access, working_directory),
         "model": model,
         "cwd": working_directory,
+        // Thinking is asked for, or it is not there. Without this, codex-cli
+        // 0.167 on gpt-6-astra completes each reasoning item with an empty
+        // summary and streams none of it: ten seconds of thought showed as
+        // nothing at all. `auto` is the one value every model takes.
+        "summary": "auto",
         // Codex restores a saved collaboration mode when resuming a thread.
         // Always select its normal workflow so older FlowX planning sessions
         // cannot retain their previous restrictions after the UI mode is gone.
@@ -2605,6 +2610,18 @@ mod tests {
         let params = turn_params(&request);
         assert!(params.get("effort").is_none());
         assert!(params["collaborationMode"]["settings"]["reasoning_effort"].is_null());
+    }
+
+    #[test]
+    fn every_turn_asks_for_the_reasoning_summary() {
+        // Read live on codex-cli 0.167 with gpt-6-astra: a turn that names no
+        // `summary` completes its reasoning item with `summary: []` and
+        // streams no `item/reasoning/*` at all; the same turn with `auto`
+        // streams `summaryPartAdded` and `summaryTextDelta`.
+        for effort in ["", "high"] {
+            let request = TurnRequest::new("thread", "prompt", "/tmp").effort(effort);
+            assert_eq!(turn_params(&request)["summary"], "auto");
+        }
     }
 
     #[test]

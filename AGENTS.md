@@ -569,7 +569,10 @@ Two more, for how a turn ends:
   carried text, as the reply's is. Codex's reasoning is its summary
   (`item/reasoning/summaryTextDelta`, a `summaryPartAdded` per paragraph);
   the raw reasoning is encrypted, and `reasoning_text` in `codex/session.rs`
-  reads the live item and the rollout's `summary_text` parts alike.
+  reads the live item and the rollout's `summary_text` parts alike. It is
+  asked for too: every `turn/start` sends `summary: "auto"`. Without it,
+  codex-cli 0.167 on gpt-6-astra completes each reasoning item with
+  `summary: []` and streams none of it.
 - **A tool call opens at its block start.** Claude's `content_block_start`
   for a `tool_use` is the call, with no arguments yet; `input_json_delta`
   frames grow them, and the assembled frame replaces them whole
@@ -594,7 +597,14 @@ Two more, for how a turn ends:
   reads stdin in order, so a `get_context_usage` control request (`detail:
   full`, `CONTEXT_REQUEST_ID`) written just before `Close` is answered before
   the exit, and its `control_response` is the `/context` breakdown
-  (`ContextBreakdown`) the gauge's tooltip lists. The idle probe
+  (`ContextBreakdown`) the gauge's tooltip lists. The answer comes after the
+  `result` it was written at (0.6 s later on 2.1.322), so a turn that ends at
+  that `result` reads on for it inside the moment the process is given to
+  exit, and a turn that reads to the exit must not take it for the turn
+  saying something: counted as content, it marked a follow-up as under way,
+  and every steered or background-task turn ended as a failure. The fakes
+  answer the request as the CLI does; one that said nothing let both of those
+  ship. The idle probe
   (`claude::catalog`) sends the same request and carries the same breakdown.
   The report's `totalTokens` is the fill; a `used` category is in the window,
   while `deferred`, `buffer` and `free` are not.
