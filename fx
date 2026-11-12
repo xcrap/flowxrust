@@ -126,6 +126,11 @@ case "${1:-dev}" in
     cargo fmt --all
     ;;
 
+  clean-probes)
+    shift
+    python3 -I scripts/clean_probes.py "$@"
+    ;;
+
   clean)
     cargo clean
     rm -rf target

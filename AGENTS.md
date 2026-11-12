@@ -26,6 +26,7 @@ git inspection, and terminals — a port of the Swift original at
 ./fx bench      # run the benchmarks
 ./fx lint       # fmt check + clippy with warnings denied
 ./fx clean      # remove target/
+./fx clean-probes  # archive the Codex threads a live probe left (see Live probes)
 ```
 
 `./fx launch` produces `target/debug/bundle/FlowX-Dev.app`. A real bundle
@@ -810,6 +811,28 @@ provider and project, a failed pass clears it, and it is reported only for the
 active project, the only one that keeps polling. A turn FlowX runs on the thread
 answers for itself. The sidebar row shows Waiting, the title bar's dot turns to
 Waiting for the active thread, and the transcript says where to answer.
+
+### Live probes
+
+The fakes are not the CLIs, so a change to how a turn runs is also checked
+against the installed ones: a temporary `#[ignore]` test that drives
+`TurnRunner::launch` with `RuntimeDiscovery::default()`, removed before the
+commit. It runs with the user's own provider homes, because pointing
+`CODEX_HOME` at a copy means copying the ChatGPT login, whose token refreshes
+would then land in the copy. So everything a probe starts is the user's
+history, and it cleans up after itself:
+
+- **Codex lists every thread, whatever folder it ran in.** Six probe threads
+  ("Run `sleep 8`, then reply red" / "Change of plan: green", "is 2027 prime")
+  were in the user's Codex sidebar on every launch until they asked why. A
+  probe runs in a temporary folder and ends with `./fx clean-probes`, which
+  archives every unarchived thread FlowX started in one, through
+  `thread/archive`, so Codex's archived list can bring it back. A thread open
+  in the Codex app has a writer and is refused; the script lists it and exits
+  non-zero. `--dry-run` only lists.
+- **Claude files a session under the folder it ran in**, so a probe's
+  transcripts are under that temporary folder's name in `~/.claude/projects`.
+  The script leaves them, since removing them cannot be undone.
 
 ## The transcript
 

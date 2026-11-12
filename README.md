@@ -113,6 +113,7 @@ for this code; current online GPUI documentation may describe a different API.
 ./fx lint        # formatting check and Clippy with warnings denied
 ./fx bench       # run benchmarks
 ./fx clean       # remove build output
+./fx clean-probes  # archive Codex threads left by a live test against the real CLI
 ```
 
 `./fx launch` creates `target/debug/bundle/FlowX-Dev.app`. A bundle provides the
