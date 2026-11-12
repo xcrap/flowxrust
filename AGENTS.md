@@ -415,6 +415,44 @@ project when a worktree is missing. Reset keeps the checkout while retiring the
 provider session. Worktrees live in the private app data directory, independent
 of conversation cache deletion.
 
+## Native history
+
+`fx-agent::claude::native` reads Claude's own transcripts, read-only, for the
+sidebar and for a thread's history. Five rules, each of which hid real threads
+first:
+
+- **A transcript is the workspace's whose history folder it is in.** That is
+  how Claude lists and resumes it. Deciding by where the session started
+  refused 73 of one renamed project's 129 threads (`_azoresgame` became
+  `azoresgame`, so every record named a path no longer there), and every
+  desktop session that began in a scratch folder and moved into its project.
+- **A recorded directory only breaks a collision.** The folder's name is an
+  encoded path and two paths can encode the same, so the first `cwd` that
+  encodes to this folder's name is asked one thing: is it this workspace, or
+  another that still exists (`claim`)? A directory that encodes differently
+  settles nothing, and one that is gone is what a rename leaves behind.
+- **The folder is named as the CLI names it**, read out of the binary
+  (2.1.322), not its documentation: every UTF-16 unit outside `[a-zA-Z0-9]`
+  becomes a dash, and past 200 characters the name is cut and closed with
+  `Math.abs(hash).toString(36)`. Keeping Unicode letters looked for `-Açores`
+  where Claude wrote `-A-ores`: a path with an accent had no threads at all.
+- **A refusal is remembered like a summary**, by the file's fingerprint. A
+  transcript refused at its last record was otherwise read to that record on
+  every five-second pass. Two things are asked again each time: whose
+  workspace it is, which the folders around it decide, and a transcript
+  accepted because a directory was missing, once that directory is back.
+- **One warning per reason, and none for an empty file.** A warning per thread
+  was a line per thread, and a tooltip taller than the window is drawn at the
+  window's top, over the pointer and the Retry button under it; the sidebar
+  also caps what it shows (`sync_detail`). Claude creates a session's file
+  before writing to it, so a zero-byte one is not a thread and not a warning.
+  Any warning stops the project's deleted threads being hidden, so a
+  permanent one is never free.
+
+Claude desktop's archive flag is mirrored, so a project worked on there can
+have every thread archived. The sidebar then says "No open threads" over a row
+that opens the archive, not "No threads yet".
+
 ## Runtime discovery
 
 Neither provider CLI is bundled. Both are the user's own install, found at launch

@@ -3517,6 +3517,50 @@ mod tests {
     }
 
     #[test]
+    fn a_project_with_only_archived_threads_says_so_and_opens_the_archive() {
+        // The state a real project was found in: every thread archived in
+        // Claude desktop, so the sidebar said "No threads yet" over 59 of
+        // them.
+        use gpui::VisualTestContext;
+        let (mut test, _dir, state, window) = shell_with_keys();
+        let project = test.read(|cx| state.read(cx).active_project().unwrap().id);
+        let selector = |name: &str| -> &'static str {
+            Box::leak(format!("{name}:{project}").into_boxed_str())
+        };
+        {
+            let mut visual = VisualTestContext::from_window(window.into(), &test);
+            assert!(
+                visual
+                    .debug_bounds(selector("sidebar-show-archived"))
+                    .is_none(),
+                "a project with open threads offers no archive row"
+            );
+        }
+        test.update(|cx| {
+            state.update(cx, |state, cx| {
+                assert!(state.set_thread_archived(Uuid::from_u128(1), true));
+                assert!(state.set_thread_archived(Uuid::from_u128(2), true));
+                cx.notify();
+            })
+        });
+        test.refresh().unwrap();
+        let mut visual = VisualTestContext::from_window(window.into(), &test);
+        assert!(
+            visual
+                .debug_bounds(selector("sidebar-no-threads"))
+                .is_some()
+        );
+        let row = visual
+            .debug_bounds(selector("sidebar-show-archived"))
+            .expect("the archive is offered where the threads would be");
+        visual.simulate_click(row.center(), Default::default());
+        test.run_until_parked();
+        test.update(|_| {});
+        let mut visual = VisualTestContext::from_window(window.into(), &test);
+        assert!(visual.debug_bounds("settings-page-archives").is_some());
+    }
+
+    #[test]
     fn the_window_reopens_where_it_was_left_on_a_display_still_connected() {
         let test = gpui::TestAppContext::single();
         let (_dir, state) = test.update(seeded);

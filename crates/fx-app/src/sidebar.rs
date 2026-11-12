@@ -230,16 +230,17 @@ fn body(state: Entity<AppState>, cx: &mut App) -> AnyElement {
             let native_status = app.native_status(id);
             let loading = native_status.syncing && record.agents.is_empty();
             if loading || !native_status.warnings.is_empty() {
-                let detail = native_status.warnings.join("\n");
+                let detail = sync_detail(&native_status.warnings);
                 let label = if detail.is_empty() {
                     "Loading provider threads…"
                 } else {
                     "Thread sync needs attention"
                 };
                 let retry_state = state.clone();
+                let failed = !detail.is_empty();
                 content = content.child(
                     div()
-                        .id(SharedString::from(format!("native-sync-status:{id}")))
+                        .debug_selector(move || format!("native-sync-status:{id}"))
                         .flex()
                         .items_center()
                         .gap(px_len(Spacing::XXS))
@@ -248,18 +249,33 @@ fn body(state: Entity<AppState>, cx: &mut App) -> AnyElement {
                         .py(px_len(Spacing::XXS))
                         .fx_caption()
                         .text_color(Colors::fg_secondary(&theme))
-                        .child(div().flex_1().min_w_0().child(label))
-                        .when(!detail.is_empty(), |row| {
-                            row.tooltip(move |window, cx| {
-                                fx_design::components::tooltip(detail.clone(), window, cx)
-                            })
+                        .child(
+                            // The warnings are the label's tooltip, not the
+                            // row's: the row holds Retry, which has a tooltip
+                            // of its own, and a tooltip stays where it opened
+                            // for as long as the pointer is over its owner.
+                            div()
+                                .id(SharedString::from(format!("native-sync-status:{id}")))
+                                .flex_1()
+                                .min_w_0()
+                                .overflow_hidden()
+                                .whitespace_nowrap()
+                                .text_ellipsis()
+                                .child(label)
+                                .when(failed, |label| {
+                                    label.tooltip(move |window, cx| {
+                                        fx_design::components::tooltip(detail.clone(), window, cx)
+                                    })
+                                }),
+                        )
+                        .when(failed, |row| {
                             // Not tied to whether a background pass is running:
                             // that changes every few seconds, so the button
                             // blinked. A retry while one runs just makes the
                             // next pass due at once. Tied to whether the row
                             // shows, which a search decides as much as the
                             // project's own disclosure.
-                            .child(icon_button(
+                            row.child(icon_button(
                                 IconButtonProps::new(Icon::ARROW_CLOCKWISE, "Retry thread sync")
                                     .tiny()
                                     .ghost()
@@ -465,15 +481,29 @@ fn threads(
         .gap(px_len(Spacing::XXXS))
         .pb(px_len(Spacing::XXS));
     if listed.visible.is_empty() {
+        // A project whose every thread is archived is not one with no
+        // threads. Claude desktop's archive is mirrored here, so a project
+        // worked on there for months opened as "No threads yet" with nothing
+        // to say where its history was.
+        let archived = listed.archived.len();
+        let column = column.child(
+            div()
+                .debug_selector(move || format!("sidebar-no-threads:{project_id}"))
+                .pl(px_len(Spacing::XXL))
+                .py(px_len(Spacing::SM))
+                .fx_caption()
+                .text_color(Colors::fg_tertiary(&theme))
+                .child(if archived == 0 {
+                    "No threads yet"
+                } else {
+                    "No open threads"
+                }),
+        );
+        if archived == 0 {
+            return column.into_any_element();
+        }
         return column
-            .child(
-                div()
-                    .pl(px_len(Spacing::XXL))
-                    .py(px_len(Spacing::SM))
-                    .fx_caption()
-                    .text_color(Colors::fg_tertiary(&theme))
-                    .child("No threads yet"),
-            )
+            .child(archived_row(project_id, archived, interactive))
             .into_any_element();
     }
     if matching.is_empty() {
@@ -530,6 +560,74 @@ fn threads(
         ));
     }
     column.into_any_element()
+}
+
+/// What the sync row's tooltip says: each warning once, and no more of them
+/// than a tooltip can hold.
+///
+/// A tooltip taller than the window is placed at the window's top and covers
+/// what the pointer was on, the Retry button included. Seventy-three warnings
+/// did that.
+pub(crate) fn sync_detail(warnings: &[String]) -> String {
+    const LINES: usize = 6;
+    const LINE: usize = 240;
+    let mut lines: Vec<String> = warnings
+        .iter()
+        .take(LINES)
+        .map(|warning| {
+            let warning = warning.trim();
+            match warning.char_indices().nth(LINE) {
+                Some((end, _)) => format!("{}…", &warning[..end]),
+                None => warning.to_owned(),
+            }
+        })
+        .collect();
+    match warnings.len().saturating_sub(LINES) {
+        0 => {}
+        1 => lines.push("…and 1 more warning".into()),
+        more => lines.push(format!("…and {more} more warnings")),
+    }
+    lines.join("\n")
+}
+
+/// The row under "No open threads" that opens the archive.
+fn archived_row(project_id: Uuid, archived: usize, interactive: bool) -> AnyElement {
+    let theme = global::current();
+    div()
+        .id(SharedString::from(format!(
+            "show-archived-threads:{project_id}"
+        )))
+        .debug_selector(move || format!("sidebar-show-archived:{project_id}"))
+        .h(px(THREAD_ROW_HEIGHT))
+        .flex_shrink_0()
+        .flex()
+        .items_center()
+        .pl(px_len(Spacing::XXL))
+        .pr(px_len(Spacing::SM))
+        .cursor_pointer()
+        .rounded(px_len(Radii::SM))
+        .hover(|s| s.fx_background(Colors::bg_hover(&theme)))
+        .on_click(move |_, window, cx| {
+            if interactive {
+                window.dispatch_action(Box::new(crate::commands::ShowArchivedChats), cx);
+            }
+        })
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .overflow_hidden()
+                .whitespace_nowrap()
+                .text_ellipsis()
+                .fx_role(TextRole::CaptionMedium)
+                .text_color(Colors::fg_secondary(&theme))
+                .child(SharedString::from(if archived == 1 {
+                    "Show 1 archived thread…".to_owned()
+                } else {
+                    format!("Show {archived} archived threads…")
+                })),
+        )
+        .into_any_element()
 }
 
 /// The listed threads matching `query`, per project record, as positions in
@@ -1636,6 +1734,34 @@ mod tests {
             full_height
         );
         test.read(|cx| assert_eq!(state.read(cx).context_registry.read(cx).len(), 4));
+    }
+
+    #[test]
+    fn the_sync_tooltip_holds_a_few_lines_however_many_warnings_there_are() {
+        assert_eq!(sync_detail(&[]), "");
+        assert_eq!(
+            sync_detail(&["claude history unavailable: offline".into()]),
+            "claude history unavailable: offline"
+        );
+        // Seventy-three of these, one per thread, made a tooltip taller than
+        // the window, which GPUI then draws over the pointer and the Retry
+        // button under it.
+        let warnings: Vec<String> = (0..73)
+            .map(|index| format!("Claude thread {index}: unreadable"))
+            .collect();
+        let detail = sync_detail(&warnings);
+        let lines: Vec<_> = detail.lines().collect();
+        assert_eq!(lines.len(), 7);
+        assert_eq!(lines[0], "Claude thread 0: unreadable");
+        assert_eq!(lines[6], "…and 67 more warnings");
+        assert_eq!(
+            sync_detail(&warnings[..7]).lines().last(),
+            Some("…and 1 more warning")
+        );
+        // One long warning is cut at a character, never inside one.
+        let long = sync_detail(&["ç".repeat(1000)]);
+        assert_eq!(long.chars().count(), 241);
+        assert!(long.ends_with('…'));
     }
 
     #[test]

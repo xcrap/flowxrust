@@ -52,7 +52,10 @@ struct Cache {
 struct CachedSummary {
     fingerprint: Fingerprint,
     canonical: PathBuf,
-    parsed: ParsedSummary,
+    /// A refusal is remembered as well as a summary. A transcript refused at
+    /// its last record was otherwise read to that record again on every pass,
+    /// every five seconds, for as long as its project stayed open.
+    parsed: Result<ParsedSummary, String>,
     accessed: u64,
 }
 
@@ -106,6 +109,10 @@ struct ParsedSummary {
     current_context_tokens: Option<u64>,
     updated_at: Option<Timestamp>,
     history_truncated: bool,
+    /// Directories this transcript names that encode to its history folder
+    /// and were not there when it was read. Its place here rests on their
+    /// absence, so it is read again if one comes back.
+    gone: Vec<PathBuf>,
 }
 
 #[derive(Default)]
@@ -155,6 +162,10 @@ impl ClaudeNativeStore {
         };
         let mut found = HashMap::<String, NativeThreadSummary>::new();
         let mut current_paths = HashSet::new();
+        // Why each unreadable thread was refused, by reason. One warning per
+        // thread was one line per thread in the sidebar: a project whose
+        // history shared a cause listed it seventy times over.
+        let mut refused = std::collections::BTreeMap::<String, Vec<String>>::new();
         for directory in &directories {
             for path in children(directory)? {
                 if path.extension().and_then(|value| value.to_str()) != Some("jsonl") {
@@ -180,10 +191,15 @@ impl ClaudeNativeStore {
                             found.insert(id, entry);
                         }
                     }
-                    Err(error) => result.warnings.push(format!("Claude thread {id}: {error}")),
+                    // Not a thread yet: nothing to list and nothing wrong.
+                    Err(ProviderError::Protocol(reason)) if reason == EMPTY_TRANSCRIPT => {}
+                    Err(error) => refused.entry(error.to_string()).or_default().push(id),
                 }
             }
         }
+        result
+            .warnings
+            .extend(refused.iter().map(|(reason, ids)| refusal(reason, ids)));
         // Removed files must not retain large cached transcripts indefinitely.
         cache.summaries.retain(|path, _| {
             !directories
@@ -400,27 +416,43 @@ impl ClaudeNativeStore {
     ) -> Result<(ParsedSummary, Fingerprint), ProviderError> {
         let fingerprint = regular_fingerprint(path)?;
         cache.tick += 1;
+        // Whose a transcript is depends on the workspace asking, so a summary
+        // read for another workspace answers nothing here: it is read again.
         if let Some(cached) = cache.summaries.get_mut(path)
             && cached.fingerprint == fingerprint
+            && cached.canonical == canonical
+            && !cached
+                .parsed
+                .as_ref()
+                .is_ok_and(|parsed| parsed.gone.iter().any(|gone| gone.is_dir()))
         {
-            if cached.canonical != canonical {
-                return Err(protocol("Transcript belongs to a different workspace"));
-            }
             cached.accessed = cache.tick;
-            return Ok((cached.parsed.clone(), fingerprint));
+            return match &cached.parsed {
+                Ok(parsed) => Ok((parsed.clone(), fingerprint)),
+                Err(reason) => Err(protocol(reason.clone())),
+            };
         }
-        let (parsed, _) = parse_file(
+        let parsed = parse_file(
             path,
             canonical,
             id,
             &fingerprint,
             self.maximum_transcript_bytes,
             false,
-        )?;
+        )
+        .map(|(parsed, _)| parsed);
         #[cfg(test)]
         {
             cache.parses += 1;
         }
+        let parsed = match parsed {
+            Ok(parsed) => Ok(parsed),
+            // What a file's own bytes decide stays decided until they change.
+            // Whose workspace it is can change with the folders around it, and
+            // an IO failure can pass, so neither is remembered.
+            Err(ProviderError::Protocol(reason)) if reason != FOREIGN_WORKSPACE => Err(reason),
+            Err(error) => return Err(error),
+        };
         cache.summaries.insert(
             path.to_path_buf(),
             CachedSummary {
@@ -439,7 +471,10 @@ impl ClaudeNativeStore {
                 .unwrap();
             cache.summaries.remove(&oldest);
         }
-        Ok((parsed, fingerprint))
+        match parsed {
+            Ok(parsed) => Ok((parsed, fingerprint)),
+            Err(reason) => Err(protocol(reason)),
+        }
     }
 
     fn project_directories(
@@ -632,15 +667,25 @@ fn parse_file(
     };
     let mut messages = Vec::<ConversationMessage>::new();
     let mut positions = HashMap::new();
+    // The history folder this file is in, which is the encoded path of the
+    // workspace Claude filed it under.
+    let folder = path
+        .parent()
+        .and_then(Path::file_name)
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default();
     let mut cwd_seen = false;
-    // Whether the first record naming a directory has been checked.
-    let mut started = false;
+    // Whether a record has named this workspace, and the directories already
+    // found to settle nothing.
+    let mut owned = false;
+    let mut settled = HashSet::<String>::new();
     // Whether a record has named this file's own session, and whether any
     // before it named the session it was forked from.
     let mut own_session_seen = false;
     let mut ancestry_seen = false;
     let mut line = Vec::new();
     let mut line_number = 0;
+    let mut records = 0_usize;
     loop {
         line.clear();
         // Take is on the line read itself, so a missing newline cannot allocate
@@ -683,6 +728,7 @@ fn parse_file(
                 "Invalid Claude history object at record {line_number}"
             )));
         }
+        records += 1;
         if object["isSidechain"].as_bool() == Some(true) {
             continue;
         }
@@ -703,24 +749,31 @@ fn parse_file(
                 }
             }
         }
-        // Where a session started decides whose it is, which is also what
-        // keeps a workspace whose name encodes the same from claiming it.
-        // Later records may name any directory: a shell that ran `cd`, or
-        // Claude desktop running a side session, moves the session's working
-        // directory without moving the thread. Rejecting those hid real
+        // A transcript is the workspace's whose history folder it is in,
+        // which is how Claude itself lists and resumes it. The folder's name
+        // is an encoded path, though, and two paths can encode the same, so a
+        // record's directory is asked only that: the first one that encodes
+        // to this folder's name is this workspace, or another that still
+        // exists and shares the folder. Every other directory settles
+        // nothing. A session moves (a shell that ran `cd`, a side session, a
+        // desktop session that started in a scratch folder), and a project
+        // that was renamed keeps its history under records that all name a
+        // path no longer there. Each of those was once refused, and hid real
         // threads behind a sync warning that retrying could never clear.
         if let Some(cwd) = object["cwd"].as_str() {
-            if !started {
-                let cwd = canonical_history_directory(Path::new(cwd))?;
-                if cwd != canonical && !cwd.starts_with(canonical) {
-                    return Err(protocol("Transcript belongs to a different workspace"));
+            cwd_seen = true;
+            if !owned && !settled.contains(cwd) {
+                match claim(Path::new(cwd), &folder, canonical) {
+                    Claim::Ours => owned = true,
+                    Claim::Another => return Err(protocol(FOREIGN_WORKSPACE)),
+                    Claim::Gone(directory) => {
+                        parsed.gone.push(directory);
+                        settled.insert(cwd.to_owned());
+                    }
+                    Claim::Neither => {
+                        settled.insert(cwd.to_owned());
+                    }
                 }
-                started = true;
-                cwd_seen = cwd == canonical;
-            } else if !cwd_seen
-                && canonical_history_directory(Path::new(cwd)).is_ok_and(|cwd| cwd == canonical)
-            {
-                cwd_seen = true;
             }
         }
         if let Some(timestamp) = parse_timestamp(&object["timestamp"]) {
@@ -890,6 +943,13 @@ fn parse_file(
             }
             _ => {}
         }
+    }
+    // Claude creates a session's file before it writes to it, and leaves it
+    // behind when the session never starts. Read as a transcript with no
+    // identity, a zero-byte file was a sync warning for good, and any warning
+    // stops the project's deleted threads being hidden.
+    if records == 0 {
+        return Err(protocol(EMPTY_TRANSCRIPT));
     }
     if !cwd_seen {
         return Err(protocol("Transcript has no verifiable workspace identity"));
@@ -1177,23 +1237,112 @@ fn parse_timestamp(value: &Value) -> Option<Timestamp> {
 fn protocol(message: impl Into<String>) -> ProviderError {
     ProviderError::Protocol(message.into())
 }
+
+/// The one refusal that is about the folders around a transcript rather than
+/// its bytes, so it is asked again on every pass.
+const FOREIGN_WORKSPACE: &str = "Transcript belongs to a different workspace";
+
+/// A file with no complete record. Not listed, and not a warning.
+const EMPTY_TRANSCRIPT: &str = "Transcript is empty";
+
+/// What a recorded directory says about whose a transcript is.
+enum Claim {
+    /// It is the workspace being read.
+    Ours,
+    /// It is another directory, still there, whose path encodes to the same
+    /// history folder: that workspace's session, not this one's.
+    Another,
+    /// It encodes to this folder and is not there: what a project renamed
+    /// without its folder's name changing leaves behind.
+    Gone(PathBuf),
+    /// It encodes to a different folder, so it says nothing about this one.
+    Neither,
+}
+
+fn claim(cwd: &Path, folder: &str, canonical: &Path) -> Claim {
+    let Ok(lexical) = absolute_normalized(cwd) else {
+        return Claim::Neither;
+    };
+    if project_key(&lexical) != folder {
+        return Claim::Neither;
+    }
+    match fs::canonicalize(&lexical) {
+        Ok(resolved) if resolved == canonical => Claim::Ours,
+        Ok(resolved) if resolved.is_dir() => Claim::Another,
+        _ => Claim::Gone(lexical),
+    }
+}
+
+/// One warning for every thread refused for the same reason.
+fn refusal(reason: &str, ids: &[String]) -> String {
+    const NAMED: usize = 3;
+    match ids {
+        [id] => format!("Claude thread {id}: {reason}"),
+        ids => {
+            let named = ids
+                .iter()
+                .take(NAMED)
+                .map(String::as_str)
+                .collect::<Vec<_>>()
+                .join(", ");
+            let more = match ids.len().saturating_sub(NAMED) {
+                0 => String::new(),
+                more => format!(" and {more} more"),
+            };
+            format!(
+                "{} Claude threads could not be read: {reason} ({named}{more})",
+                ids.len()
+            )
+        }
+    }
+}
 fn safe_session_id(id: &str) -> Option<String> {
     (id.len() == 36)
         .then(|| Uuid::parse_str(id).ok())
         .flatten()
         .map(|id| id.to_string())
 }
+/// A workspace's history folder, named as Claude names it.
+///
+/// Read out of the CLI (2.1.322), not out of its documentation: every UTF-16
+/// unit outside `[a-zA-Z0-9]` becomes a dash, and a name past 200 characters
+/// is cut there and closed with a hash of the whole path. Keeping every
+/// Unicode letter, as this once did, looked for `…-Açores` where Claude had
+/// written `…-A-ores`, and a project with an accent in its path had no
+/// threads at all, with nothing to say why.
 fn project_key(path: &Path) -> String {
-    path.to_string_lossy()
-        .chars()
-        .map(|character| {
-            if character.is_alphanumeric() {
-                character
-            } else {
-                '-'
-            }
-        })
-        .collect()
+    const LONGEST: usize = 200;
+    let text = path.to_string_lossy();
+    let mut key = String::with_capacity(text.len());
+    // `(hash << 5) - hash + unit | 0`, over the units JavaScript sees.
+    let mut hash = 0_i32;
+    for unit in text.encode_utf16() {
+        hash = hash
+            .wrapping_shl(5)
+            .wrapping_sub(hash)
+            .wrapping_add(i32::from(unit));
+        key.push(match u8::try_from(unit) {
+            Ok(byte) if byte.is_ascii_alphanumeric() => char::from(byte),
+            _ => '-',
+        });
+    }
+    if key.len() <= LONGEST {
+        return key;
+    }
+    key.truncate(LONGEST);
+    key.push('-');
+    // `Math.abs(hash).toString(36)`.
+    let mut rest = i64::from(hash).unsigned_abs();
+    let mut digits = Vec::new();
+    loop {
+        digits.push(char::from_digit((rest % 36) as u32, 36).expect("a base-36 digit"));
+        rest /= 36;
+        if rest == 0 {
+            break;
+        }
+    }
+    key.extend(digits.into_iter().rev());
+    key
 }
 
 fn absolute_normalized(path: &Path) -> Result<PathBuf, ProviderError> {
@@ -1211,32 +1360,6 @@ fn absolute_normalized(path: &Path) -> Result<PathBuf, ProviderError> {
         }
     }
     Ok(result)
-}
-
-/// A session can cd into a project subdirectory, including one removed since
-/// that turn. Resolve existing symlinks while retaining the missing suffix;
-/// accepting lexical prefixes alone would let a symlink escape the workspace.
-fn canonical_history_directory(path: &Path) -> Result<PathBuf, ProviderError> {
-    let mut path = absolute_normalized(path)?;
-    let mut missing = Vec::new();
-    loop {
-        match fs::canonicalize(&path) {
-            Ok(mut canonical) => {
-                for part in missing.into_iter().rev() {
-                    canonical.push(part);
-                }
-                return Ok(canonical);
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                let Some(name) = path.file_name().map(|value| value.to_os_string()) else {
-                    return Err(error.into());
-                };
-                missing.push(name);
-                path.pop();
-            }
-            Err(error) => return Err(error.into()),
-        }
-    }
 }
 
 fn is_plain_directory(path: &Path) -> bool {
@@ -2078,20 +2201,10 @@ mod tests {
                 .len(),
             3
         );
-        // A session that started elsewhere is still not this workspace's,
-        // even if it visits it later.
+        // Nor does it matter where it started. A real thread: Claude
+        // desktop opened it in a scratch folder and moved it into the
+        // project sixty records later, and filed it under the project.
         fixture.write(&[side, first]);
-        assert!(fixture.store().read(fixture.root(), SESSION).is_err());
-    }
-
-    #[test]
-    fn main_session_may_visit_descendants_but_needs_exact_workspace_identity() {
-        let fixture = Fixture::new();
-        let first = fixture.record("user", "At project root", Uuid::new_v4());
-        let mut nested = fixture.record("assistant", "Inside source folder", Uuid::new_v4());
-        // The historical subdirectory can have been deleted since this turn.
-        nested["cwd"] = json!(fixture.workspace.join("old-source/nested"));
-        fixture.write(&[first.clone(), nested.clone()]);
         assert_eq!(
             fixture
                 .store()
@@ -2101,11 +2214,161 @@ mod tests {
                 .len(),
             2
         );
-        fixture.write(&[nested]);
-        assert!(fixture.store().read(fixture.root(), SESSION).is_err());
+    }
+
+    #[test]
+    fn a_renamed_projects_history_is_still_its_own() {
+        // A real project: `_azoresgame` became `azoresgame` and its history
+        // folder was renamed with it, so 73 of its 129 transcripts name only
+        // a path that is no longer there. Each was refused, one sidebar
+        // warning apiece, and Retry could never clear them.
+        let fixture = Fixture::new();
+        let before = fixture.workspace.with_file_name("_before the rename");
+        let mut question = fixture.record("user", "Asked before the rename", Uuid::new_v4());
+        question["cwd"] = json!(before);
+        let mut answer = fixture.record("assistant", "Answered there", Uuid::new_v4());
+        answer["cwd"] = json!(before.join("src"));
+        fixture.write(&[question, answer]);
+        let store = fixture.store();
+        let index = store.list(fixture.root()).unwrap();
+        assert_eq!(index.warnings, Vec::<String>::new());
+        assert_eq!(index.threads.len(), 1);
+        assert_eq!(index.threads[0].summary.working_directory, fixture.root());
+        assert_eq!(
+            store.read(fixture.root(), SESSION).unwrap().messages.len(),
+            2
+        );
+    }
+
+    #[test]
+    fn a_rename_that_keeps_the_folders_name_keeps_its_history() {
+        // `project_with` to `project-with` encodes the same, so the folder
+        // never moves and every record names a path that is gone. Gone is
+        // what tells it from a neighbour that shares the folder.
+        let fixture = Fixture::new();
+        let before = fixture.workspace.with_file_name("Açores-project-with-dots");
+        assert_eq!(project_key(&fixture.workspace), project_key(&before));
+        let mut record = fixture.record("user", "Asked before the rename", Uuid::new_v4());
+        record["cwd"] = json!(before);
+        fixture.write(&[record]);
+        let store = fixture.store();
+        assert_eq!(store.list(fixture.root()).unwrap().threads.len(), 1);
+        // The same transcript once that other directory exists is its
+        // session, and it is asked again rather than remembered.
+        fs::create_dir(&before).unwrap();
+        let index = store.list(fixture.root()).unwrap();
+        assert!(index.threads.is_empty());
+        assert_eq!(
+            index.warnings,
+            [format!("Claude thread {SESSION}: {FOREIGN_WORKSPACE}")]
+        );
+        fs::remove_dir(&before).unwrap();
+        assert_eq!(store.list(fixture.root()).unwrap().threads.len(), 1);
+    }
+
+    #[test]
+    fn a_history_folder_is_named_as_claude_names_it() {
+        // Claude Code 2.1.322: `replace(/[^a-zA-Z0-9]/g, "-")` over UTF-16
+        // units, then past 200 characters the first 200, a dash and
+        // `Math.abs(hash).toString(36)` of the whole path.
+        assert_eq!(
+            project_key(Path::new("/Users/me/www/_azores.game")),
+            "-Users-me-www--azores-game"
+        );
+        // An accent is one unit and an emoji two; neither is kept.
+        assert_eq!(
+            project_key(Path::new("/Users/me/Açores 🌋")),
+            "-Users-me-A-ores---"
+        );
+        let long = format!("/Users/me/{}", "a".repeat(200));
+        let key = project_key(Path::new(&long));
+        assert_eq!(&key[..200], &project_key(Path::new(&long[..200]))[..]);
+        // The suffix computed by the expression above in a JavaScript engine.
+        assert_eq!(&key[200..], "-taq8db");
+    }
+
+    #[test]
+    fn a_session_file_with_nothing_in_it_is_not_a_thread_or_a_warning() {
+        // A real zero-byte transcript, left by a session that never started.
+        let fixture = Fixture::new();
+        fixture.write(&[]);
+        let store = fixture.store();
+        let index = store.list(fixture.root()).unwrap();
+        assert!(index.threads.is_empty());
+        assert_eq!(index.warnings, Vec::<String>::new());
+        // Nor is one whose first record is still being written.
+        fs::write(&fixture.file, r#"{"type":"user","cwd":"#).unwrap();
+        let index = store.list(fixture.root()).unwrap();
+        assert!(index.threads.is_empty());
+        assert_eq!(index.warnings, Vec::<String>::new());
+        assert!(store.read(fixture.root(), SESSION).is_err());
+        // Once written, it is listed.
+        fixture.write(&[fixture.record("user", "Now it starts", Uuid::new_v4())]);
+        assert_eq!(store.list(fixture.root()).unwrap().threads.len(), 1);
+    }
+
+    #[test]
+    fn threads_refused_for_one_reason_share_one_warning() {
+        let fixture = Fixture::new();
+        fixture.write(&[fixture.record("user", "Readable", Uuid::new_v4())]);
+        let folder = fixture.file.parent().unwrap();
+        let mut refused = Vec::new();
+        for index in 0..5 {
+            let id = Uuid::from_u128(0x2000_0000_0000_4000_8000_0000_0000_0000 + index);
+            fs::write(folder.join(format!("{id}.jsonl")), "not json\n").unwrap();
+            refused.push(id.to_string());
+        }
+        let store = fixture.store();
+        let index = store.list(fixture.root()).unwrap();
+        assert_eq!(index.threads.len(), 1);
+        assert_eq!(
+            index.warnings,
+            [format!(
+                "5 Claude threads could not be read: Invalid Claude history JSON at record 1 ({}, {}, {} and 2 more)",
+                refused[0], refused[1], refused[2]
+            )]
+        );
+        // A refusal the file's own bytes decided is not read for again.
+        let parses = store.cache.lock().unwrap().parses;
+        assert_eq!(store.list(fixture.root()).unwrap().warnings, index.warnings);
+        assert_eq!(store.cache.lock().unwrap().parses, parses);
+        // Until the file changes.
+        fs::write(
+            folder.join(format!("{}.jsonl", refused[0])),
+            "still not json\n",
+        )
+        .unwrap();
+        store.list(fixture.root()).unwrap();
+        assert_eq!(store.cache.lock().unwrap().parses, parses + 1);
+    }
+
+    #[test]
+    fn a_session_filed_here_may_name_any_directory_but_must_name_one() {
+        let fixture = Fixture::new();
+        let first = fixture.record("user", "At project root", Uuid::new_v4());
+        let mut nested = fixture.record("assistant", "Inside source folder", Uuid::new_v4());
+        // The historical subdirectory can have been deleted since this turn.
+        nested["cwd"] = json!(fixture.workspace.join("old-source/nested"));
         let mut unrelated = fixture.record("assistant", "Elsewhere", Uuid::new_v4());
         unrelated["cwd"] = json!(fixture.workspace.parent().unwrap());
-        fixture.write(&[unrelated, first]);
+        for (records, messages) in [
+            (vec![first.clone(), nested.clone()], 2),
+            (vec![nested], 1),
+            (vec![unrelated, first], 2),
+        ] {
+            fixture.write(&records);
+            assert_eq!(
+                fixture
+                    .store()
+                    .read(fixture.root(), SESSION)
+                    .unwrap()
+                    .messages
+                    .len(),
+                messages
+            );
+        }
+        // A record that names no directory at all is not Claude's.
+        fixture.write(&[json!({"type":"user","message":{"content":"No cwd"}})]);
         assert!(fixture.store().read(fixture.root(), SESSION).is_err());
     }
 }
