@@ -634,6 +634,14 @@ Two more, for how a turn ends:
   agent started on purpose keeps running. The fakes start their tools the same
   way; a fake whose child stayed in the provider's group passed against a Stop
   that reached no real tool.
+- **A finished turn's process is left to exit.** Claude Code 2.1.322 takes
+  about 1.3 s from a `result` to its exit: it answers the context question
+  and runs the user's SessionEnd hooks first. `CLOSE_GRACE` is 2.5 s for
+  that reason; at 750 ms every completed turn ended with a SIGTERM into
+  those hooks. Stop keeps its own 750 ms (`STOP_GRACE`). And a process that
+  left with status 0 did not fail because of what it printed on the way out:
+  `Exit::reason` quotes stderr only for a non-zero status, or a stale hook in
+  the user's settings explains a turn it had nothing to do with.
 - **The tree is watched, not taken at Stop.** Taken at Stop, it missed every
   tool of a Claude that had already died, or been killed for an oversized
   line: with Claude gone, nothing in the table leads to a session it started.
@@ -985,6 +993,13 @@ that work proportional to what is on screen:
   `a_repaint_does_no_work_that_grows_with_the_threads` checks that across the
   whole shell; a mutable borrow taken on every frame would rebuild the index
   every frame.
+- **A sync pass costs the project it is about, once.** Native-sync passes
+  land every couple of seconds on the UI thread. What a pass changed is told
+  by the snapshot's generation, not by copying the workspace before and
+  after; an index pass copies its own project's record, reads everything it
+  looks up per thread into maps first (`index_bindings`), and encodes the
+  workspace only when that record changed in memory. Scanned per thread, a
+  pass was quadratic in the project's threads.
 - **A search is remembered, not rerun.** The sidebar folds each thread's text
   once, re-reads only threads whose loaded transcript has moved, and
   re-matches only when the query, the snapshot's generation or a folded text

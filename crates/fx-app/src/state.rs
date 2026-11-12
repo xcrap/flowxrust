@@ -2682,7 +2682,11 @@ impl AppState {
     /// Everything a native-sync pass can change that the window shows.
     fn native_view(&self) -> NativeView {
         NativeView {
-            snapshot: self.snapshot.clone(),
+            // The generation, not a copy of the workspace: this is built
+            // twice for every pass that completes. A pass that borrows the
+            // snapshot mutably and changes nothing reads as a change, which
+            // costs one repaint.
+            snapshot: self.snapshot.generation(),
             warnings: self.native_sync.warnings.clone(),
             history_warnings: self.native_sync.history_warnings.clone(),
             revisions: self
@@ -3007,17 +3011,76 @@ impl AppState {
                     .iter()
                     .map(|entry| entry.summary.identity.session_id.clone())
                     .collect();
-                let mut next = self.snapshot.clone();
-                let record = next
+                // A copy of this project's record, not of the workspace, and
+                // everything the loop looks up per thread read once into a
+                // map. This runs on the UI thread on every pass: copied whole
+                // and scanned per thread, a pass was quadratic in the
+                // project's threads, with a lock for each loaded
+                // conversation inside the scan.
+                let at = self
+                    .snapshot
                     .projects
-                    .iter_mut()
-                    .find(|record| {
+                    .iter()
+                    .position(|record| {
                         record
                             .project
                             .as_ref()
                             .is_some_and(|project| project.id == ticket.project)
                     })
                     .unwrap();
+                let mut record = self.snapshot.projects[at].clone();
+                let suppressed: HashSet<(String, String)> = record
+                    .suppressed_native_threads
+                    .iter()
+                    .map(|deleted| (deleted.provider_id.clone(), deleted.session_id.clone()))
+                    .collect();
+                let mut overrides: HashMap<Uuid, (Option<String>, Option<bool>)> = HashMap::new();
+                for entry in &record.thread_overrides {
+                    overrides
+                        .entry(entry.agent_id)
+                        .or_insert_with(|| (entry.title.clone(), entry.archived));
+                }
+                let mut slots: HashMap<Uuid, usize> = HashMap::new();
+                for (slot, agent) in record.agents.iter().enumerate() {
+                    slots.entry(agent.id).or_insert(slot);
+                }
+                let mut archived_ids: HashSet<Uuid> =
+                    record.archived_agent_ids.iter().copied().collect();
+                // The thread a session belongs to when no binding says: the
+                // first of this provider's whose loaded conversation, or
+                // saved one, is on it.
+                let mut saved: HashMap<Uuid, Vec<&String>> = HashMap::new();
+                for (agent, session) in &sessions {
+                    saved.entry(*agent).or_default().push(session);
+                }
+                let mut by_session: HashMap<String, Uuid> = HashMap::new();
+                for agent in &record.agents {
+                    if agent
+                        .configuration
+                        .provider_id
+                        .as_deref()
+                        .unwrap_or("codex")
+                        != ticket.provider
+                    {
+                        continue;
+                    }
+                    let live = self.conversations.get(&agent.id).and_then(|conversation| {
+                        conversation
+                            .lock()
+                            .unwrap_or_else(|error| error.into_inner())
+                            .session_id()
+                            .map(str::to_owned)
+                    });
+                    for session in live
+                        .iter()
+                        .chain(saved.get(&agent.id).into_iter().flatten().copied())
+                    {
+                        by_session.entry(session.clone()).or_insert(agent.id);
+                    }
+                }
+                let (mut bound, mut binding_slots, mut repeated) =
+                    index_bindings(&record.native_bindings);
+                let mut found: HashSet<Uuid> = HashSet::new();
                 for entry in index.threads {
                     let identity = &entry.summary.identity;
                     if identity.provider_id != ticket.provider
@@ -3027,56 +3090,21 @@ impl AppState {
                         warnings.push("A native history entry belonged to another provider or project and was ignored.".into());
                         continue;
                     }
-                    if record.suppressed_native_threads.iter().any(|deleted| {
-                        deleted.provider_id == identity.provider_id
-                            && deleted.session_id == identity.session_id
-                    }) {
+                    let key = (identity.provider_id.clone(), identity.session_id.clone());
+                    if suppressed.contains(&key) {
                         continue;
                     }
-                    let existing = record
-                        .native_bindings
-                        .iter()
-                        .find(|binding| {
-                            binding.provider_id == identity.provider_id
-                                && binding.session_id == identity.session_id
-                        })
-                        .map(|binding| binding.agent_id)
-                        .or_else(|| {
-                            record
-                                .agents
-                                .iter()
-                                .find(|agent| {
-                                    if agent
-                                        .configuration
-                                        .provider_id
-                                        .as_deref()
-                                        .unwrap_or("codex")
-                                        != identity.provider_id
-                                    {
-                                        return false;
-                                    }
-                                    self.conversations
-                                        .get(&agent.id)
-                                        .is_some_and(|conversation| {
-                                            conversation
-                                                .lock()
-                                                .unwrap_or_else(|error| error.into_inner())
-                                                .session_id()
-                                                == Some(&identity.session_id)
-                                        })
-                                        || sessions.iter().any(|(id, session)| {
-                                            *id == agent.id && *session == identity.session_id
-                                        })
-                                })
-                                .map(|agent| agent.id)
-                        });
+                    let existing = bound
+                        .get(&key)
+                        .or_else(|| by_session.get(&identity.session_id))
+                        .copied();
                     let id = existing.unwrap_or_else(Uuid::new_v4);
                     if let Some(reason) = &entry.waiting_elsewhere
                         && !self.is_thread_busy(id)
                     {
                         waiting.push((id, reason.clone()));
                     }
-                    record.missing_native_agent_ids.retain(|agent| *agent != id);
+                    found.insert(id);
                     if self.is_thread_busy(id)
                         || self
                             .native_sync
@@ -3086,27 +3114,26 @@ impl AppState {
                     {
                         continue;
                     }
-                    if !record.agents.iter().any(|agent| agent.id == id) {
-                        let mut agent = Agent::with_id(id, &entry.summary.title);
-                        agent.configuration.provider_id = Some(identity.provider_id.clone());
-                        record.agents.push(agent);
-                        record.project.as_mut().unwrap().agent_order.push(id);
-                    }
-                    let overrides = record
-                        .thread_overrides
-                        .iter()
-                        .find(|entry| entry.agent_id == id);
+                    let slot = match slots.get(&id) {
+                        Some(slot) => *slot,
+                        None => {
+                            let mut agent = Agent::with_id(id, &entry.summary.title);
+                            agent.configuration.provider_id = Some(identity.provider_id.clone());
+                            record.agents.push(agent);
+                            record.project.as_mut().unwrap().agent_order.push(id);
+                            slots.insert(id, record.agents.len() - 1);
+                            record.agents.len() - 1
+                        }
+                    };
                     let title = overrides
-                        .and_then(|entry| entry.title.clone())
+                        .get(&id)
+                        .and_then(|(title, _)| title.clone())
                         .unwrap_or_else(|| entry.summary.title.clone());
                     let archived = overrides
-                        .and_then(|entry| entry.archived)
+                        .get(&id)
+                        .and_then(|(_, archived)| *archived)
                         .unwrap_or(entry.summary.is_archived);
-                    let agent = record
-                        .agents
-                        .iter_mut()
-                        .find(|agent| agent.id == id)
-                        .unwrap();
+                    let agent = &mut record.agents[slot];
                     agent.title = title;
                     // Native defaults stay in the binding, separate from explicit
                     // user model, effort, and access overrides.
@@ -3119,17 +3146,22 @@ impl AppState {
                     // providers swapped their order on every pass, and the
                     // comparison below rewrote the workspace each time.
                     if !archived {
-                        record.archived_agent_ids.retain(|agent| *agent != id);
-                    } else if !record.archived_agent_ids.contains(&id) {
+                        if archived_ids.remove(&id) {
+                            record.archived_agent_ids.retain(|agent| *agent != id);
+                        }
+                    } else if archived_ids.insert(id) {
                         record.archived_agent_ids.push(id);
                     }
-                    let position = record
-                        .native_bindings
-                        .iter()
-                        .position(|binding| binding.agent_id == id);
+                    let position = binding_slots.get(&id).copied();
                     let previous = position.map(|index| record.native_bindings[index].clone());
                     let mut binding = native_binding(id, &entry);
+                    // A thread whose binding moves to another session takes
+                    // its old session out of the map, so the maps are read
+                    // again; so are they once a second binding is dropped.
+                    let mut stale = repeated.contains(&id);
                     if let Some(previous) = previous {
+                        stale |= previous.provider_id != binding.provider_id
+                            || previous.session_id != binding.session_id;
                         binding.local_history_pending = previous.local_history_pending;
                         if previous.session_id == binding.session_id {
                             binding.local_start = previous.local_start;
@@ -3142,15 +3174,27 @@ impl AppState {
                     }
                     match position {
                         Some(index) => record.native_bindings[index] = binding,
-                        None => record.native_bindings.push(binding),
+                        None => {
+                            record.native_bindings.push(binding);
+                            binding_slots.insert(id, record.native_bindings.len() - 1);
+                            bound.entry(key).or_insert(id);
+                        }
                     }
                     // A second binding for the same thread, which the old
                     // remove-all kept from accumulating, is still dropped.
-                    let mut seen = false;
-                    record.native_bindings.retain(|binding| {
-                        binding.agent_id != id || !std::mem::replace(&mut seen, true)
-                    });
+                    if repeated.contains(&id) {
+                        let mut seen = false;
+                        record.native_bindings.retain(|binding| {
+                            binding.agent_id != id || !std::mem::replace(&mut seen, true)
+                        });
+                    }
+                    if stale {
+                        (bound, binding_slots, repeated) = index_bindings(&record.native_bindings);
+                    }
                 }
+                record
+                    .missing_native_agent_ids
+                    .retain(|agent| !found.contains(agent));
                 if warnings.is_empty() {
                     for binding in record.native_bindings.iter().filter(|binding| {
                         binding.provider_id == ticket.provider
@@ -3184,13 +3228,26 @@ impl AppState {
                         }
                     }
                 }
-                if next.active_project_id == Some(ticket.project) && next.active_agent_id.is_none()
+                let active_agent = if self.snapshot.active_project_id == Some(ticket.project)
+                    && self.snapshot.active_agent_id.is_none()
                 {
-                    next.active_agent_id = visible_agent(record, record.last_selected_agent_id);
-                }
+                    visible_agent(&record, record.last_selected_agent_id)
+                } else {
+                    self.snapshot.active_agent_id
+                };
                 // Provider errors and no-op polls must not rewrite the workspace.
-                if serde_json::to_vec(&next).ok() != serde_json::to_vec(&*self.snapshot).ok() {
-                    self.commit_thread_change(next, "save native thread discovery");
+                // What is equal in memory is equal on disk, so the pass that
+                // changed nothing, which is nearly every pass, copies and
+                // encodes nothing.
+                if record != self.snapshot.projects[at]
+                    || active_agent != self.snapshot.active_agent_id
+                {
+                    let mut next = self.snapshot.clone();
+                    next.projects[at] = record;
+                    next.active_agent_id = active_agent;
+                    if serde_json::to_vec(&next).ok() != serde_json::to_vec(&*self.snapshot).ok() {
+                        self.commit_thread_change(next, "save native thread discovery");
+                    }
                 }
                 self.forget_waiting_elsewhere(
                     ticket.project,
@@ -4329,6 +4386,36 @@ fn local_override(
     record.thread_overrides.last_mut().unwrap()
 }
 
+/// A record's bindings as an index pass looks them up: the thread bound to
+/// each provider session, where each thread's binding is, and the threads
+/// with more than one. The first of each, as a scan of the list finds them.
+#[allow(clippy::type_complexity)]
+fn index_bindings(
+    bindings: &[fx_store::PersistedBinding],
+) -> (
+    HashMap<(String, String), Uuid>,
+    HashMap<Uuid, usize>,
+    HashSet<Uuid>,
+) {
+    let mut bound = HashMap::new();
+    let mut slots = HashMap::new();
+    let mut repeated = HashSet::new();
+    for (slot, binding) in bindings.iter().enumerate() {
+        bound
+            .entry((binding.provider_id.clone(), binding.session_id.clone()))
+            .or_insert(binding.agent_id);
+        match slots.entry(binding.agent_id) {
+            std::collections::hash_map::Entry::Vacant(first) => {
+                first.insert(slot);
+            }
+            std::collections::hash_map::Entry::Occupied(_) => {
+                repeated.insert(binding.agent_id);
+            }
+        }
+    }
+    (bound, slots, repeated)
+}
+
 fn native_binding(
     agent_id: Uuid,
     entry: &fx_agent::native::NativeThreadSummary,
@@ -4625,7 +4712,7 @@ pub fn persisted_from(conversation: &Conversation) -> PersistedConversation {
 /// is applied.
 #[derive(PartialEq)]
 struct NativeView {
-    snapshot: PersistedApp,
+    snapshot: u64,
     warnings: HashMap<(Uuid, String), Vec<String>>,
     history_warnings: HashMap<Uuid, String>,
     revisions: HashMap<Uuid, u64>,

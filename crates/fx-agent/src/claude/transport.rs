@@ -90,8 +90,17 @@ pub const MAX_IMAGE_BYTES: usize = 25 * 1024 * 1024;
 /// failure this transport exists to avoid.
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(2);
 
-/// How long a closing process is given to end on its own before it is killed.
-pub const CLOSE_GRACE: Duration = Duration::from_millis(750);
+/// How long a closing process is given to end on its own before it is
+/// signalled.
+///
+/// Claude Code 2.1.322 takes about 1.3 s from a `result` to its exit: it
+/// answers the context question and runs the user's SessionEnd hooks first.
+/// At 750 ms every completed turn ended with a SIGTERM into those hooks.
+pub const CLOSE_GRACE: Duration = Duration::from_millis(2500);
+
+/// How long a process that is being stopped gets to leave on its own, and
+/// one that was signalled gets before it is killed.
+const STOP_GRACE: Duration = Duration::from_millis(750);
 
 /// How long a stopped turn's process group gets to exit on SIGTERM before it
 /// is killed.
@@ -155,6 +164,13 @@ impl Exit {
     /// empty and no status to report, and silence there would make the turn look
     /// like one that simply ran out of things to say.
     pub fn reason(&self) -> String {
+        // A process that left cleanly did not fail because of what it printed
+        // on the way out. Claude reports each failing SessionEnd hook on
+        // stderr as it exits, and quoted as the reason, a stale hook in the
+        // user's settings explained a turn it had nothing to do with.
+        if self.code == Some(0) {
+            return "Claude Code exited before finishing the turn.".to_string();
+        }
         let stderr = self.stderr.trim();
         if !stderr.is_empty() {
             return format!("Claude Code exited: {stderr}");
@@ -874,7 +890,7 @@ impl ClaudeTransport {
         if let Some(mut child) = slot.take()
             && tokio::time::timeout(grace, child.wait()).await.is_err()
         {
-            crate::process::stop_leader(&mut child, CLOSE_GRACE).await;
+            crate::process::stop_leader(&mut child, STOP_GRACE).await;
         }
         drop(slot);
         self.leave_running();
@@ -900,7 +916,7 @@ impl ClaudeTransport {
         self.close_input().await;
         let mut slot = self.inner.child.lock().await;
         if let Some(child) = slot.as_mut() {
-            let _ = tokio::time::timeout(CLOSE_GRACE, child.wait()).await;
+            let _ = tokio::time::timeout(STOP_GRACE, child.wait()).await;
         }
         match (tree, slot.as_mut()) {
             (Some(tree), leader) => tree.terminate(leader, TERMINATE_GRACE).await,
@@ -1666,6 +1682,20 @@ mod tests {
             code: Some(1),
         };
         assert_eq!(exit.reason(), "Claude Code exited: Error: not logged in");
+    }
+
+    #[test]
+    fn a_clean_exits_stderr_is_not_its_reason() {
+        // Read live: a turn that ended early was explained by a hook that
+        // had failed on the way out, exit status 0.
+        let exit = Exit {
+            stderr: "SessionEnd hook [notify.sh] failed: No such file or directory".into(),
+            code: Some(0),
+        };
+        assert_eq!(
+            exit.reason(),
+            "Claude Code exited before finishing the turn."
+        );
     }
 
     #[test]
