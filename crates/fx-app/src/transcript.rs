@@ -84,7 +84,7 @@ use fx_design::theme::{
 use gpui::prelude::*;
 use gpui::{
     AnyElement, App, ClipboardItem, CursorStyle, FocusHandle, KeyDownEvent, ListAlignment,
-    ListOffset, ListState, SharedString, StyledText, Window, div, list, px,
+    ListOffset, ListState, SharedString, StyledText, Window, div, list, px, relative,
 };
 use uuid::Uuid;
 
@@ -183,6 +183,8 @@ const ORPHAN_TOOL: &str = "Tool";
 /// How many characters a tool's detail block shows before it is cut off.
 const DETAIL_CHARACTER_LIMIT: usize = 2_000;
 
+/// The most of a tool row a call's title takes, so its detail keeps the rest.
+const TOOL_TITLE_MAX_SHARE: f32 = 0.5;
 /// How many characters a one-line tool summary shows before it is elided.
 const SUMMARY_CHARACTER_LIMIT: usize = 100;
 
@@ -2903,9 +2905,11 @@ fn inline_tool_call(name: &str, input: &str, place: Place) -> AnyElement {
                 .child(tool_glyph(name))
                 .child(
                     div()
+                        .min_w_0()
+                        .truncate()
                         .fx_role(TextRole::CaptionMedium)
                         .text_color(Colors::accent_secondary_ink(&theme))
-                        .child(SharedString::from(name.to_string())),
+                        .child(SharedString::from(display_tool_name(name))),
                 ),
         );
     if !input.is_empty() && input != "{}" {
@@ -4386,15 +4390,29 @@ fn tool_row(
         })
         .child(div().flex_shrink_0().child(tool_glyph(call.name)))
         .child(
+            // Shrinks first and never past its share, so the detail beside
+            // it and the status mark at the end stay in a narrow column. It
+            // was fixed at its full width, and a long MCP tool name pushed
+            // both off the row.
             div()
+                .debug_selector({
+                    let id = call.id.clone();
+                    move || format!("transcript.call-title:{id}")
+                })
+                .min_w_0()
+                .flex_shrink()
+                .max_w(relative(TOOL_TITLE_MAX_SHARE))
+                .truncate()
                 .fx_role(TextRole::CaptionMedium)
-                .flex_shrink_0()
                 .text_color(Colors::fg_secondary(&theme))
-                .whitespace_nowrap()
                 .child(SharedString::from(tool_title(call, Tense::Past))),
         )
         .child(if let Some(detail) = tool_detail(call) {
             div()
+                .debug_selector({
+                    let id = call.id.clone();
+                    move || format!("transcript.call-detail:{id}")
+                })
                 .flex_1()
                 .min_w_0()
                 .truncate()
@@ -4639,13 +4657,30 @@ fn tool_title(call: &ToolCall<'_>, tense: Tense) -> String {
         "bash" | "command" | "shell" | "commandexecution" => ("Ran command", "Running command"),
         _ if call.name == ORPHAN_TOOL && call.is_error => ("Tool failed", "Tool failed"),
         _ if call.name == ORPHAN_TOOL => ("Tool result", "Tool result"),
-        _ => return call.name.to_string(),
+        _ => return display_tool_name(call.name),
     };
     match tense {
         Tense::Past => past,
         Tense::Present => present,
     }
     .to_string()
+}
+
+/// A tool's name as the reader should see it.
+///
+/// Claude names an MCP server's tool `mcp__<server>__<tool>`, which is the
+/// wire's namespacing rather than a name: it shows as `server · tool`.
+fn display_tool_name(name: &str) -> String {
+    let Some(rest) = name.strip_prefix("mcp__") else {
+        return name.to_string();
+    };
+    match rest.split_once("__") {
+        Some((server, tool)) if !server.is_empty() && !tool.is_empty() => {
+            format!("{server} · {tool}")
+        }
+        _ if !rest.is_empty() => rest.trim_end_matches('_').to_string(),
+        _ => name.to_string(),
+    }
 }
 
 /// The one line that says what the call was pointed at.
@@ -9779,5 +9814,54 @@ mod tests {
         let slot =
             Typography::icon(fx_design::components::STATUS_GLYPH_SIZE, &global::current()).size;
         assert_eq!(done.size.width, px(slot));
+    }
+
+    #[test]
+    fn an_mcp_tool_reads_as_its_server_and_its_tool() {
+        assert_eq!(
+            display_tool_name("mcp__probe__ask_name"),
+            "probe · ask_name"
+        );
+        assert_eq!(
+            display_tool_name("mcp__claude_ai_Gmail__search_threads"),
+            "claude_ai_Gmail · search_threads"
+        );
+        assert_eq!(display_tool_name("mcp__probe"), "probe");
+        assert_eq!(display_tool_name("Bash"), "Bash");
+        assert_eq!(display_tool_name("mcp__"), "mcp__");
+        let call = ToolCall {
+            id: "t".into(),
+            name: "mcp__docs__read",
+            input: "",
+            output: None,
+            is_error: false,
+            result_recorded: false,
+            started: fx_core::models::now(),
+        };
+        assert_eq!(tool_title(&call, Tense::Past), "docs · read");
+        assert_eq!(tool_title(&call, Tense::Present), "docs · read");
+    }
+
+    #[test]
+    fn a_long_tool_title_gives_way_to_its_detail_and_mark_in_a_narrow_column() {
+        let (_test, mut visual) = opened_finished_calls(
+            420.0,
+            "mcp__a_very_long_server_name__an_even_longer_tool_name_for_the_row",
+        );
+        let row = visual
+            .debug_bounds("transcript.activity-call:polish-failed")
+            .unwrap();
+        let title = visual
+            .debug_bounds("transcript.call-title:polish-failed")
+            .unwrap();
+        let detail = visual
+            .debug_bounds("transcript.call-detail:polish-failed")
+            .unwrap();
+        let mark = visual.debug_bounds("status-glyph:failed").unwrap();
+        assert!(title.size.width <= row.size.width * TOOL_TITLE_MAX_SHARE);
+        assert!(title.right() <= detail.left());
+        assert!(detail.size.width > px(0.0), "the detail was squeezed out");
+        assert!(mark.right() <= row.right(), "the mark left the row");
+        assert!(detail.right() <= mark.left());
     }
 }
