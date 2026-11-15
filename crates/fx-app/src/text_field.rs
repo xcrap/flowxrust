@@ -164,7 +164,7 @@ impl TextFieldEvent {
 impl EventEmitter<TextFieldEvent> for TextField {}
 
 /// A count with its thousands grouped, so a limit reads as 32,000.
-fn grouped(count: usize) -> String {
+pub(crate) fn grouped(count: usize) -> String {
     let digits = count.to_string();
     let mut grouped = String::with_capacity(digits.len() + digits.len() / 3);
     for (index, digit) in digits.chars().enumerate() {
@@ -249,6 +249,9 @@ pub struct TextField {
     window_active: bool,
     geometry: Rc<RefCell<FieldGeometry>>,
     history: UndoHistory,
+    /// Ends a composition when focus moves elsewhere in the window. Taken at
+    /// the first render, the first moment there is a window to listen in.
+    blur: Option<gpui::Subscription>,
 }
 
 impl TextField {
@@ -274,6 +277,7 @@ impl TextField {
             window_active: false,
             geometry: Rc::default(),
             history: UndoHistory::default(),
+            blur: None,
         }
     }
 
@@ -368,9 +372,11 @@ impl TextField {
     }
 
     /// Replace `range` with `text` as one undoable step of its own, with the
-    /// caret after what went in. Refused while the IME is composing, and for
-    /// a range that is not within the value on character boundaries, since
-    /// the caller read it from an earlier frame. Returns whether it applied.
+    /// caret after what went in. Refused while the IME is composing, for a
+    /// range that is not within the value on character boundaries, since the
+    /// caller read it from an earlier frame, and for text that does not
+    /// [`fit`](Self::fits): cut to the cap, a completed path is another path.
+    /// Returns whether it applied.
     pub(crate) fn replace_range(
         &mut self,
         range: Range<usize>,
@@ -383,12 +389,27 @@ impl TextField {
             || range.end > self.value.len()
             || !self.value.is_char_boundary(range.start)
             || !self.value.is_char_boundary(range.end)
+            || !self.fits(range.clone(), text)
         {
             return false;
         }
         self.user_edit(EditKind::Clipboard, range, text);
         cx.notify();
         true
+    }
+
+    /// Whether `text` can replace `range` whole under the cap, which, as in
+    /// [`Self::edit`], is never below what the value already holds.
+    pub(crate) fn fits(&self, range: Range<usize>, text: &str) -> bool {
+        if self.max_len == 0 {
+            return true;
+        }
+        let Some(replaced) = self.value.get(range) else {
+            return false;
+        };
+        let current = self.value.chars().count();
+        let insert = normalise_line_breaks(text, self.multiline.is_some());
+        current - replaced.chars().count() + insert.chars().count() <= self.max_len.max(current)
     }
 
     /// Append an explicit reference as one undoable edit, or keep the entire
@@ -1053,6 +1074,18 @@ impl TextField {
             cx.notify();
         }
     }
+
+    /// Focus moved to something else in the window. What was composed stays
+    /// as typed text, as a click away leaves it: a marked range kept past the
+    /// blur was where the next character went after focus came back, over the
+    /// old composed text. Leaving the app is the input context's to settle,
+    /// since the IME may still commit or continue its composition there.
+    fn focus_left(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if window.is_window_active() && self.marked.take().is_some() {
+            self.history.break_group();
+            cx.notify();
+        }
+    }
 }
 
 impl Render for TextField {
@@ -1060,6 +1093,10 @@ impl Render for TextField {
         let theme = global::current();
         let focused = self.focus_handle.is_focused(window);
         self.focused = focused;
+        if self.blur.is_none() {
+            let handle = self.focus_handle.clone();
+            self.blur = Some(cx.on_blur(&handle, window, Self::focus_left));
+        }
         // A window in the background holds a steady caret. Blinking there
         // re-rendered the whole window twice a second for as long as FlowX
         // sat behind another app; activation refreshes the window, which
@@ -2428,8 +2465,10 @@ fn move_horizontal(
         selection.head
     };
     // An arrow on a selection starts from the edge it is heading towards, which
-    // is what makes shrink-then-grow feel right.
-    let head = if selection.is_empty() {
+    // is what makes shrink-then-grow feel right. Extending moves the head
+    // itself: stepped from the edge, Shift-Left on a rightward selection
+    // jumped to its anchor and selected nothing.
+    let head = if extend || selection.is_empty() {
         selection.head
     } else if forward {
         selection.range().end
@@ -2909,6 +2948,64 @@ mod tests {
     }
 
     #[test]
+    fn a_composition_left_by_moving_focus_away_is_kept_as_typed_text() {
+        struct Pair(Entity<TextField>, Entity<TextField>);
+        impl Render for Pair {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                div().child(self.0.clone()).child(self.1.clone())
+            }
+        }
+        let mut test = gpui::TestAppContext::single();
+        let (field, other) = test.update(|cx| {
+            (
+                cx.new(|cx| TextField::new(cx).multiline(4.0)),
+                cx.new(TextField::new),
+            )
+        });
+        let window = test.add_window({
+            let (field, other) = (field.clone(), other.clone());
+            move |_, _| Pair(field, other)
+        });
+        // A blur is only reported in a key window.
+        window
+            .update(&mut test, |_, window, _| window.activate_window())
+            .unwrap();
+        test.run_until_parked();
+        let focus = |test: &mut gpui::TestAppContext, target: &Entity<TextField>| {
+            let target = target.clone();
+            window
+                .update(test, |_, window, cx| {
+                    target.read(cx).focus_handle().focus(window)
+                })
+                .unwrap();
+            test.refresh().unwrap();
+        };
+        focus(&mut test, &field);
+        window
+            .update(&mut test, |_, window, cx| {
+                field.update(cx, |field, cx| {
+                    field.replace_and_mark_text_in_range(None, "か", Some(1..1), window, cx);
+                    assert!(field.is_composing());
+                });
+            })
+            .unwrap();
+        // Tab away and back, as the keyboard does.
+        focus(&mut test, &other);
+        focus(&mut test, &field);
+        window
+            .update(&mut test, |_, window, cx| {
+                field.update(cx, |field, cx| {
+                    assert!(!field.is_composing(), "the marked range outlived the blur");
+                    // The next character goes in at the caret, rather than
+                    // over the text composed before the field lost focus.
+                    field.replace_text_in_range(None, "x", window, cx);
+                    assert_eq!(field.value(), "かx");
+                });
+            })
+            .unwrap();
+    }
+
+    #[test]
     fn an_empty_field_fills_its_parent_flex_width() {
         struct WidthProbe(Entity<TextField>);
         impl Render for WidthProbe {
@@ -3046,6 +3143,29 @@ mod tests {
                 assert!(!field.replace_range(reversed, "x", cx));
                 assert!(field.undo(cx));
                 assert_eq!(field.value(), "Fix @comp");
+            });
+        });
+    }
+
+    #[test]
+    fn a_completion_that_does_not_fit_the_cap_is_refused_whole() {
+        // Cut to fit, a chosen path landed in the draft as a different path.
+        let test = gpui::TestAppContext::single();
+        let field = test.update(|cx| cx.new(|cx| TextField::new(cx).multiline(4.0).max_len(12)));
+        test.update(|cx| {
+            field.update(cx, |field, cx| {
+                field.set_value("Fix @comp", cx);
+                assert!(!field.replace_range(4..9, "@src/composer.rs ", cx));
+                assert_eq!(field.value(), "Fix @comp");
+                assert!(!field.can_undo(), "nothing was recorded");
+                // One that fits exactly still goes in.
+                assert!(field.replace_range(4..9, "@lib.rs ", cx));
+                assert_eq!(field.value(), "Fix @lib.rs ");
+                // Recovered text over the cap may be edited without growing.
+                field.restore_value("Fix @c and more text", cx);
+                assert!(field.replace_range(4..6, "@a", cx));
+                assert!(!field.replace_range(4..6, "@a.rs", cx));
+                assert_eq!(field.value(), "Fix @a and more text");
             });
         });
     }
@@ -3788,6 +3908,40 @@ mod tests {
         assert_eq!(at_end.head, 3);
         let at_start = move_horizontal("abc", Selection::collapsed(0), false, false, false);
         assert_eq!(at_start.head, 0);
+    }
+
+    #[test]
+    fn a_shift_arrow_moves_the_head_back_over_its_own_selection() {
+        // Stepped from the selection's edge, Shift-Right three times and then
+        // Shift-Left left nothing selected instead of two characters.
+        let step = |selection, forward, by_word| {
+            move_horizontal("one two three", selection, forward, true, by_word)
+        };
+        let mut selection = Selection::collapsed(0);
+        for _ in 0..3 {
+            selection = step(selection, true, false);
+        }
+        assert_eq!(selection, Selection { anchor: 0, head: 3 });
+        assert_eq!(
+            step(selection, false, false),
+            Selection { anchor: 0, head: 2 }
+        );
+        // A selection grown leftwards shrinks from its left end.
+        let backwards = Selection { anchor: 7, head: 4 };
+        assert_eq!(
+            step(backwards, true, false),
+            Selection { anchor: 7, head: 5 }
+        );
+        // Option-Shift likewise, a word at a time.
+        let words = step(step(Selection::collapsed(0), true, true), true, true);
+        assert_eq!(words, Selection { anchor: 0, head: 7 });
+        assert_eq!(step(words, false, true), Selection { anchor: 0, head: 4 });
+        // Without Shift, an arrow still leaves from the edge it heads to.
+        let selected = Selection { anchor: 0, head: 3 };
+        assert_eq!(
+            move_horizontal("one two three", selected, false, false, false),
+            Selection::collapsed(0)
+        );
     }
 
     #[test]

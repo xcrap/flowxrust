@@ -1482,22 +1482,32 @@ impl AppState {
     }
 
     /// Put a draft read in the background into a composer made while it was
-    /// read, unless the user has typed there since: that typing is newer.
+    /// read. What the user typed there since is newer, so it follows the
+    /// saved draft after a blank line, as a recovered queue does; neither
+    /// replaces the other. Whitespace alone is not typing: kept whole, one
+    /// stray Return during a slow load replaced the saved draft for good.
     fn restore_loaded_draft(&mut self, agent_id: Uuid, cx: &mut App) {
         let Some(field) = self.drafts.get(&agent_id).cloned() else {
             return;
         };
         let typed = field.read(cx).value().to_string();
-        if !typed.is_empty() {
-            self.restored_drafts.insert(agent_id, typed);
-        } else if let Some(draft) = self
+        let saved = self
             .restored_drafts
             .get(&agent_id)
-            .filter(|draft| !draft.is_empty())
-            .cloned()
-        {
-            field.update(cx, |field, cx| field.restore_value(draft, cx));
-        }
+            .filter(|draft| !draft.trim().is_empty())
+            .cloned();
+        let draft = match saved {
+            Some(saved) if typed.trim().is_empty() => saved,
+            Some(saved) if saved.trim() != typed.trim() => format!("{saved}\n\n{typed}"),
+            _ => {
+                if !typed.is_empty() {
+                    self.restored_drafts.insert(agent_id, typed);
+                }
+                return;
+            }
+        };
+        field.update(cx, |field, cx| field.restore_value(draft.clone(), cx));
+        self.restored_drafts.insert(agent_id, draft);
     }
 
     /// The active thread's conversation, or `None` while it is still loading.
@@ -1605,11 +1615,10 @@ impl AppState {
                 session.retarget(token)
             }
             _ => {
-                let index = self
-                    .file_indexes
-                    .get(&root)
-                    .filter(|index| index.is_fresh(Instant::now()))
-                    .cloned();
+                // A stale listing serves until its replacement lands, which
+                // `ensure_file_index` below starts. Refused, a new `@` opened
+                // an empty picker that took Return as a newline.
+                let index = self.file_indexes.get(&root).cloned();
                 self.mention = Some(crate::file_mentions::MentionSession::open(
                     agent_id, &root, token, index,
                 ));
@@ -1645,15 +1654,22 @@ impl AppState {
             return;
         }
         let path = std::path::PathBuf::from(root);
-        let listing = cx.background_spawn(async move {
-            fx_core::services::list_files(&path, crate::file_mentions::MAX_INDEXED_FILES)
-        });
         let root = root.to_string();
+        // Built there too: folding every path for ranking is the one pass
+        // over the whole listing, and it is not the UI thread's.
+        let index = cx.background_spawn({
+            let root = root.clone();
+            async move {
+                let listing =
+                    fx_core::services::list_files(&path, crate::file_mentions::MAX_INDEXED_FILES);
+                crate::file_mentions::FileIndex::new(root, listing)
+            }
+        });
         cx.spawn(async move |this, cx| {
-            let listing = listing.await;
+            let index = index.await;
             let _ = this.update(cx, |state, cx| {
                 state.indexing.remove(&root);
-                state.adopt_file_index(crate::file_mentions::FileIndex::new(root, listing), cx);
+                state.adopt_file_index(index, cx);
             });
         })
         .detach();
@@ -1725,7 +1741,18 @@ impl AppState {
             return false;
         };
         let mention = fx_core::policy::mention::mention_text(&path);
-        field.update(cx, |field, cx| field.replace_range(range, &mention, cx))
+        let (applied, fits) = field.update(cx, |field, cx| {
+            let fits = field.fits(range.clone(), &mention);
+            (field.replace_range(range, &mention, cx), fits)
+        });
+        if !fits {
+            // Refused whole rather than cut to a path that is not the file.
+            self.set_composer_notice(
+                agent_id,
+                Some("This file's path would exceed the prompt limit. Shorten the draft to mention it.".into()),
+            );
+        }
+        applied
     }
 
     /// Close the picker without taking anything. It stays closed for this
@@ -2007,20 +2034,25 @@ impl AppState {
         }
         self.retry_drafts.remove(&agent_id);
         self.composer.retry_attachments.remove(&agent_id);
-        let sent: Vec<Uuid> = attachments.iter().map(|attachment| attachment.id).collect();
-        self.release_sent_attachments(agent_id, &sent);
         // The keyboard callback is deferred. Only clear the submitted text,
         // preserving any replacement draft written before that callback runs.
-        if let Some(field) = self.drafts.get(&agent_id).cloned() {
-            if field.read(cx).value().trim() == text.trim() {
-                self.clear_draft(agent_id, cx);
-            }
-        } else if self
-            .restored_drafts
-            .get(&agent_id)
-            .is_some_and(|draft| draft.trim() == text.trim())
-        {
-            self.restored_drafts.remove(&agent_id);
+        let sent_the_draft = match self.drafts.get(&agent_id) {
+            Some(field) => field.read(cx).value().trim() == text.trim(),
+            None => self
+                .restored_drafts
+                .get(&agent_id)
+                .is_some_and(|draft| draft.trim() == text.trim()),
+        };
+        if sent_the_draft {
+            // The composer may hold this prompt's images as other copies: a
+            // failure puts them back with new ids, and Retry resends copies
+            // read from its row. Released by id alone, they stayed and went
+            // out again with the next prompt.
+            self.release_sent_copies(agent_id, attachments);
+            self.clear_draft(agent_id, cx);
+        } else {
+            let sent: Vec<Uuid> = attachments.iter().map(|attachment| attachment.id).collect();
+            self.release_sent_attachments(agent_id, &sent);
         }
         self.capture_drafts(cx);
         self.native_sync.invalidate(project_id);
@@ -2237,6 +2269,7 @@ impl AppState {
                     self.composer.steers.remove(&agent_id);
                     self.composer.goal_prompts.remove(&agent_id);
                     self.restore_unaccepted_prompt(agent_id);
+                    self.settle_control(agent_id, outcome.is_completed());
                     self.queue_may_advance(agent_id);
                     let settled = crate::thread_presentation::settled_state(&outcome);
                     // Marked before the outcome is recorded, so the one save
@@ -2274,6 +2307,7 @@ impl AppState {
                     self.composer.steers.remove(&agent_id);
                     self.composer.goal_prompts.remove(&agent_id);
                     self.restore_unaccepted_prompt(agent_id);
+                    self.settle_control(agent_id, false);
                     self.queue_may_advance(agent_id);
                     self.record_execution_state(agent_id, fx_core::AgentExecutionState::Failure);
                 }
@@ -3768,6 +3802,8 @@ pub struct ComposerStore {
     goals: HashMap<Uuid, fx_core::models::ConversationGoal>,
     /// An objective `/goal` set, to send as a prompt once the goal is in place.
     goal_prompts: HashMap<Uuid, String>,
+    /// A running slash command's own text, put back if the command fails.
+    control_drafts: HashMap<Uuid, String>,
     /// Threads whose turn ended with prompts waiting behind it.
     dispatch: Vec<Uuid>,
     /// Threads whose next prompt was due while it was open for editing. Each
@@ -3871,6 +3907,7 @@ impl AppState {
             .retain(|(agent, _)| *agent != agent_id);
         self.composer.goals.remove(&agent_id);
         self.composer.goal_prompts.remove(&agent_id);
+        self.composer.control_drafts.remove(&agent_id);
         self.composer.dispatch.retain(|agent| *agent != agent_id);
         self.composer.held_queues.remove(&agent_id);
         if self
@@ -3968,6 +4005,27 @@ impl AppState {
             if pending.is_empty() {
                 // No explicit draft remains: a save before acceptance must
                 // recover the submitted prompt's images from its user row.
+                self.composer.attachments.remove(&agent_id);
+            }
+        }
+    }
+
+    /// [`Self::release_sent_attachments`] for a prompt that was the composer's
+    /// own draft: each sent image takes the composer's image with its id, or
+    /// else one with its bytes, as [`same_images`] compares a retried row.
+    fn release_sent_copies(&mut self, agent_id: Uuid, sent: &[fx_core::Attachment]) {
+        if let Some(pending) = self.composer.attachments.get_mut(&agent_id) {
+            let images = Arc::make_mut(pending);
+            for image in sent {
+                if let Some(position) = images
+                    .iter()
+                    .position(|pending| pending.id == image.id)
+                    .or_else(|| images.iter().position(|pending| pending.data == image.data))
+                {
+                    images.remove(position);
+                }
+            }
+            if images.is_empty() {
                 self.composer.attachments.remove(&agent_id);
             }
         }
@@ -4320,9 +4378,60 @@ impl AppState {
         self.composer.goal_prompts.insert(agent_id, objective);
     }
 
+    /// A slash command is starting: its text leaves the composer, so the
+    /// composer is free while it runs, as a sent prompt's is.
+    ///
+    /// A command that carries words of the reader's — a goal's objective,
+    /// Claude's compaction instructions — keeps them until it succeeds, and a
+    /// failure puts the command back as a prompt the provider never accepted
+    /// comes back. Cleared for good at the start, a failed `/goal` lost its
+    /// objective.
+    pub(crate) fn begin_control(
+        &mut self,
+        agent_id: Uuid,
+        command: &str,
+        control: &crate::session::ThreadControl,
+        cx: &mut App,
+    ) {
+        use crate::session::ThreadControl;
+        if let ThreadControl::GoalSet(objective) = control {
+            self.send_after_goal(agent_id, objective.clone());
+        }
+        let carries_text = match control {
+            ThreadControl::GoalSet(_) => true,
+            ThreadControl::Compact(instructions) => !instructions.is_empty(),
+            _ => false,
+        };
+        if carries_text {
+            self.composer
+                .control_drafts
+                .insert(agent_id, command.trim().to_string());
+        } else {
+            self.composer.control_drafts.remove(&agent_id);
+        }
+        self.clear_draft(agent_id, cx);
+        self.set_composer_notice(agent_id, None);
+    }
+
+    /// A slash command ended. Unless it did what it was asked, its text goes
+    /// back to the composer through the same path as an unaccepted prompt's,
+    /// so it never replaces a draft written meanwhile.
+    fn settle_control(&mut self, agent_id: Uuid, succeeded: bool) {
+        if let Some(command) = self.composer.control_drafts.remove(&agent_id)
+            && !succeeded
+        {
+            self.retry_drafts.insert(agent_id, command);
+            // A command takes no images; an older prompt's must not join it.
+            self.composer.retry_attachments.remove(&agent_id);
+        }
+    }
+
     fn goal_changed(&mut self, agent_id: Uuid, goal: Option<fx_core::models::ConversationGoal>) {
         match goal {
             Some(goal) => {
+                // The goal is set and its objective queued: `/goal` did its
+                // work, whatever the rest of its turn does.
+                self.composer.control_drafts.remove(&agent_id);
                 if let Some(objective) = self.composer.goal_prompts.remove(&agent_id)
                     && let Some(conversation) = self.conversations.get(&agent_id)
                 {
@@ -4470,10 +4579,31 @@ impl AppState {
                 .attachments
                 .insert(agent_id, Arc::new(attachments));
         } else {
-            // The draft stays the reader's. The prompt's text fits in the
-            // notice, but its images do not, so they join the draft's under
-            // the usual limits rather than being dropped.
-            let mut notice = format!("A queued prompt could not be sent: {text}");
+            // The draft stays the reader's, and the prompt follows it after a
+            // blank line, as a recovered queue does. Held in the notice alone,
+            // it was never saved and was gone at the next notice. Appended
+            // as an undoable step where it fits; restored whole where not,
+            // since saved work is never cut.
+            let has_text = !text.trim().is_empty();
+            if has_text
+                && field
+                    .update(cx, |field, cx| field.append_context(&text, cx))
+                    .is_err()
+            {
+                let draft = field.read(cx).value().to_string();
+                let joined = if draft.is_empty() {
+                    text
+                } else {
+                    format!("{draft}\n\n{text}")
+                };
+                field.update(cx, |field, cx| field.restore_value(joined, cx));
+            }
+            let mut notice = if has_text {
+                "A queued prompt could not be sent, so it was added to your draft.".to_string()
+            } else {
+                "A queued prompt could not be sent.".to_string()
+            };
+            // Its images join the draft's under the usual limits.
             if !attachments.is_empty() {
                 let pending = self.composer.attachments.entry(agent_id).or_default();
                 let refused = crate::attachments::admit(
@@ -4491,6 +4621,9 @@ impl AppState {
             }
             self.set_composer_notice(agent_id, Some(notice));
         }
+        // The prompts behind it move on. Nothing else would come back for
+        // them: no turn started, so none ends to advance the queue.
+        self.queue_may_advance(agent_id);
     }
 
     // ── Follow-up mode ─────────────────────────────────────────────────────
@@ -6719,22 +6852,34 @@ mod persistence_tests {
         let temp = tempfile::tempdir().unwrap();
         let paths = AppPaths::at(temp.path().join("state"));
         let test = gpui::TestAppContext::single();
-        let (state, _, agent, _) = test.update(|cx| workspace(cx, &paths));
+        let (state, project, agent, _) = test.update(|cx| workspace(cx, &paths));
         test.update(|cx| {
             state.update(cx, |state, cx| {
+                state.conversation(project, agent);
                 let field = state.draft(agent, cx);
                 field.update(cx, |field, cx| field.set_value("my own draft", cx));
-                state.return_to_composer(agent, "queued".into(), vec![image(5)], cx);
-                // The reader's draft is untouched; the prompt is in the notice
-                // and its image waits in the composer instead of vanishing.
-                assert_eq!(field.read(cx).value(), "my own draft");
+                state
+                    .enqueue_prompt(agent, "queued", vec![image(5)], cx)
+                    .unwrap();
+                state
+                    .enqueue_prompt(agent, "and then", Vec::new(), cx)
+                    .unwrap();
+                let (text, images) = state.dequeue_prompt(agent).unwrap();
+                state.return_to_composer(agent, text, images, cx);
+                // The prompt follows the reader's draft, as a recovered queue
+                // does. Held only in the notice, it was gone at the next
+                // notice and never saved.
+                assert_eq!(field.read(cx).value(), "my own draft\n\nqueued");
                 assert!(
                     state
                         .composer_notice(agent)
-                        .is_some_and(|notice| notice.contains("queued"))
+                        .is_some_and(|notice| notice.contains("added to your draft"))
                 );
                 assert_eq!(state.attachments(agent).len(), 1, "the image was dropped");
                 assert_eq!(state.attachments(agent)[0].data, image(5).data);
+                // The rest of the queue is not stranded behind it.
+                assert_eq!(state.take_ready_queues(), vec![agent]);
+                assert_eq!(state.dequeue_prompt(agent).unwrap().0, "and then");
             })
         });
     }
@@ -6755,6 +6900,106 @@ mod persistence_tests {
                 state.drain_updates_with_context(cx);
                 assert_eq!(state.attachments(agent).len(), 1);
                 assert_eq!(state.attachments(agent)[0].data, image(2).data);
+            })
+        });
+    }
+
+    #[test]
+    fn typing_while_a_saved_draft_loads_never_replaces_it() {
+        // Kept whole, one stray Return typed during a slow load replaced the
+        // saved draft for good.
+        for (typed, expected) in [
+            ("\n", "Saved words"),
+            ("  ", "Saved words"),
+            ("and more", "Saved words\n\nand more"),
+            ("Saved words", "Saved words"),
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let paths = AppPaths::at(temp.path().join("state"));
+            let mut test = gpui::TestAppContext::single();
+            let (state, project, agent, _) = test.update(|cx| workspace(cx, &paths));
+            test.update(|cx| {
+                state.update(cx, |state, cx| {
+                    let mut saved = PersistedConversation::from_messages(agent, Vec::new());
+                    saved.draft_text = "Saved words".into();
+                    state
+                        .store
+                        .save_conversation(project, agent, &saved)
+                        .unwrap();
+                    state.draft(agent, cx);
+                    assert!(state.is_loading_conversation(agent));
+                });
+            });
+            test.update(|cx| {
+                state.update(cx, |state, cx| {
+                    let field = state.draft(agent, cx);
+                    field.update(cx, |field, cx| field.set_value(typed, cx));
+                });
+            });
+            test.run_until_parked();
+            test.update(|cx| {
+                state.update(cx, |state, cx| {
+                    assert!(!state.is_loading_conversation(agent));
+                    assert_eq!(
+                        state.draft(agent, cx).read(cx).value(),
+                        expected,
+                        "typed {typed:?}"
+                    );
+                });
+            });
+        }
+    }
+
+    #[test]
+    fn retrying_a_failed_prompt_takes_its_images_out_of_the_composer() {
+        // The failure puts the prompt's images back as copies with new ids,
+        // and Retry sends further copies read from its row. Released by id,
+        // the composer's copies stayed and went out again with the next prompt.
+        let temp = tempfile::tempdir().unwrap();
+        let paths = AppPaths::at(temp.path().join("state"));
+        let test = gpui::TestAppContext::single();
+        let (state, _, agent, _) = test.update(|cx| workspace(cx, &paths));
+        test.update(|cx| {
+            state.update(cx, |state, cx| {
+                let field = state.draft(agent, cx);
+                assert!(state.prepare_prompt_with(agent, "look", &[image(1), image(2)], cx));
+                state.update_sender_for(agent)(SessionUpdate::Failed {
+                    reason: "startup failed".into(),
+                });
+                state.drain_updates_with_context(cx);
+                assert_eq!(field.read(cx).value(), "look");
+                assert!(same_images(state.attachments(agent), &[image(1), image(2)]));
+
+                // The banner's Retry.
+                assert_eq!(state.retry_prompt(agent).as_deref(), Some("look"));
+                let resent = state.recovery_images(agent);
+                assert!(same_images(&resent, &[image(1), image(2)]));
+                assert!(state.prepare_prompt_with(agent, "look", &resent, cx));
+                assert_eq!(field.read(cx).value(), "");
+                assert!(
+                    state.attachments(agent).is_empty(),
+                    "the retried prompt's images stayed in the composer"
+                );
+            })
+        });
+    }
+
+    #[test]
+    fn a_prompt_sent_beside_another_draft_leaves_that_draft_s_images() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = AppPaths::at(temp.path().join("state"));
+        let test = gpui::TestAppContext::single();
+        let (state, _, agent, _) = test.update(|cx| workspace(cx, &paths));
+        test.update(|cx| {
+            state.update(cx, |state, cx| {
+                let field = state.draft(agent, cx);
+                field.update(cx, |field, cx| field.set_value("something else", cx));
+                attach(state, agent, vec![image(1)]);
+                // Retry resends the same bytes, but the composer holds a
+                // different draft, so its image is that draft's.
+                assert!(state.prepare_prompt_with(agent, "look", &[image(1)], cx));
+                assert_eq!(field.read(cx).value(), "something else");
+                assert_eq!(state.attachments(agent).len(), 1);
             })
         });
     }
@@ -7203,6 +7448,97 @@ mod persistence_tests {
             reopened.update(cx, |state, _| {
                 state.conversation(project, agent);
                 assert_eq!(state.goal(agent), None, "a cleared goal came back");
+            })
+        });
+    }
+
+    #[test]
+    fn a_slash_command_that_fails_puts_its_text_back_in_the_composer() {
+        // Cleared as the command started, a failed `/goal` lost its
+        // objective and a failed `/compact` its instructions.
+        use crate::session::ThreadControl;
+        let failures = [
+            SessionUpdate::Failed {
+                reason: "thread/goal/set failed".into(),
+            },
+            SessionUpdate::Finished {
+                outcome: fx_agent::codex::TurnOutcome::Failed {
+                    reason: "compaction failed".into(),
+                    thread_id: "thread".into(),
+                },
+            },
+        ];
+        for failure in failures {
+            let temp = tempfile::tempdir().unwrap();
+            let paths = AppPaths::at(temp.path().join("state"));
+            let test = gpui::TestAppContext::single();
+            let (state, project, agent, _) = test.update(|cx| workspace(cx, &paths));
+            test.update(|cx| {
+                state.update(cx, |state, cx| {
+                    state.conversation(project, agent);
+                    let field = state.draft(agent, cx);
+                    for (command, control) in [
+                        ("/goal Ship it", ThreadControl::GoalSet("Ship it".into())),
+                        (
+                            "/compact keep the API notes",
+                            ThreadControl::Compact("keep the API notes".into()),
+                        ),
+                    ] {
+                        field.update(cx, |field, cx| field.set_value(command, cx));
+                        state.begin_control(agent, command, &control, cx);
+                        assert_eq!(field.read(cx).value(), "", "the composer is free");
+                        state.update_sender_for(agent)(failure.clone());
+                        state.drain_updates_with_context(cx);
+                        assert_eq!(field.read(cx).value(), command, "{failure:?}");
+                        assert_eq!(state.take_ready_queues(), Vec::<Uuid>::new());
+                    }
+                })
+            });
+        }
+    }
+
+    #[test]
+    fn a_slash_command_that_succeeds_does_not_come_back() {
+        use crate::session::ThreadControl;
+        let temp = tempfile::tempdir().unwrap();
+        let paths = AppPaths::at(temp.path().join("state"));
+        let test = gpui::TestAppContext::single();
+        let (state, project, agent, _) = test.update(|cx| workspace(cx, &paths));
+        let goal = fx_core::models::ConversationGoal::from_codex(&serde_json::json!({
+            "threadId": "thread", "objective": "Ship it", "status": "active"
+        }))
+        .unwrap();
+        let completed = || SessionUpdate::Finished {
+            outcome: fx_agent::codex::TurnOutcome::Completed {
+                thread_id: "thread".into(),
+                stop_reason: "control".into(),
+            },
+        };
+        test.update(|cx| {
+            state.update(cx, |state, cx| {
+                state.conversation(project, agent);
+                let field = state.draft(agent, cx);
+                state.begin_control(
+                    agent,
+                    "/goal Ship it",
+                    &ThreadControl::GoalSet("Ship it".into()),
+                    cx,
+                );
+                state.update_sender_for(agent)(SessionUpdate::GoalChanged { goal: Some(goal) });
+                state.update_sender_for(agent)(completed());
+                state.drain_updates_with_context(cx);
+                assert_eq!(field.read(cx).value(), "");
+                assert_eq!(state.dequeue_prompt(agent).unwrap().0, "Ship it");
+
+                state.begin_control(
+                    agent,
+                    "/compact keep the API notes",
+                    &ThreadControl::Compact("keep the API notes".into()),
+                    cx,
+                );
+                state.update_sender_for(agent)(completed());
+                state.drain_updates_with_context(cx);
+                assert_eq!(field.read(cx).value(), "");
             })
         });
     }
@@ -8486,6 +8822,85 @@ mod persistence_tests {
         assert!(!open(), "the caret has left the token");
         type_text("");
         assert!(!open());
+    }
+
+    #[test]
+    fn a_stale_listing_serves_a_new_at_while_its_replacement_is_read() {
+        // Refused once stale, a new `@` after the listing's lifetime opened
+        // an empty "Listing files…" picker, whose Return then typed a newline.
+        let temp = tempfile::tempdir().unwrap();
+        let paths = AppPaths::at(temp.path().join("state"));
+        let mut test = gpui::TestAppContext::single();
+        let (state, _project, agent, _) = test.update(|cx| workspace(cx, &paths));
+        test.update(|cx| {
+            state.update(cx, |state, cx| {
+                let root = state.project_root_for(agent).unwrap();
+                let mut stale = fresh_index(&root, &PROJECT_FILES);
+                stale.built = Instant::now()
+                    .checked_sub(crate::file_mentions::INDEX_TTL + Duration::from_secs(1))
+                    .unwrap();
+                assert!(!stale.is_fresh(Instant::now()));
+                state.adopt_file_index(stale, cx);
+                state.draft(agent, cx);
+            });
+        });
+        test.update(|cx| {
+            state.update(cx, |state, cx| {
+                let draft = state.draft(agent, cx);
+                draft.update(cx, |field, cx| field.set_value("Fix @co", cx));
+            });
+        });
+        let popup = test
+            .update(|cx| state.read(cx).mention_popup(agent))
+            .expect("the picker opened on the `@`");
+        assert!(!popup.loading, "the stale listing was refused");
+        assert_eq!(popup.rows.len(), 2);
+        // The re-read replaces it when it lands, without closing the picker.
+        test.run_until_parked();
+        test.update(|cx| {
+            let state = state.read(cx);
+            let root = state.project_root_for(agent).unwrap();
+            assert!(state.file_indexes[&root].is_fresh(Instant::now()));
+            assert!(
+                state
+                    .mention_popup(agent)
+                    .is_some_and(|popup| !popup.loading)
+            );
+        });
+    }
+
+    #[test]
+    fn a_mention_that_does_not_fit_the_draft_is_refused_with_a_notice() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = AppPaths::at(temp.path().join("state"));
+        let test = gpui::TestAppContext::single();
+        let (state, _project, agent, _) = test.update(|cx| workspace(cx, &paths));
+        let draft = "x".repeat(COMPOSER_MAX_CHARACTERS - 10) + " @co";
+        test.update(|cx| {
+            state.update(cx, |state, cx| {
+                let root = state.project_root_for(agent).unwrap();
+                state.adopt_file_index(fresh_index(&root, &PROJECT_FILES), cx);
+                state.draft(agent, cx);
+            });
+        });
+        test.update(|cx| {
+            state.update(cx, |state, cx| {
+                let field = state.draft(agent, cx);
+                field.update(cx, |field, cx| field.set_value(draft.clone(), cx));
+            });
+        });
+        test.update(|cx| {
+            state.update(cx, |state, cx| {
+                assert!(state.mention_popup(agent).is_some());
+                assert!(!state.mention_choose(None, cx), "a cut-off path went in");
+                assert_eq!(state.draft(agent, cx).read(cx).value(), draft);
+                assert!(
+                    state
+                        .composer_notice(agent)
+                        .is_some_and(|notice| notice.contains("prompt limit"))
+                );
+            });
+        });
     }
 
     #[test]

@@ -76,6 +76,9 @@ fn git_listing(root: &Path, limit: usize) -> Option<FileListing> {
     let deleted = git_lines(root, &["ls-files", "-z", "--deleted"]).unwrap_or_default();
     let mut paths: Vec<String> = listed
         .into_iter()
+        // An untracked nested repository is listed as its directory,
+        // `vendor/lib/`, which is not a file and has no name to show.
+        .filter(|path| !path.ends_with('/'))
         .filter(|path| !deleted.contains(path))
         .filter(|path| is_mentionable(path))
         .collect();
@@ -238,6 +241,26 @@ mod tests {
             listing.paths,
             [".gitignore", "README.md", "src/lib.rs", "src/new.rs"]
         );
+    }
+
+    #[test]
+    fn an_untracked_nested_repository_is_not_listed_as_a_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        git(root, &["init", "-q", "-b", "main"]);
+        write(root, "src/lib.rs", "");
+        let nested = root.join("vendor/lib");
+        fs::create_dir_all(&nested).unwrap();
+        git(&nested, &["init", "-q", "-b", "main"]);
+        write(&nested, "inner.rs", "");
+        git(&nested, &["add", "-A"]);
+        git(&nested, &["commit", "-q", "-m", "init"]);
+
+        // `ls-files --others` names the nested checkout `vendor/lib/`, which
+        // the picker drew as a row with no file name.
+        let listing = list_files(root, 100);
+        assert_eq!(listing.source, ListingSource::Git);
+        assert_eq!(listing.paths, ["src/lib.rs"]);
     }
 
     #[test]

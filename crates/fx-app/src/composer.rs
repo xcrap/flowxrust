@@ -804,15 +804,7 @@ fn mention_panel(popup: &MentionPopup, handler: Option<ActionHandler>) -> AnyEle
         );
     }
 
-    let status: SharedString = if popup.rows.is_empty() && popup.loading {
-        "Listing files…".into()
-    } else if popup.rows.is_empty() {
-        format!("No file matches “{}”", popup.query).into()
-    } else if popup.truncated {
-        "Not every file is listed; type more of the name".into()
-    } else {
-        "↑↓ to move · ↩ to insert · ⎋ to close".into()
-    };
+    let status = mention_status(popup);
 
     div()
         .id("composer-mention")
@@ -1493,6 +1485,31 @@ fn queued_editor(field: &Entity<TextField>, handler: &Option<ActionHandler>) -> 
                 )),
         )
         .into_any_element()
+}
+
+/// The picker's last line: what it is doing, or how to work it.
+///
+/// A listing cut at its cap is a prefix in name order, so a file past the cut
+/// is never found however much of its name is typed. The line says the list
+/// is partial rather than telling the reader to type more.
+fn mention_status(popup: &MentionPopup) -> SharedString {
+    let cap = || text_field::grouped(crate::file_mentions::MAX_INDEXED_FILES);
+    if popup.rows.is_empty() && popup.loading {
+        "Listing files…".into()
+    } else if popup.rows.is_empty() && popup.truncated {
+        format!(
+            "No file matches “{}” in the first {} files",
+            popup.query,
+            cap()
+        )
+        .into()
+    } else if popup.rows.is_empty() {
+        format!("No file matches “{}”", popup.query).into()
+    } else if popup.truncated {
+        format!("Only the first {} files by name are listed", cap()).into()
+    } else {
+        "↑↓ to move · ↩ to insert · ⎋ to close".into()
+    }
 }
 
 /// How many prompts the strip is standing in for.
@@ -2542,6 +2559,41 @@ mod tests {
             loading: false,
             truncated: false,
         }
+    }
+
+    #[test]
+    fn a_partial_listing_says_what_is_missing_rather_than_to_type_more() {
+        // The listing is cut at its cap in name order, so a file past it is
+        // never in the list however much of its name is typed.
+        let cut = format!(
+            "{} files",
+            text_field::grouped(crate::file_mentions::MAX_INDEXED_FILES)
+        );
+        let truncated = MentionPopup {
+            truncated: true,
+            ..picker()
+        };
+        let status = mention_status(&truncated);
+        assert!(!status.contains("type more"), "{status}");
+        assert!(status.contains(&cut), "{status}");
+        let unmatched = MentionPopup {
+            rows: Vec::new(),
+            highlighted: None,
+            ..truncated
+        };
+        let status = mention_status(&unmatched);
+        assert!(
+            status.contains("“comp”") && status.contains(&cut),
+            "{status}"
+        );
+        // A whole listing says nothing about a cap.
+        assert!(!mention_status(&picker()).contains(&cut));
+        let none = MentionPopup {
+            rows: Vec::new(),
+            highlighted: None,
+            ..picker()
+        };
+        assert_eq!(mention_status(&none).as_ref(), "No file matches “comp”");
     }
 
     #[test]

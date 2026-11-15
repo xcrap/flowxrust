@@ -62,8 +62,10 @@ pub fn mention_at(text: &str, caret: usize) -> Option<MentionToken> {
 
 /// Whether a path can be mentioned at all: both CLIs read a mention up to the
 /// next whitespace, so a path with any in it would reach the model cut short.
+/// So would one with an `@` in it (`packages/@scope/x.ts`), which
+/// [`mentioned_paths`] ends a mention at, as the CLIs' own pattern does.
 pub fn is_mentionable(path: &str) -> bool {
-    !path.is_empty() && !path.chars().any(char::is_whitespace)
+    !path.is_empty() && !path.chars().any(|c| c.is_whitespace() || c == '@')
 }
 
 /// What a chosen file becomes in the draft: `@path` and a space, so typing
@@ -108,66 +110,98 @@ pub fn mentioned_paths(text: &str) -> Vec<&str> {
 /// skipped between matches and a long path each cost a little, so `comp`
 /// finds `composer.rs` before `src/components/mod.rs`.
 pub fn match_score(query: &str, path: &str) -> Option<u32> {
-    let query: Vec<char> = query.chars().flat_map(char::to_lowercase).collect();
-    if query.is_empty() {
-        return Some(empty_query_score(path));
+    Query::new(query).score(&fold(path))
+}
+
+/// A path as matching reads it: lowercased once, character by character.
+/// Lowercasing can grow a string (`İ` is two characters lowercased), and a
+/// path where it did is matched as written instead, or the positions scored
+/// below would not line up with the path's own.
+fn fold(path: &str) -> String {
+    if path.is_ascii() {
+        return path.to_ascii_lowercase();
     }
-    let path_chars: Vec<char> = path.chars().collect();
-    let lowered: Vec<char> = path_chars.iter().flat_map(|c| c.to_lowercase()).collect();
-    // Lowercasing can grow a string; score on it only when it did not, which
-    // is every ASCII path. Otherwise the positions below would not line up.
-    let lowered = if lowered.len() == path_chars.len() {
+    let lowered: String = path.chars().flat_map(char::to_lowercase).collect();
+    if lowered.chars().count() == path.chars().count() {
         lowered
     } else {
-        path_chars.clone()
-    };
-    let name_start = path_chars
-        .iter()
-        .rposition(|&c| c == '/')
-        .map_or(0, |slash| slash + 1);
+        path.to_string()
+    }
+}
 
-    let mut score: i64 = 100;
-    let mut position = 0usize;
-    let mut previous: Option<usize> = None;
-    for &wanted in &query {
-        let found = lowered[position..]
-            .iter()
-            .position(|&c| c == wanted)
-            .map(|offset| position + offset)?;
-        let boundary = found == 0 || matches!(lowered[found - 1], '/' | '_' | '-' | '.' | ' ');
-        if boundary {
-            score += 10;
+/// What was typed, lowercased once per ranking rather than once per path.
+struct Query {
+    chars: Vec<char>,
+    text: String,
+}
+
+impl Query {
+    fn new(query: &str) -> Self {
+        let chars: Vec<char> = query.chars().flat_map(char::to_lowercase).collect();
+        let text = chars.iter().collect();
+        Self { chars, text }
+    }
+
+    /// [`match_score`] over a path already [`fold`]ed. Allocates nothing: it
+    /// runs for every listed file on every keystroke.
+    fn score(&self, folded: &str) -> Option<u32> {
+        if self.chars.is_empty() {
+            return Some(empty_query_score(folded));
         }
-        if found == name_start {
-            score += 8;
+        let name_byte = folded.rfind('/').map_or(0, |slash| slash + 1);
+        let name_start = folded[..name_byte].chars().count();
+
+        let mut score: i64 = 100;
+        let mut chars = folded.chars().enumerate();
+        // The character before the one being read, for word boundaries.
+        let mut before: Option<char> = None;
+        let mut previous: Option<usize> = None;
+        for &wanted in &self.chars {
+            let (found, preceding) = loop {
+                let (index, c) = chars.next()?;
+                let preceding = before.replace(c);
+                if c == wanted {
+                    break (index, preceding);
+                }
+            };
+            let boundary = preceding.is_none_or(|c| matches!(c, '/' | '_' | '-' | '.' | ' '));
+            if boundary {
+                score += 10;
+            }
+            if found == name_start {
+                score += 8;
+            }
+            if found >= name_start {
+                score += 3;
+            }
+            if previous.is_some_and(|previous| previous + 1 == found) {
+                score += 6;
+            }
+            if let Some(previous) = previous {
+                let gap = found - previous - 1;
+                score -= (gap as i64).min(10);
+            } else {
+                score -= (found as i64 / 4).min(10);
+            }
+            previous = Some(found);
         }
-        if found >= name_start {
-            score += 3;
+
+        let name = &folded[name_byte..];
+        if name == self.text {
+            score += 60;
+        } else if name.starts_with(&self.text) {
+            score += 30;
+        } else if name.contains(&self.text) {
+            score += 15;
         }
-        if previous.is_some_and(|previous| previous + 1 == found) {
-            score += 6;
-        }
-        if let Some(previous) = previous {
-            let gap = found - previous - 1;
-            score -= (gap as i64).min(10);
+        let length = if folded.is_ascii() {
+            folded.len()
         } else {
-            score -= (found as i64 / 4).min(10);
-        }
-        previous = Some(found);
-        position = found + 1;
+            folded.chars().count()
+        };
+        score -= (length as i64 / 8).min(20);
+        Some(score.max(1) as u32)
     }
-
-    let name: String = lowered[name_start..].iter().collect();
-    let typed: String = query.iter().collect();
-    if name == typed {
-        score += 60;
-    } else if name.starts_with(&typed) {
-        score += 30;
-    } else if name.contains(&typed) {
-        score += 15;
-    }
-    score -= (path_chars.len() as i64 / 8).min(20);
-    Some(score.max(1) as u32)
 }
 
 /// With nothing typed, the files nearest the root come first: what a reader
@@ -177,36 +211,70 @@ fn empty_query_score(path: &str) -> u32 {
     1_000u32.saturating_sub(depth * 50)
 }
 
-/// The paths a query ranks, best first and at most `limit`, as positions in
-/// `paths`. Equal scores fall back to the shorter path, then to name order,
-/// so the list is stable across repaints; with nothing typed, name order
-/// alone, so the root's files read as a directory listing.
-pub fn rank(query: &str, paths: &[String], limit: usize) -> Vec<usize> {
-    let mut scored: Vec<(u32, usize)> = paths
-        .iter()
-        .enumerate()
-        .filter_map(|(index, path)| match_score(query, path).map(|score| (score, index)))
-        .collect();
-    let by_length = !query.is_empty();
-    scored.sort_by(|a, b| {
-        b.0.cmp(&a.0)
-            .then_with(|| {
-                if by_length {
-                    paths[a.1].len().cmp(&paths[b.1].len())
-                } else {
-                    Ordering::Equal
-                }
-            })
-            .then_with(|| compare_paths(&paths[a.1], &paths[b.1]))
-    });
-    scored.truncate(limit);
-    scored.into_iter().map(|(_, index)| index).collect()
+/// A folder's files, ready to rank for an `@` on every keystroke.
+///
+/// Each path is folded for matching once, when the listing is built. Ranked
+/// as plain strings, every keystroke lowercased each of a large checkout's
+/// 50,000 paths with five allocations apiece, then sorted every match with
+/// two more per comparison: 30–58 ms a keystroke on the UI thread, in release.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MentionPaths {
+    paths: Vec<String>,
+    folded: Vec<String>,
 }
 
-fn compare_paths(a: &str, b: &str) -> Ordering {
-    a.to_lowercase()
-        .cmp(&b.to_lowercase())
-        .then_with(|| a.cmp(b))
+impl MentionPaths {
+    pub fn new(paths: Vec<String>) -> Self {
+        let folded = paths.iter().map(|path| fold(path)).collect();
+        Self { paths, folded }
+    }
+
+    pub fn paths(&self) -> &[String] {
+        &self.paths
+    }
+
+    pub fn get(&self, index: usize) -> Option<&str> {
+        self.paths.get(index).map(String::as_str)
+    }
+
+    /// The paths a query ranks, best first and at most `limit`, as positions
+    /// in [`Self::paths`]. Equal scores fall back to the shorter path, then to
+    /// name order, so the list is stable across repaints; with nothing typed,
+    /// name order alone, so the root's files read as a directory listing.
+    ///
+    /// Only the best `limit` are put in order. The picker shows a handful of
+    /// rows, and sorting every match of a one-letter query sorted the listing.
+    pub fn rank(&self, query: &str, limit: usize) -> Vec<usize> {
+        if limit == 0 {
+            return Vec::new();
+        }
+        let query = Query::new(query);
+        let mut scored: Vec<(u32, usize)> = self
+            .folded
+            .iter()
+            .enumerate()
+            .filter_map(|(index, folded)| query.score(folded).map(|score| (score, index)))
+            .collect();
+        let by_length = !query.chars.is_empty();
+        let order = |a: &(u32, usize), b: &(u32, usize)| {
+            b.0.cmp(&a.0)
+                .then_with(|| {
+                    if by_length {
+                        self.paths[a.1].len().cmp(&self.paths[b.1].len())
+                    } else {
+                        Ordering::Equal
+                    }
+                })
+                .then_with(|| self.folded[a.1].cmp(&self.folded[b.1]))
+                .then_with(|| self.paths[a.1].cmp(&self.paths[b.1]))
+        };
+        if scored.len() > limit {
+            scored.select_nth_unstable_by(limit - 1, order);
+            scored.truncate(limit);
+        }
+        scored.sort_unstable_by(order);
+        scored.into_iter().map(|(_, index)| index).collect()
+    }
 }
 
 #[cfg(test)]
@@ -262,6 +330,17 @@ mod tests {
     }
 
     #[test]
+    fn a_path_with_an_at_sign_cannot_be_mentioned() {
+        // A mention is read up to the next `@`, so Codex would be handed
+        // `packages/` for a scoped package's file.
+        let path = "packages/@scope/x.ts";
+        assert_ne!(mentioned_paths(&mention_text(path)), [path]);
+        assert!(!is_mentionable(path));
+        assert!(!is_mentionable("@types/index.d.ts"));
+        assert!(is_mentionable("packages/scope/x.ts"));
+    }
+
+    #[test]
     fn the_mentioned_paths_are_read_the_way_the_clis_read_them() {
         assert_eq!(
             mentioned_paths("Compare @src/a.rs with @src/b.rs, then @src/a.rs again"),
@@ -277,9 +356,13 @@ mod tests {
         assert_eq!(mentioned_paths("line\n@a.rs\n@b.rs"), ["a.rs", "b.rs"]);
     }
 
+    fn listing(paths: &[&str]) -> MentionPaths {
+        MentionPaths::new(paths.iter().map(|p| p.to_string()).collect())
+    }
+
     fn ranked<'a>(query: &str, paths: &'a [&str]) -> Vec<&'a str> {
-        let owned: Vec<String> = paths.iter().map(|p| p.to_string()).collect();
-        rank(query, &owned, 10)
+        listing(paths)
+            .rank(query, 10)
             .into_iter()
             .map(|index| paths[index])
             .collect()
@@ -350,9 +433,58 @@ mod tests {
         assert_eq!(ranked("", &paths), ["a.rs", "aa.rs", "b.rs", "c.rs"]);
         // With a query, the shorter of two equal matches comes first.
         assert_eq!(ranked("rs", &["ab.rs", "a.rs"]), ["a.rs", "ab.rs"]);
-        let owned: Vec<String> = paths.iter().map(|p| p.to_string()).collect();
-        assert_eq!(rank("", &owned, 2).len(), 2);
-        assert_eq!(rank("zzz", &owned, 2), Vec::<usize>::new());
+        let listed = listing(&paths);
+        assert_eq!(listed.rank("", 2).len(), 2);
+        assert_eq!(listed.rank("zzz", 2), Vec::<usize>::new());
+        assert_eq!(listed.rank("rs", 0), Vec::<usize>::new());
+    }
+
+    #[test]
+    fn keeping_only_the_best_rows_keeps_the_order_a_full_sort_gives() {
+        // Many equal scores, so the tie-breaks decide which rows are kept.
+        let paths: Vec<String> = (0..500)
+            .map(|i| {
+                format!(
+                    "{}/{}/File{}.rs",
+                    ["src", "Src", "lib"][i % 3],
+                    i % 7,
+                    i % 50
+                )
+            })
+            .collect();
+        let listed = MentionPaths::new(paths);
+        for query in ["", "f", "file1", "src/f", "s"] {
+            let all = listed.rank(query, usize::MAX);
+            for limit in [1, 15, 100] {
+                assert_eq!(
+                    listed.rank(query, limit),
+                    all[..limit.min(all.len())],
+                    "{query:?} at {limit}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_keystroke_ranks_a_large_listing_in_milliseconds() {
+        // The picker re-ranks on every keystroke, on the UI thread, over a
+        // listing of up to 50,000 paths. Before paths were folded once and
+        // only the shown rows sorted, this took 160–230 ms in a debug build.
+        let listed = MentionPaths::new(
+            (0..50_000)
+                .map(|i| format!("Crates/Module{}/src/Sub_{}/File{i}.rs", i % 97, i % 13))
+                .collect(),
+        );
+        for query in ["", "c", "cr", "file4", "sub_3/file"] {
+            let started = std::time::Instant::now();
+            let rows = listed.rank(query, 15);
+            let elapsed = started.elapsed();
+            assert_eq!(rows.len(), 15, "{query:?}");
+            assert!(
+                elapsed < std::time::Duration::from_millis(60),
+                "{query:?} took {elapsed:?} over 50,000 paths"
+            );
+        }
     }
 
     #[test]
@@ -362,5 +494,10 @@ mod tests {
         assert!(match_score("i", "İstanbul/İ.rs").is_none());
         assert!(match_score("stanbul", "İstanbul/x.rs").is_some());
         assert!(match_score("é", "café.rs").is_some());
+        // Folded once, a mixed-case non-ASCII path still matches either case.
+        let listed = listing(&["Docs/Ébauche.md", "İstanbul/x.rs"]);
+        assert_eq!(listed.rank("éba", 5), [0]);
+        assert_eq!(listed.rank("ÉBA", 5), [0]);
+        assert_eq!(listed.rank("stanbul", 5), [1]);
     }
 }

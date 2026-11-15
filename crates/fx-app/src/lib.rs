@@ -1395,6 +1395,7 @@ fn submit_draft(
             state,
             project_root,
             agent,
+            &prompt,
             control,
             !attachments.is_empty(),
             cx,
@@ -1422,10 +1423,12 @@ fn submit_draft(
 }
 
 /// `/compact` and `/goal`, refused where the original refused them.
+/// `command` is the draft as typed, which a failure puts back.
 fn run_slash_command(
     state: &Entity<AppState>,
     project_root: &str,
     agent: Agent,
+    command: &str,
     control: session::ThreadControl,
     has_attachments: bool,
     cx: &mut App,
@@ -1488,11 +1491,7 @@ fn run_slash_command(
         session::Work::control(control.clone())
     };
     state.update(cx, |state, cx| {
-        if let ThreadControl::GoalSet(objective) = &control {
-            state.send_after_goal(agent_id, objective.clone());
-        }
-        state.clear_draft(agent_id, cx);
-        state.set_composer_notice(agent_id, None);
+        state.begin_control(agent_id, command, &control, cx);
     });
     launch_runner(state, project_root, agent, conversation, work, cx);
 }

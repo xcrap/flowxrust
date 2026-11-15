@@ -10,7 +10,7 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use fx_core::policy::mention::{self, MentionToken};
+use fx_core::policy::mention::{MentionPaths, MentionToken};
 use fx_core::services::FileListing;
 use fx_design::components::{MenuItem, MenuModel, MenuSection};
 use fx_design::theme::Layout;
@@ -36,9 +36,9 @@ const SECTION: &str = "files";
 #[derive(Debug)]
 pub struct FileIndex {
     pub root: String,
-    /// Root-relative paths with `/` separators, in name order. Shared, so a
-    /// session re-ranking them copies nothing.
-    pub paths: Arc<Vec<String>>,
+    /// Root-relative paths with `/` separators, in name order, folded for
+    /// ranking as the listing lands rather than on every keystroke.
+    pub paths: MentionPaths,
     pub truncated: bool,
     pub built: Instant,
 }
@@ -47,7 +47,7 @@ impl FileIndex {
     pub fn new(root: impl Into<String>, listing: FileListing) -> Self {
         Self {
             root: root.into(),
-            paths: Arc::new(listing.paths),
+            paths: MentionPaths::new(listing.paths),
             truncated: listing.truncated,
             built: Instant::now(),
         }
@@ -124,15 +124,15 @@ impl MentionSession {
             self.model = MenuModel::new(Vec::new());
             return;
         };
-        self.results = mention::rank(&self.token.query, &index.paths, Layout::MENTION_MAX_ROWS);
+        self.results = index
+            .paths
+            .rank(&self.token.query, Layout::MENTION_MAX_ROWS);
         let previous = self.model.highlighted().map(str::to_string);
         let items = self
             .results
             .iter()
-            .map(|&i| {
-                let path = &index.paths[i];
-                MenuItem::new(path.clone(), file_name(path))
-            })
+            .filter_map(|&i| index.paths.get(i))
+            .map(|path| MenuItem::new(path.to_string(), file_name(path)))
             .collect();
         self.model = MenuModel::new(vec![MenuSection::new(SECTION, items)]);
         let kept = previous.is_some_and(|key| self.model.set_highlight(&key));
@@ -165,7 +165,7 @@ impl MentionSession {
         let paths = self.index.as_ref().map(|index| &index.paths);
         self.results
             .iter()
-            .filter_map(move |&i| paths.and_then(|paths| paths.get(i)).map(String::as_str))
+            .filter_map(move |&i| paths.and_then(|paths| paths.get(i)))
     }
 
     /// What the composer draws.
