@@ -714,7 +714,12 @@ impl Render for RequestPanel {
                     cx.stop_propagation();
                 }
             })
-            .child(dialog(DialogWidth::Regular, header, scrolled, footer))
+            // A question the turn stopped on arrives unasked, as an approval
+            // card does, so it enters as one: a `BASE` fade, rising into place.
+            .child(crate::approvals::arriving_card(
+                SharedString::from(format!("provider-request-entrance:{}", self.request.id)),
+                dialog(DialogWidth::Regular, header, scrolled, footer),
+            ))
     }
 }
 
