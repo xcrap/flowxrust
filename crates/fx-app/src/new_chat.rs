@@ -2,9 +2,12 @@
 
 use crate::{AppState, text_field::TextField, workspace_ui};
 use fx_core::AgentConfiguration;
-use fx_design::components::{ButtonStyle, button, choice_row, divider, panel};
+use fx_design::components::{
+    ButtonStyle, DialogAction, DialogClose, DialogHeader, DialogWidth, choice_row, cycle_focus,
+    dialog, dialog_body, dialog_footer, dialog_scrim,
+};
 use fx_design::styled::{FxStyled, px_len};
-use fx_design::theme::{Colors, Layout, Spacing, global};
+use fx_design::theme::{Colors, Spacing, global};
 use gpui::{
     App, Context, Entity, FocusHandle, MouseButton, Render, Subscription, Task, Window, div,
     prelude::*,
@@ -20,6 +23,9 @@ pub(crate) struct NewChat {
     worktree: bool,
     branch: Entity<TextField>,
     focus: FocusHandle,
+    cancel_focus: FocusHandle,
+    confirm_focus: FocusHandle,
+    close_focus: FocusHandle,
     error: Option<String>,
     creating: bool,
     prepared: Option<fx_core::models::agent::ChatWorkspace>,
@@ -66,6 +72,9 @@ pub(crate) fn open(
             worktree: false,
             branch,
             focus: cx.focus_handle(),
+            cancel_focus: cx.focus_handle(),
+            confirm_focus: cx.focus_handle(),
+            close_focus: cx.focus_handle(),
             error: None,
             creating: false,
             prepared: None,
@@ -186,10 +195,7 @@ impl Render for NewChat {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = global::current();
         let editable = !self.creating && self.prepared.is_none();
-        let body = div()
-            .flex().flex_col()
-            .gap(px_len(Spacing::MD)).p(px_len(Spacing::XL))
-            .child(div().fx_title3().text_color(Colors::fg(&theme)).child("New conversation"))
+        let body = dialog_body()
             .child(choice_row(
                 "Current folder",
                 "Use the project's existing checkout and changes.",
@@ -217,20 +223,25 @@ impl Render for NewChat {
             .children(self.error.clone().map(|error| {
                 div().fx_caption().text_color(Colors::fg(&theme)).child(error)
             }));
-        let content = div().flex().flex_col().child(body).child(divider()).child(
-            div()
-                .flex()
-                .justify_end()
-                .gap(px_len(Spacing::SM))
-                .px(px_len(Spacing::XL))
-                .py(px_len(Spacing::MD))
-                .child(button(
-                    "Cancel",
-                    ButtonStyle::Secondary,
-                    !self.creating,
-                    cx.listener(|this, _, window, cx| this.close(window, cx)),
-                ))
-                .child(button(
+        let can_confirm =
+            !self.creating && (!self.worktree || !self.branch.read(cx).value().trim().is_empty());
+        let this = cx.entity();
+        let (close, cancel, confirm) = (this.clone(), this.clone(), this.clone());
+        let header = DialogHeader::new("New conversation").close(
+            DialogClose::new("Close", move |window, cx| {
+                close.update(cx, |this, cx| this.close(window, cx));
+            })
+            .focus(&self.close_focus),
+        );
+        let footer = dialog_footer(
+            None,
+            [
+                DialogAction::new("Cancel", ButtonStyle::Secondary, move |window, cx| {
+                    cancel.update(cx, |this, cx| this.close(window, cx));
+                })
+                .enabled(!self.creating)
+                .focus(&self.cancel_focus),
+                DialogAction::new(
                     if self.creating {
                         "Creating worktree…"
                     } else if self.prepared.is_some() {
@@ -239,44 +250,50 @@ impl Render for NewChat {
                         "Create conversation"
                     },
                     ButtonStyle::Primary,
-                    !self.creating
-                        && (!self.worktree || !self.branch.read(cx).value().trim().is_empty()),
-                    cx.listener(|this, _, window, cx| this.confirm(window, cx)),
-                )),
+                    move |window, cx| {
+                        confirm.update(cx, |this, cx| this.confirm(window, cx));
+                    },
+                )
+                .enabled(can_confirm)
+                .focus(&self.confirm_focus),
+            ],
         );
-        div()
-            .id("new-chat-dialog")
+        let mut order = Vec::new();
+        if self.worktree && editable {
+            order.push(self.branch.read(cx).focus_handle());
+        }
+        if !self.creating {
+            order.push(self.cancel_focus.clone());
+        }
+        if can_confirm {
+            order.push(self.confirm_focus.clone());
+        }
+        order.push(self.close_focus.clone());
+        dialog_scrim("new-chat-dialog")
             .debug_selector(|| "new-chat-dialog".into())
-            .absolute()
-            .size_full()
-            .occlude()
             .track_focus(&self.focus)
-            .bg(Colors::overlay(&theme))
-            .flex()
-            .items_center()
-            .justify_center()
-            .p(px_len(Spacing::XL))
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
             .on_mouse_down(MouseButton::Right, |_, _, cx| cx.stop_propagation())
-            .capture_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, window, cx| {
-                match event.keystroke.key.as_str() {
-                    "escape" => {
-                        this.close(window, cx);
+            .capture_key_down(
+                cx.listener(move |this, event: &gpui::KeyDownEvent, window, cx| {
+                    if cycle_focus(&order, event, window) {
                         cx.stop_propagation();
+                        return;
                     }
-                    "enter" => {
-                        this.confirm(window, cx);
-                        cx.stop_propagation();
+                    match event.keystroke.key.as_str() {
+                        "escape" => {
+                            this.close(window, cx);
+                            cx.stop_propagation();
+                        }
+                        "enter" => {
+                            this.confirm(window, cx);
+                            cx.stop_propagation();
+                        }
+                        _ => {}
                     }
-                    _ => {}
-                }
-            }))
-            .child(
-                div()
-                    .w(px_len(Layout::DIALOG_WIDTH))
-                    .max_w_full()
-                    .child(panel(content)),
+                }),
             )
+            .child(dialog(DialogWidth::Compact, header, body, footer))
     }
 }
 

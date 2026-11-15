@@ -26,11 +26,12 @@ use std::path::{Path, PathBuf};
 
 use fx_design::components::surface::banner;
 use fx_design::components::{
-    BadgeTone, ButtonStyle, IconButtonProps, badge, button, divider, icon_button, panel,
+    BadgeTone, ButtonStyle, DialogAction, DialogClose, DialogHeader, DialogWidth, badge,
+    cycle_focus, dialog, dialog_body, dialog_button, dialog_footer, dialog_scrim,
 };
 use fx_design::icon::Icon;
 use fx_design::styled::{FxStyled, px_len};
-use fx_design::theme::{Colors, IconSize, Layout, Shadow, Spacing, TextRole, Theme, global};
+use fx_design::theme::{Colors, IconSize, Spacing, TextRole, Theme, global};
 use gpui::prelude::*;
 use gpui::{
     AnyElement, App, Context, Entity, FocusHandle, KeyDownEvent, MouseButton, Render, SharedString,
@@ -215,6 +216,11 @@ pub struct ProjectPicker {
     /// Choosing one of these focuses that project rather than adding it again,
     /// and the sheet says so before the reader commits to it.
     open_roots: Vec<PathBuf>,
+    /// The sheet's buttons, so the keyboard can reach them.
+    browse_focus: FocusHandle,
+    cancel_focus: FocusHandle,
+    add_focus: FocusHandle,
+    close_focus: FocusHandle,
     /// Keeps the field observation alive; dropping it stops re-validation.
     _observation: Option<Subscription>,
 }
@@ -248,6 +254,10 @@ impl ProjectPicker {
                 browse_error: None,
                 settled: false,
                 open_roots: Vec::new(),
+                browse_focus: cx.focus_handle(),
+                cancel_focus: cx.focus_handle(),
+                add_focus: cx.focus_handle(),
+                close_focus: cx.focus_handle(),
                 _observation: None,
             };
             picker._observation = Some(cx.observe(
@@ -408,13 +418,61 @@ impl Render for ProjectPicker {
             return div().w(px(0.0)).h(px(0.0)).into_any_element();
         }
 
-        let backdrop = div()
-            .absolute()
-            .size_full()
-            // `overlay`, not `overlay_light`: this is the token layer's
-            // strongest wash, and a scrim over the whole window is the
-            // strongest thing it is asked to do.
-            .bg(Colors::overlay(&theme))
+        let for_close = this.clone();
+        let header = DialogHeader::new("Add project")
+            .subtitle("Choose a local folder for this project.")
+            .close(
+                DialogClose::new("Close project picker", move |window, cx| {
+                    for_close.update(cx, |picker, cx| {
+                        picker.cancel(window, cx);
+                        cx.notify();
+                    });
+                })
+                .focus(&self.close_focus),
+            );
+        let for_cancel = this.clone();
+        let for_add = this.clone();
+        let footer = dialog_footer(
+            None,
+            [
+                DialogAction::new("Cancel", ButtonStyle::Secondary, move |window, cx| {
+                    for_cancel.update(cx, |picker, cx| {
+                        picker.cancel(window, cx);
+                        cx.notify();
+                    });
+                })
+                .focus(&self.cancel_focus),
+                DialogAction::new(
+                    if self.is_already_open() {
+                        "Show project"
+                    } else {
+                        "Add project"
+                    },
+                    ButtonStyle::Primary,
+                    move |window, cx| {
+                        for_add.update(cx, |picker, cx| {
+                            picker.confirm(window, cx);
+                            cx.notify();
+                        });
+                    },
+                )
+                .enabled(self.can_add())
+                .focus(&self.add_focus),
+            ],
+        );
+        // The keyboard's way through the sheet, in reading order, skipping
+        // what cannot be pressed.
+        let mut order = vec![self.field.read(cx).focus_handle()];
+        if !self.browsing {
+            order.push(self.browse_focus.clone());
+        }
+        order.push(self.cancel_focus.clone());
+        if self.can_add() {
+            order.push(self.add_focus.clone());
+        }
+        order.push(self.close_focus.clone());
+
+        dialog_scrim("project-picker-overlay")
             .on_mouse_down(MouseButton::Left, {
                 let this = this.clone();
                 move |_event, window, cx| {
@@ -423,209 +481,103 @@ impl Render for ProjectPicker {
                         cx.notify();
                     });
                 }
-            });
-
-        let sheet = div()
-            .w(px_len(Layout::DIALOG_WIDTH))
-            .max_w_full()
-            // Padding around the panel so the shadow has somewhere to land: a
-            // styled element's shadow is clipped to the element's own bounds,
-            // which is why the menus take an edge instead.
-            .p(px_len(Spacing::SM))
-            .fx_shadow(Shadow::dialog(Colors::overlay(&theme)))
-            // Swallow the click that lands on the sheet's own padding, so
-            // reaching for the field does not read as reaching past the sheet.
-            .on_mouse_down(MouseButton::Left, |_event, _window, cx| {
-                cx.stop_propagation();
             })
-            .child(panel(
+            // Return is captured rather than bubbled because the field claims
+            // `enter` itself — that is how a single-line field submits — and
+            // stops propagation on the way up. The capture phase runs the
+            // other way, so this is the only place that both sees the key and
+            // still holds a window.
+            .capture_key_down({
+                let this = this.clone();
+                move |event: &KeyDownEvent, window, cx| {
+                    if cycle_focus(&order, event, window) {
+                        cx.stop_propagation();
+                        return;
+                    }
+                    let cancel = event.keystroke.key == "escape";
+                    let confirm = event.keystroke.key == "enter" && this.read(cx).can_add();
+                    if !cancel && !confirm {
+                        return;
+                    }
+                    cx.stop_propagation();
+                    this.update(cx, |picker, cx| {
+                        if cancel {
+                            picker.cancel(window, cx);
+                        } else {
+                            picker.confirm(window, cx);
+                        }
+                        cx.notify();
+                    });
+                }
+            })
+            .child(dialog(
+                DialogWidth::Compact,
+                header,
                 self.body(
                     &theme,
                     &this,
                     (window.viewport_size().height - px(Spacing::HUGE * 4.0))
                         .max(px(Spacing::HUGE * 2.0)),
                 ),
-            ));
-
-        div()
-            .id("project-picker-overlay")
-            .occlude()
-            .absolute()
-            .size_full()
-            .child(backdrop)
-            .child(
-                div()
-                    .size_full()
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    // Return is captured rather than bubbled because the field
-                    // claims `enter` itself — that is how a single-line field
-                    // submits — and stops propagation on the way up. The
-                    // capture phase runs the other way, so this is the only
-                    // place that both sees the key and still holds a window.
-                    .capture_key_down({
-                        let this = this.clone();
-                        move |event: &KeyDownEvent, window, cx| {
-                            let cancel = event.keystroke.key == "escape";
-                            let confirm = event.keystroke.key == "enter" && this.read(cx).can_add();
-                            if !cancel && !confirm {
-                                return;
-                            }
-                            cx.stop_propagation();
-                            this.update(cx, |picker, cx| {
-                                if cancel {
-                                    picker.cancel(window, cx);
-                                } else {
-                                    picker.confirm(window, cx);
-                                }
-                                cx.notify();
-                            });
-                        }
-                    })
-                    .child(sheet),
-            )
+                footer,
+            ))
             .into_any_element()
     }
 }
 
 impl ProjectPicker {
-    /// The panel's contents: what is being asked for, the field, the verdict,
-    /// and the two ways out.
+    /// The sheet's body: what is being asked for, the field, and the verdict.
+    /// It scrolls past `max_body_height`, while the header and the footer stay.
     fn body(
         &self,
         theme: &Theme,
         this: &Entity<ProjectPicker>,
         max_body_height: gpui::Pixels,
     ) -> impl IntoElement {
-        let for_cancel = this.clone();
-        let for_add = this.clone();
-        let for_close = this.clone();
         let for_browse = this.clone();
-
         div()
+            .id("project-picker-content")
             .w_full()
-            .flex()
-            .flex_col()
+            .min_h_0()
+            .max_h(max_body_height)
+            .overflow_y_scroll()
             .child(
-                div()
-                    .w_full()
-                    .flex()
-                    .items_center()
-                    .justify_between()
-                    .gap(px_len(Spacing::MD))
-                    .px(px_len(Spacing::XXL))
-                    .py(px_len(Spacing::XL))
-                    .flex_shrink_0()
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .flex()
-                            .flex_col()
-                            .gap(px_len(Spacing::XXS))
-                            .child(div().fx_title2().child("Add project"))
-                            .child(
-                                div()
-                                    .fx_caption()
-                                    .text_color(Colors::fg_secondary(theme))
-                                    .child("Choose a local folder for this project."),
-                            ),
-                    )
-                    .child(icon_button(
-                        IconButtonProps::new(Icon::XMARK, "Close project picker"),
-                        move |_, window, cx| {
-                            for_close.update(cx, |picker, cx| {
-                                picker.cancel(window, cx);
-                                cx.notify();
-                            });
-                        },
-                    )),
-            )
-            .child(divider())
-            .child(
-                div()
-                    .id("project-picker-content")
-                    .w_full()
-                    .min_h_0()
-                    .max_h(max_body_height)
-                    .overflow_y_scroll()
+                dialog_body()
+                    .child(div().fx_body_medium().child("Folder path"))
                     .child(
                         div()
                             .w_full()
+                            .min_w_0()
                             .flex()
-                            .flex_col()
-                            .gap(px_len(Spacing::MD))
-                            .p(px_len(Spacing::XXL))
-                            .child(div().fx_body_medium().child("Folder path"))
-                            .child(
-                                div()
-                                    .w_full()
-                                    .min_w_0()
-                                    .flex()
-                                    .items_center()
-                                    .gap(px_len(Spacing::SM))
-                                    .child(div().flex_1().min_w_0().child(self.field.clone()))
-                                    .child(button(
-                                        "Browse…",
-                                        ButtonStyle::Secondary,
-                                        !self.browsing,
-                                        move |_, _, cx| for_browse.update(cx, |picker, cx| picker.browse(cx)),
-                                    )),
-                            )
-                            .child(
-                                div()
-                                    .fx_caption()
-                                    .text_color(Colors::fg_secondary(theme))
-                                    .child("Browse for a folder or enter its full path. Git repositories are detected automatically."),
-                            )
-                            .when_some(self.browse_error.as_ref(), |body, error| {
-                                body.child(banner(
-                                    Colors::error_muted(theme),
-                                    Colors::fg(theme),
-                                    div().fx_caption().child(SharedString::from(error.clone())),
-                                ))
-                            })
-                            .child(self.verdict_row(theme)),
-                    ),
-            )
-            .child(divider())
-            .child(
-                div()
-                    .w_full()
-                    .flex()
-                    .items_center()
-                    .justify_end()
-                    .gap(px_len(Spacing::SM))
-                    .px(px_len(Spacing::XXL))
-                    .py(px_len(Spacing::LG))
-                    .flex_shrink_0()
-                    .child(button(
-                        "Cancel",
-                        ButtonStyle::Secondary,
-                        true,
-                        move |_event, window, cx| {
-                            for_cancel.update(cx, |picker, cx| {
-                                picker.cancel(window, cx);
-                                cx.notify();
-                            });
-                        },
-                    ))
-                    .child(button(
-                        if self.is_already_open() {
-                            "Show project"
-                        } else {
-                            "Add project"
-                        },
-                        ButtonStyle::Primary,
-                        self.can_add(),
-                        move |_event, window, cx| {
-                            for_add.update(cx, |picker, cx| {
-                                picker.confirm(window, cx);
-                                cx.notify();
-                            });
-                        },
-                    )),
+                            .items_center()
+                            .gap(px_len(Spacing::SM))
+                            .child(div().flex_1().min_w_0().child(self.field.clone()))
+                            .child(dialog_button(
+                                DialogAction::new(
+                                    "Browse…",
+                                    ButtonStyle::Secondary,
+                                    move |_, cx| {
+                                        for_browse.update(cx, |picker, cx| picker.browse(cx))
+                                    },
+                                )
+                                .enabled(!self.browsing)
+                                .focus(&self.browse_focus),
+                            )),
+                    )
+                    .child(
+                        div()
+                            .fx_caption()
+                            .text_color(Colors::fg_secondary(theme))
+                            .child("Browse for a folder or enter its full path. Git repositories are detected automatically."),
+                    )
+                    .when_some(self.browse_error.as_ref(), |body, error| {
+                        body.child(banner(
+                            Colors::error_muted(theme),
+                            Colors::fg(theme),
+                            div().fx_caption().child(SharedString::from(error.clone())),
+                        ))
+                    })
+                    .child(self.verdict_row(theme)),
             )
     }
 

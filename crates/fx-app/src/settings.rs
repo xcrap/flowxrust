@@ -20,16 +20,17 @@ use std::path::{Path, PathBuf};
 use fx_core::services::runtime::{BinaryHealth, BinarySpec, expand_glob};
 use fx_design::components::segmented::{SegmentedOption, segmented_control};
 use fx_design::components::{
-    BadgeTone, ButtonStyle, DividerAxis, IconButtonProps, badge, breadcrumb, button,
-    button_with_icon, divider, divider_with_axis, icon_button, navigation_button, settings_group,
+    BadgeTone, ButtonStyle, DialogAction, DialogClose, DividerAxis, badge, breadcrumb,
+    button_with_icon, cycle_focus, dialog_close_button, dialog_footer, dialog_scrim,
+    dialog_surface, divider, divider_with_axis, navigation_button, settings_group,
     settings_nav_label, settings_row, settings_row_custom, settings_row_dense, settings_search,
     settings_section, settings_section_with_action, tooltip,
 };
 use fx_design::icon::Icon;
 use fx_design::styled::{FxStyled, px_len};
 use fx_design::theme::{
-    AccentColor, AppearanceMode, BaseTone, BorderWidth, Colors, Layout, Radii, Shadow, Spacing,
-    TextRole, TextSizePreset, Theme, global,
+    AccentColor, AppearanceMode, BaseTone, Colors, Layout, Radii, Spacing, TextRole,
+    TextSizePreset, Theme, global,
 };
 use gpui::prelude::*;
 use gpui::{
@@ -563,6 +564,10 @@ pub struct SettingsSheet {
     draft: SettingsDraft,
     rows: Vec<HealthRow>,
     focus: FocusHandle,
+    /// The sheet's own buttons, so the keyboard can reach them.
+    close_focus: FocusHandle,
+    reset_focus: FocusHandle,
+    done_focus: FocusHandle,
     on_apply: ApplyHandler,
     on_dismiss: DismissHandler,
     on_recheck: RecheckHandler,
@@ -618,6 +623,9 @@ impl SettingsSheet {
                 draft,
                 rows: Vec::new(),
                 focus,
+                close_focus: cx.focus_handle(),
+                reset_focus: cx.focus_handle(),
+                done_focus: cx.focus_handle(),
                 on_apply,
                 on_dismiss,
                 on_recheck,
@@ -937,22 +945,6 @@ impl Render for SettingsSheet {
             return div().w(px(0.0)).h(px(0.0)).into_any_element();
         }
 
-        let backdrop = div()
-            .absolute()
-            .size_full()
-            // `overlay`, not `overlay_light`: a scrim over the whole window is
-            // the strongest thing the token layer's overlays are asked to do.
-            .bg(Colors::overlay(&theme))
-            .on_mouse_down(MouseButton::Left, {
-                let this = this.clone();
-                move |_event, window, cx| {
-                    this.update(cx, |sheet, cx| {
-                        sheet.dismiss(window, cx);
-                        cx.notify();
-                    });
-                }
-            });
-
         // As large as a preferences window, and never closer to the window's
         // edge than a margin: the backdrop around it is how the reader backs
         // out with the pointer.
@@ -963,97 +955,90 @@ impl Render for SettingsSheet {
         let height = px(Layout::SETTINGS_WINDOW_HEIGHT)
             .min(viewport.height - px(Spacing::HUGE * 2.0))
             .max(px(Spacing::HUGE * 4.0));
-        let sheet = div()
-            .w(width)
-            // Padding around the panel so the shadow has somewhere to land: a
-            // styled element's shadow is clipped to the element's own bounds.
-            .p(px_len(Spacing::SM))
-            .fx_shadow(Shadow::dialog(Colors::overlay(&theme)))
-            // Swallow the click that lands on the sheet's own padding, so
-            // reaching for a control does not read as backing out.
-            .on_mouse_down(MouseButton::Left, |_event, _window, cx| {
-                cx.stop_propagation();
-            })
-            .child(
-                div()
-                    .w_full()
-                    .h(height - px(Spacing::SM * 2.0))
-                    .bg(Colors::content_bg(&theme))
-                    .rounded(px_len(Radii::XL))
-                    .border(px_len(BorderWidth::HAIRLINE))
-                    .border_color(Colors::border_medium(&theme))
-                    .child(self.body(&this, cx)),
-            );
+        // The keyboard's way around the sheet's own controls: the search,
+        // the close button, then the footer.
+        let mut order = vec![
+            self.search.read(cx).focus_handle(),
+            self.close_focus.clone(),
+        ];
+        if self.can_reset() {
+            order.push(self.reset_focus.clone());
+        }
+        order.push(self.done_focus.clone());
 
-        div()
-            .id("settings-overlay")
-            .occlude()
-            .absolute()
-            .size_full()
-            .child(backdrop)
-            .child(
-                div()
-                    .size_full()
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    // `.id` upgrades to `Stateful<Div>`, which is what carries
-                    // `track_focus` and `on_key_down` in GPUI 0.2.2.
-                    .id(SHEET_ID)
-                    .track_focus(&self.focus)
-                    .capture_key_down({
-                        let this = this.clone();
-                        move |event: &KeyDownEvent, window, cx| {
-                            if this.read(cx).settings_menu_is_open(cx) {
-                                // The app's one menu layer owns Escape, Enter,
-                                // and arrow keys until this picker closes.
-                                return;
-                            }
-                            let sheet = this.read(cx);
-                            let search = sheet.search.read(cx);
-                            let searching = search.focus_handle().is_focused(window);
-                            let action = match event.keystroke.key.as_str() {
-                                // A search is cleared before it is left.
-                                "escape" if searching && !search.value().is_empty() => {
-                                    Some(Action::ClearSearch)
-                                }
-                                "escape" => Some(Action::Dismiss),
-                                "enter" if searching => Some(Action::OpenFirstMatch),
-                                // Searching archives must not submit the settings.
-                                "enter" if sheet.page != SettingsPage::Archives => {
-                                    Some(Action::Confirm)
-                                }
-                                // Only while no field has the keys, so a slash
-                                // can still be typed into one.
-                                "/" if !event.keystroke.modifiers.modified()
-                                    && sheet.focus.is_focused(window) =>
-                                {
-                                    Some(Action::Search)
-                                }
-                                _ => None,
-                            };
-                            let Some(action) = action else {
-                                // Not claimed: swallowing Tab while the sheet
-                                // had focus would strand the reader in it.
-                                return;
-                            };
-                            cx.stop_propagation();
-                            this.update(cx, |sheet, cx| {
-                                match action {
-                                    Action::Dismiss => sheet.dismiss(window, cx),
-                                    Action::Confirm => sheet.confirm(window, cx),
-                                    Action::ClearSearch => sheet.clear_search(cx),
-                                    Action::OpenFirstMatch => sheet.open_first_match(window, cx),
-                                    Action::Search => {
-                                        sheet.search.read(cx).focus_handle().focus(window)
-                                    }
-                                }
-                                cx.notify();
-                            });
+        // The dialog's frame, filled with the content background: its pages
+        // carry their own cards, which are drawn on `bg`.
+        let sheet = dialog_surface(f32::from(width))
+            .h(height)
+            .bg(Colors::content_bg(&theme))
+            // `.id` upgrades to `Stateful<Div>`, which is what carries
+            // `track_focus` and `on_key_down` in GPUI 0.2.2.
+            .id(SHEET_ID)
+            .track_focus(&self.focus)
+            .capture_key_down({
+                let this = this.clone();
+                move |event: &KeyDownEvent, window, cx| {
+                    if this.read(cx).settings_menu_is_open(cx) {
+                        // The app's one menu layer owns Escape, Enter,
+                        // and arrow keys until this picker closes.
+                        return;
+                    }
+                    if cycle_focus(&order, event, window) {
+                        cx.stop_propagation();
+                        return;
+                    }
+                    let sheet = this.read(cx);
+                    let search = sheet.search.read(cx);
+                    let searching = search.focus_handle().is_focused(window);
+                    let action = match event.keystroke.key.as_str() {
+                        // A search is cleared before it is left.
+                        "escape" if searching && !search.value().is_empty() => {
+                            Some(Action::ClearSearch)
                         }
-                    })
-                    .child(sheet),
-            )
+                        "escape" => Some(Action::Dismiss),
+                        "enter" if searching => Some(Action::OpenFirstMatch),
+                        // Searching archives must not submit the settings.
+                        "enter" if sheet.page != SettingsPage::Archives => Some(Action::Confirm),
+                        // Only while no field has the keys, so a slash
+                        // can still be typed into one.
+                        "/" if !event.keystroke.modifiers.modified()
+                            && sheet.focus.is_focused(window) =>
+                        {
+                            Some(Action::Search)
+                        }
+                        _ => None,
+                    };
+                    let Some(action) = action else {
+                        // Not claimed: the arrows and every other key
+                        // belong to whatever holds the focus.
+                        return;
+                    };
+                    cx.stop_propagation();
+                    this.update(cx, |sheet, cx| {
+                        match action {
+                            Action::Dismiss => sheet.dismiss(window, cx),
+                            Action::Confirm => sheet.confirm(window, cx),
+                            Action::ClearSearch => sheet.clear_search(cx),
+                            Action::OpenFirstMatch => sheet.open_first_match(window, cx),
+                            Action::Search => sheet.search.read(cx).focus_handle().focus(window),
+                        }
+                        cx.notify();
+                    });
+                }
+            })
+            .child(self.body(&this, cx));
+
+        dialog_scrim("settings-overlay")
+            .on_mouse_down(MouseButton::Left, {
+                let this = this.clone();
+                move |_event, window, cx| {
+                    this.update(cx, |sheet, cx| {
+                        sheet.dismiss(window, cx);
+                        cx.notify();
+                    });
+                }
+            })
+            .child(sheet)
             .into_any_element()
     }
 }
@@ -1109,57 +1094,40 @@ impl SettingsSheet {
             .h(px_len(Layout::PANE_HEADER_HEIGHT + Spacing::SM))
             .flex_shrink_0()
             .child(breadcrumb(&["Settings".into(), page.label().into()]))
-            .child(icon_button(
-                IconButtonProps::new(Icon::XMARK, "Close settings"),
-                move |_, window, cx| {
+            .child(dialog_close_button(
+                DialogClose::new("Close settings", move |window, cx| {
                     for_close.update(cx, |sheet, cx| {
                         sheet.dismiss(window, cx);
                         cx.notify();
                     });
-                },
+                })
+                .focus(&self.close_focus),
             ));
-        let footer = div()
-            .w_full()
-            .flex()
-            .items_center()
-            .justify_between()
-            .gap(px_len(Spacing::MD))
-            .px(px_len(Spacing::XXL))
-            .py(px_len(Spacing::MD))
-            .flex_shrink_0()
-            .child(
+        let footer = dialog_footer(
+            Some(
                 div()
                     .min_w_0()
                     .fx_caption()
                     .text_color(Colors::fg_tertiary(&theme))
-                    .when(dirty, |note| note.child("Unsaved changes")),
-            )
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap(px_len(Spacing::SM))
-                    .child(button_with_icon(
-                        "Reset changes",
-                        Some(Icon::ARROW_COUNTERCLOCKWISE),
-                        ButtonStyle::Ghost,
-                        self.can_reset(),
-                        move |_, _, cx| {
-                            for_reset.update(cx, |sheet, cx| sheet.reset(cx));
-                        },
-                    ))
-                    .child(button(
-                        "Done",
-                        ButtonStyle::Primary,
-                        true,
-                        move |_, window, cx| {
-                            for_done.update(cx, |sheet, cx| {
-                                sheet.confirm(window, cx);
-                                cx.notify();
-                            });
-                        },
-                    )),
-            );
+                    .when(dirty, |note| note.child("Unsaved changes"))
+                    .into_any_element(),
+            ),
+            [
+                DialogAction::new("Reset changes", ButtonStyle::Ghost, move |_, cx| {
+                    for_reset.update(cx, |sheet, cx| sheet.reset(cx));
+                })
+                .icon(Icon::ARROW_COUNTERCLOCKWISE)
+                .enabled(self.can_reset())
+                .focus(&self.reset_focus),
+                DialogAction::new("Done", ButtonStyle::Primary, move |window, cx| {
+                    for_done.update(cx, |sheet, cx| {
+                        sheet.confirm(window, cx);
+                        cx.notify();
+                    });
+                })
+                .focus(&self.done_focus),
+            ],
+        );
         div()
             .size_full()
             .min_w_0()
@@ -2596,8 +2564,8 @@ mod tests {
 
     #[test]
     fn a_key_the_sheet_does_not_use_is_left_alone() {
-        // Stopping propagation on every key would strand the reader: Tab would
-        // stop moving focus while the sheet had it.
+        // Stopping propagation on every key would strand the reader: the
+        // arrows would stop reaching the control that holds the focus.
         let mut mounted = mount();
         mounted.press("down");
 

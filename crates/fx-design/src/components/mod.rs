@@ -12,6 +12,7 @@ pub mod checklist;
 pub mod collapsible;
 pub mod context_menu;
 pub mod context_meter;
+pub mod dialog;
 pub mod menu;
 pub mod menu_model;
 pub mod palette;
@@ -38,6 +39,12 @@ pub use turn_action::{TurnAction, turn_action_button};
 pub use collapsible::collapsible;
 pub use context_menu::{
     ContextRegion, ContextRegistry, context_frame, context_region, handle_root_right_click, open_at,
+};
+pub use dialog::{
+    DIALOG_TITLE_ROLE, DialogAction, DialogClose, DialogHandler, DialogHeader, DialogPalette,
+    DialogWidth, cycle_focus, dialog, dialog_body, dialog_button, dialog_close_button,
+    dialog_footer, dialog_header, dialog_palette, dialog_scrim, dialog_surface, dialog_title,
+    next_focus_index,
 };
 pub use menu::{
     MenuLayer, MenuTrigger, RowPalette, menu_layer_overlay, menu_overlay, menu_surface,

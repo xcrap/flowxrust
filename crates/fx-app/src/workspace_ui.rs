@@ -4,10 +4,13 @@ use std::sync::mpsc;
 
 use fx_agent::provider::{UserInputRequest, UserResponse};
 use fx_core::services::runtime::{BinaryHealth, BinarySpec, RuntimeDiscovery, all_specs};
-use fx_design::components::{ButtonStyle, button, choice_row, divider, panel};
+use fx_design::components::{
+    ButtonStyle, DialogAction, DialogHeader, DialogWidth, choice_row, cycle_focus, dialog,
+    dialog_body, dialog_footer, dialog_scrim, divider,
+};
 use fx_design::icon::Icon;
 use fx_design::styled::{FxStyled, px_len};
-use fx_design::theme::{Colors, IconSize, Layout, Radii, Shadow, Spacing, TextRole, global};
+use fx_design::theme::{Colors, Radii, Spacing, TextRole, global};
 use gpui::prelude::*;
 use gpui::{App, Context, Entity, SharedString, Subscription, Window, div, px};
 use uuid::Uuid;
@@ -399,6 +402,8 @@ pub struct RequestPanel {
     _observations: Vec<Subscription>,
     sent: bool,
     focus: gpui::FocusHandle,
+    refuse_focus: gpui::FocusHandle,
+    accept_focus: gpui::FocusHandle,
     focused: bool,
 }
 
@@ -434,6 +439,8 @@ impl RequestPanel {
                 _observations: observations,
                 sent: false,
                 focus: cx.focus_handle(),
+                refuse_focus: cx.focus_handle(),
+                accept_focus: cx.focus_handle(),
                 focused: false,
             }
         })
@@ -532,37 +539,12 @@ impl Render for RequestPanel {
             Some(source) => format!("MCP server “{source}” · {title}"),
             None => title,
         };
-        let icon = Icon::QUESTIONMARK_BUBBLE_FILL;
-        let header = div()
-            .w_full()
-            .flex()
-            .items_center()
-            .gap(px_len(Spacing::MD))
-            .px(px_len(Spacing::XXL))
-            .py(px_len(Spacing::XL))
-            .flex_shrink_0()
-            .child(icon.render(IconSize::Large, Colors::fg_secondary(&theme), &theme))
-            .child(
-                div()
-                    .flex_1()
-                    .min_w_0()
-                    .flex()
-                    .flex_col()
-                    .gap(px_len(Spacing::XXS))
-                    .child(div().fx_title2().child(heading))
-                    .child(
-                        div()
-                            .fx_caption()
-                            .text_color(Colors::fg_secondary(&theme))
-                            .child(SharedString::from(title)),
-                    ),
-            );
-        let mut body = div()
-            .w_full()
-            .flex()
-            .flex_col()
-            .gap(px_len(Spacing::XL))
-            .p(px_len(Spacing::XXL));
+        // No close button: the provider is waiting on an answer, and the
+        // footer says which refusal this is, Decline or Cancel.
+        let header = DialogHeader::new(heading)
+            .subtitle(title)
+            .icon(Icon::QUESTIONMARK_BUBBLE_FILL);
+        let mut body = dialog_body().gap(px_len(Spacing::XL));
         if let Some(message) = &request.message {
             body = body.child(
                 div()
@@ -585,15 +567,6 @@ impl Render for RequestPanel {
                     .child(SharedString::from(link.clone())),
             );
         }
-        let mut footer = div()
-            .w_full()
-            .flex()
-            .items_center()
-            .justify_end()
-            .gap(px_len(Spacing::SM))
-            .px(px_len(Spacing::XXL))
-            .py(px_len(Spacing::LG))
-            .flex_shrink_0();
         for (index, question) in request.questions.iter().enumerate() {
             // An id per question, because a choice row's id is its label: two
             // questions offering "Yes" shared one row state, and a click on
@@ -676,78 +649,72 @@ impl Render for RequestPanel {
             .link
             .clone()
             .filter(|link| fx_agent::elicitation::is_web_link(link));
-        footer = footer
-            .child(
-                div()
-                    .debug_selector(|| "request-refuse".into())
-                    .child(button(
-                        refuse,
-                        ButtonStyle::Secondary,
-                        !self.sent,
-                        cx.listener(move |this, _, _, cx| this.respond(cancel.clone(), cx)),
-                    )),
-            )
-            .child(
-                div()
-                    .debug_selector(|| "request-accept".into())
-                    .child(button(
-                        accept,
-                        ButtonStyle::Primary,
-                        !self.sent && answers.is_some(),
-                        cx.listener(move |this, _, _, cx| {
-                            if let Some(answer) = this.answers(cx) {
-                                // Accepting a link is consenting to open it,
-                                // so it is opened here, in the reader's own
-                                // browser, and only a web page ever is.
-                                if let Some(link) = &link
-                                    && !this.sent
-                                {
-                                    cx.open_url(link);
-                                }
-                                this.respond(answer, cx);
+        let can_accept = !self.sent && answers.is_some();
+        let this = cx.entity();
+        let (for_refuse, for_accept) = (this.clone(), this);
+        let footer = dialog_footer(
+            None,
+            [
+                DialogAction::new(refuse, ButtonStyle::Secondary, move |_, cx| {
+                    for_refuse.update(cx, |this, cx| this.respond(cancel.clone(), cx));
+                })
+                .enabled(!self.sent)
+                .focus(&self.refuse_focus)
+                .selector("request-refuse"),
+                DialogAction::new(accept, ButtonStyle::Primary, move |_, cx| {
+                    for_accept.update(cx, |this, cx| {
+                        if let Some(answer) = this.answers(cx) {
+                            // Accepting a link is consenting to open it, so it
+                            // is opened here, in the reader's own browser, and
+                            // only a web page ever is.
+                            if let Some(link) = &link
+                                && !this.sent
+                            {
+                                cx.open_url(link);
                             }
-                        }),
-                    )),
-            );
-        let content = div()
+                            this.respond(answer, cx);
+                        }
+                    });
+                })
+                .enabled(can_accept)
+                .focus(&self.accept_focus)
+                .selector("request-accept"),
+            ],
+        );
+        // The keyboard's way through: each field that is typed into, then the
+        // two answers.
+        let mut order: Vec<_> = request
+            .questions
+            .iter()
+            .zip(&self.fields)
+            .filter(|(question, _)| takes_typed_answer(question))
+            .map(|(_, field)| field.read(cx).focus_handle())
+            .collect();
+        if !self.sent {
+            order.push(self.refuse_focus.clone());
+        }
+        if can_accept {
+            order.push(self.accept_focus.clone());
+        }
+        let scrolled = div()
+            .id("provider-request-content")
             .w_full()
-            .flex()
-            .flex_col()
-            .child(header)
-            .child(divider())
-            .child(
-                div()
-                    .id("provider-request-content")
-                    .w_full()
-                    .min_h_0()
-                    .max_h(
-                        (window.viewport_size().height - px(Spacing::HUGE * 4.0))
-                            .max(px(Spacing::HUGE * 2.0)),
-                    )
-                    .overflow_y_scroll()
-                    .child(body),
+            .min_h_0()
+            .max_h(
+                (window.viewport_size().height - px(Spacing::HUGE * 4.0))
+                    .max(px(Spacing::HUGE * 2.0)),
             )
-            .child(divider())
-            .child(footer);
-        div()
-            .id("provider-request-overlay")
+            .overflow_y_scroll()
+            .child(body);
+        dialog_scrim("provider-request-overlay")
             .track_focus(&self.focus)
-            .occlude()
-            .absolute()
-            .inset_0()
-            .bg(Colors::overlay(&theme))
-            .flex()
-            .items_center()
-            .justify_center()
             .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| cx.stop_propagation())
-            .child(
-                div()
-                    .w(px_len(Layout::SETTINGS_PANEL_WIDTH))
-                    .max_w_full()
-                    .p(px_len(Spacing::SM))
-                    .fx_shadow(Shadow::dialog(Colors::overlay(&theme)))
-                    .child(panel(content)),
-            )
+            .capture_key_down(move |event, window, cx| {
+                if cycle_focus(&order, event, window) {
+                    cx.stop_propagation();
+                }
+            })
+            .child(dialog(DialogWidth::Regular, header, scrolled, footer))
     }
 }
 

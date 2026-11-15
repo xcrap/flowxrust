@@ -160,7 +160,6 @@ impl Layout {
     pub const SIDEBAR_WIDTH: f32 = 248.0;
     pub const SIDEBAR_MIN_WIDTH: f32 = 200.0;
     pub const SIDEBAR_MAX_WIDTH: f32 = 400.0;
-    pub const SETTINGS_PANEL_WIDTH: f32 = 560.0;
     /// The settings sheet at its widest; a narrower window shrinks it.
     pub const SETTINGS_WINDOW_WIDTH: f32 = 1040.0;
     /// The settings sheet at its tallest; a shorter window shrinks it.
@@ -181,7 +180,10 @@ impl Layout {
     /// How far below the window's top edge the palette sits: clear of the title
     /// bar, with room to read it as floating.
     pub const COMMAND_PALETTE_TOP_INSET: f32 = Self::TITLE_BAR_HEIGHT + Spacing::XXXL;
+    /// A compact dialog: one question or one field.
     pub const DIALOG_WIDTH: f32 = 440.0;
+    /// A dialog with several questions, or text that needs a measure.
+    pub const DIALOG_WIDE_WIDTH: f32 = 560.0;
     /// Row action menus: context menus and the "…" and "+" dropdowns beside them.
     pub const MENU_WIDTH: f32 = 220.0;
 

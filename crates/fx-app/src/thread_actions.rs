@@ -1,8 +1,11 @@
 //! Thread-scoped rename and deletion dialogs.
 
-use fx_design::components::{ButtonStyle, button, divider, panel};
-use fx_design::styled::{FxStyled, px_len};
-use fx_design::theme::{Colors, Layout, Spacing, global};
+use fx_design::components::{
+    ButtonStyle, DialogAction, DialogClose, DialogHeader, DialogWidth, cycle_focus, dialog,
+    dialog_body, dialog_footer, dialog_scrim,
+};
+use fx_design::styled::FxStyled;
+use fx_design::theme::{Colors, global};
 use gpui::prelude::*;
 use gpui::{App, Context, Entity, FocusHandle, MouseButton, Render, Subscription, Window, div};
 use uuid::Uuid;
@@ -22,6 +25,9 @@ pub struct ThreadDialog {
     title: String,
     field: Entity<TextField>,
     focus: FocusHandle,
+    cancel_focus: FocusHandle,
+    confirm_focus: FocusHandle,
+    close_focus: FocusHandle,
     error: Option<String>,
     settled: bool,
     _observation: Subscription,
@@ -70,6 +76,9 @@ pub fn open(
             title: agent.title,
             field,
             focus: cx.focus_handle(),
+            cancel_focus: cx.focus_handle(),
+            confirm_focus: cx.focus_handle(),
+            close_focus: cx.focus_handle(),
             error: None,
             settled: false,
             _observation: observation,
@@ -138,24 +147,8 @@ impl Render for ThreadDialog {
         let theme = global::current();
         let deleting = self.action == ThreadAction::Delete;
         let this = cx.entity();
-        let cancel = this.clone();
-        let confirm = this.clone();
         let can_confirm = self.can_confirm(cx);
-        let mut body = div()
-            .flex()
-            .flex_col()
-            .gap(px_len(Spacing::MD))
-            .p(px_len(Spacing::XL))
-            .child(
-                div()
-                    .fx_title3()
-                    .text_color(Colors::fg(&theme))
-                    .child(if deleting {
-                        "Delete thread?"
-                    } else {
-                        "Rename thread"
-                    }),
-            );
+        let mut body = dialog_body();
         if deleting {
             body = body
                 .child(div().fx_body().text_color(Colors::fg(&theme)).child(self.title.clone()))
@@ -176,48 +169,58 @@ impl Render for ThreadDialog {
                     .child(error.clone()),
             );
         }
-        let content = div().flex().flex_col().child(body).child(divider()).child(
-            div()
-                .flex()
-                .justify_end()
-                .gap(px_len(Spacing::SM))
-                .px(px_len(Spacing::XL))
-                .py(px_len(Spacing::MD))
-                .child(button(
-                    "Cancel",
-                    ButtonStyle::Secondary,
-                    true,
-                    move |_, window, cx| {
-                        cancel.update(cx, |dialog, cx| dialog.close(window, cx));
-                    },
-                ))
-                .child(button(
+        let (cancel, confirm, close) = (this.clone(), this.clone(), this.clone());
+        let header = DialogHeader::new(if deleting {
+            "Delete thread?"
+        } else {
+            "Rename thread"
+        })
+        .close(
+            DialogClose::new("Close", move |window, cx| {
+                close.update(cx, |dialog, cx| dialog.close(window, cx));
+            })
+            .focus(&self.close_focus),
+        );
+        let footer = dialog_footer(
+            None,
+            [
+                DialogAction::new("Cancel", ButtonStyle::Secondary, move |window, cx| {
+                    cancel.update(cx, |dialog, cx| dialog.close(window, cx));
+                })
+                .focus(&self.cancel_focus),
+                DialogAction::new(
                     if deleting { "Delete thread" } else { "Save" },
                     if deleting {
                         ButtonStyle::Danger
                     } else {
                         ButtonStyle::Primary
                     },
-                    can_confirm,
-                    move |_, window, cx| {
+                    move |window, cx| {
                         confirm.update(cx, |dialog, cx| dialog.confirm(window, cx));
                     },
-                )),
+                )
+                .enabled(can_confirm)
+                .focus(&self.confirm_focus),
+            ],
         );
-        div()
-            .id("thread-dialog")
-            .absolute()
-            .size_full()
-            .occlude()
+        let mut order = Vec::new();
+        if !deleting {
+            order.push(self.field.read(cx).focus_handle());
+        }
+        order.push(self.cancel_focus.clone());
+        if can_confirm {
+            order.push(self.confirm_focus.clone());
+        }
+        order.push(self.close_focus.clone());
+        dialog_scrim("thread-dialog")
             .track_focus(&self.focus)
-            .bg(Colors::overlay(&theme))
-            .flex()
-            .items_center()
-            .justify_center()
-            .p(px_len(Spacing::XL))
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
             .on_mouse_down(MouseButton::Right, |_, _, cx| cx.stop_propagation())
             .capture_key_down(move |event, window, cx| {
+                if cycle_focus(&order, event, window) {
+                    cx.stop_propagation();
+                    return;
+                }
                 let escape = event.keystroke.key == "escape";
                 let submit = event.keystroke.key == "enter" && !deleting;
                 if escape || submit {
@@ -231,12 +234,7 @@ impl Render for ThreadDialog {
                     });
                 }
             })
-            .child(
-                div()
-                    .w(px_len(Layout::DIALOG_WIDTH))
-                    .max_w_full()
-                    .child(panel(content)),
-            )
+            .child(dialog(DialogWidth::Compact, header, body, footer))
     }
 }
 
@@ -343,6 +341,59 @@ mod tests {
                 .len(),
             2
         );
+    }
+
+    #[test]
+    fn tab_reaches_the_dialogs_buttons_and_space_presses_the_focused_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = AppPaths::at(dir.path().join("state"));
+        let mut test = TestAppContext::single();
+        let (state, _, second) = seeded(&mut test, &paths);
+        let view_state = state.clone();
+        let window = test.add_window(move |_, _| crate::FlowX::new(view_state));
+        test.refresh().unwrap();
+        window
+            .update(&mut test, |_, window, cx| {
+                crate::dispatch_menu_choice(&format!("thread:{second}"), "delete", window, cx);
+            })
+            .unwrap();
+        test.refresh().unwrap();
+        let dialog = test.update(|cx| {
+            workspace_ui::handle(cx)
+                .read(cx)
+                .thread_dialog
+                .clone()
+                .unwrap()
+        });
+        let focused = |test: &mut TestAppContext, pick: fn(&ThreadDialog) -> &FocusHandle| {
+            window
+                .update(test, |_, window, cx| {
+                    pick(dialog.read(cx)).is_focused(window)
+                })
+                .unwrap()
+        };
+        test.simulate_keystrokes(window.into(), "tab");
+        assert!(
+            focused(&mut test, |d| &d.cancel_focus),
+            "Tab starts at Cancel"
+        );
+        test.simulate_keystrokes(window.into(), "tab");
+        assert!(focused(&mut test, |d| &d.confirm_focus));
+        test.simulate_keystrokes(window.into(), "tab tab");
+        assert!(
+            focused(&mut test, |d| &d.cancel_focus),
+            "Tab wraps past the close button"
+        );
+        test.simulate_keystrokes(window.into(), "shift-tab");
+        assert!(focused(&mut test, |d| &d.close_focus));
+        test.simulate_keystrokes(window.into(), "shift-tab shift-tab");
+        assert!(focused(&mut test, |d| &d.cancel_focus));
+        // Space presses Cancel, never the destructive default.
+        test.simulate_keystrokes(window.into(), "space");
+        test.update(|cx| {
+            assert!(workspace_ui::handle(cx).read(cx).thread_dialog.is_none());
+            assert_eq!(state.read(cx).snapshot.projects[0].agents.len(), 2);
+        });
     }
 
     #[test]
