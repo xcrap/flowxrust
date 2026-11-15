@@ -9377,7 +9377,7 @@ mod native_sync_tests {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().to_string_lossy().to_string();
         let test = gpui::TestAppContext::single();
-        let (state, project) =
+        let (state, _) =
             test.update(|cx| setup(cx, AppPaths::at(temp.path().join("store")), &root));
         test.update(|cx| {
             state.update(cx, |state, cx| {
