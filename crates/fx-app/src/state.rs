@@ -3344,10 +3344,37 @@ impl AppState {
                         .get(&id)
                         .and_then(|(title, _)| title.clone())
                         .unwrap_or_else(|| entry.summary.title.clone());
-                    let archived = overrides
+                    // FlowX's archive or restore holds until the provider's
+                    // own flag moves, which is newer, or agrees with it. Kept
+                    // for good, one restore in FlowX hid every later archive
+                    // in Codex or Claude. What the provider said last is the
+                    // binding's, when the provider wrote it: one FlowX made
+                    // for its own session has no revision.
+                    let reported = binding_slots
                         .get(&id)
-                        .and_then(|(_, archived)| *archived)
-                        .unwrap_or(entry.summary.is_archived);
+                        .map(|&at| &record.native_bindings[at])
+                        .filter(|binding| {
+                            !binding.revision.is_empty()
+                                && binding.session_id == identity.session_id
+                        })
+                        .map(|binding| binding.is_archived);
+                    let mut archived = entry.summary.is_archived;
+                    if let Some(local) = overrides.get(&id).and_then(|(_, archived)| *archived) {
+                        if local == archived || reported.is_some_and(|last| last != archived) {
+                            if let Some(held) = record
+                                .thread_overrides
+                                .iter_mut()
+                                .find(|held| held.agent_id == id)
+                            {
+                                held.archived = None;
+                            }
+                            record
+                                .thread_overrides
+                                .retain(|held| held.title.is_some() || held.archived.is_some());
+                        } else {
+                            archived = local;
+                        }
+                    }
                     let agent = &mut record.agents[slot];
                     agent.title = title;
                     // Native defaults stay in the binding, separate from explicit
@@ -9247,6 +9274,47 @@ mod native_sync_tests {
                     order(state),
                     vec![d_id, c_id, worktree, created, b_id, a_id]
                 );
+            })
+        });
+    }
+
+    #[test]
+    fn an_archive_in_the_provider_after_one_in_flowx_wins() {
+        // FlowX's archive or restore was kept over the provider's flag for
+        // good: after one restore in FlowX, archiving the thread again in
+        // Codex or Claude never showed.
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().to_string_lossy().to_string();
+        let test = gpui::TestAppContext::single();
+        let (state, project) =
+            test.update(|cx| setup(cx, AppPaths::at(temp.path().join("store")), &root));
+        test.update(|cx| {
+            state.update(cx, |state, _| {
+                let mut native = entry(&root, "codex", "native", "Native");
+                let mut pass = |state: &mut AppState, archived: bool| {
+                    native.summary.is_archived = archived;
+                    index(state, project, "codex", vec![native.clone()], Vec::new());
+                };
+                pass(state, true);
+                let agent = state.snapshot.projects[0].native_bindings[0].agent_id;
+                assert!(state.is_thread_archived(agent));
+                assert!(state.set_thread_archived(agent, false));
+                pass(state, true);
+                assert!(!state.is_thread_archived(agent), "the restore was undone");
+                // Restored there too, then archived again: newer than FlowX's.
+                pass(state, false);
+                pass(state, true);
+                assert!(state.is_thread_archived(agent));
+                // The other way round: archived here, then restored there
+                // after archiving there.
+                assert!(state.set_thread_archived(agent, false));
+                pass(state, false);
+                assert!(state.set_thread_archived(agent, true));
+                pass(state, false);
+                assert!(state.is_thread_archived(agent), "the archive was undone");
+                pass(state, true);
+                pass(state, false);
+                assert!(!state.is_thread_archived(agent));
             })
         });
     }
