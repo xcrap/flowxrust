@@ -651,13 +651,20 @@ fn parse_file(
     maximum_bytes: u64,
     include_messages: bool,
 ) -> Result<(ParsedSummary, Vec<ConversationMessage>), ProviderError> {
-    if fingerprint.size > maximum_bytes {
+    // The limit is on importing a history, which holds its messages. A
+    // listing holds none, so a transcript over it is listed from what fits
+    // under it: who it belongs to, its title and its defaults are at its
+    // start, and its time is the file's. Refused at listing too, one archived
+    // 164 MiB transcript was a sync warning on every pass, for good, and any
+    // warning stops the project's deleted threads being hidden.
+    let partial = fingerprint.size > maximum_bytes;
+    if partial && include_messages {
         return Err(protocol(format!(
             "Transcript exceeds the {maximum_bytes}-byte history limit; no partial history was imported"
         )));
     }
     let file = checked_file(path, fingerprint)?;
-    let mut reader = BufReader::new(file.take(fingerprint.size));
+    let mut reader = BufReader::new(file.take(fingerprint.size.min(maximum_bytes)));
     let mut parsed = ParsedSummary {
         defaults: NativeDefaults {
             provider_id: Some("claude".into()),
@@ -959,6 +966,12 @@ fn parse_file(
         return Err(protocol(
             "Transcript session ID does not match its filename",
         ));
+    }
+    // What was not read may hold later records; the file's own time is no
+    // earlier than any of them.
+    if partial && let Some(modified) = fingerprint.modified {
+        let modified = DateTime::<Utc>::from(modified);
+        parsed.updated_at = Some(parsed.updated_at.map_or(modified, |old| old.max(modified)));
     }
     // A concurrent append, replacement, or rewrite must be retried instead of
     // publishing an older prefix as the history for a newer fingerprint.
@@ -2051,19 +2064,33 @@ mod tests {
     #[test]
     fn limits_are_explicit_and_do_not_import_partial_history() {
         let fixture = Fixture::new();
-        fixture.write(&[fixture.record("user", "Message", Uuid::new_v4())]);
+        fixture.write(&[
+            fixture.record("user", "Message", Uuid::new_v4()),
+            fixture.record("assistant", "A reply past the limit", Uuid::new_v4()),
+        ]);
+        let first_line = fs::read_to_string(&fixture.file)
+            .unwrap()
+            .lines()
+            .next()
+            .unwrap()
+            .len() as u64
+            + 1;
         let mut store = fixture.store();
-        store.maximum_transcript_bytes = 64;
+        store.maximum_transcript_bytes = first_line + 8;
         assert!(
             store
                 .read(fixture.root(), SESSION)
                 .unwrap_err()
                 .to_string()
-                .contains("64-byte history limit")
+                .contains(&format!("{}-byte history limit", first_line + 8))
         );
+        // Listed from what fits under the limit, with no warning: only its
+        // history is refused, when the thread is opened. Refused at listing
+        // too, one archived oversized transcript warned on every pass.
         let index = store.list(fixture.root()).unwrap();
-        assert!(index.threads.is_empty());
-        assert_eq!(index.warnings.len(), 1);
+        assert_eq!(index.threads.len(), 1);
+        assert_eq!(index.threads[0].summary.title, "Message");
+        assert!(index.warnings.is_empty(), "{:?}", index.warnings);
         assert_eq!(store.cache.lock().unwrap().transcripts.len(), 0);
     }
 
