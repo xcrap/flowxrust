@@ -347,7 +347,9 @@ impl AppState {
             .iter_mut()
             .find(|record| record.project.as_ref().is_some_and(|p| p.id == project_id))?;
         let project = record.project.as_mut()?;
-        project.agent_order.push(agent.id);
+        // First, as the sidebar lists newest first: appended, a new thread
+        // sat below the fold and out of ⌘1–9's reach.
+        project.agent_order.insert(0, agent.id);
         record.agents.push(agent.clone());
         record.auto_title_pending.push(agent.id);
         record.is_expanded = true;
@@ -511,7 +513,8 @@ impl AppState {
         {
             return Err("This worktree belongs to a different project.".into());
         }
-        record.project.as_mut().unwrap().agent_order.push(id);
+        // First, as `create_thread` puts one.
+        record.project.as_mut().unwrap().agent_order.insert(0, id);
         record.agents.push(agent);
         if auto_title {
             record.auto_title_pending.push(id);
@@ -3278,6 +3281,9 @@ impl AppState {
                 let (mut bound, mut binding_slots, mut repeated) =
                     index_bindings(&record.native_bindings);
                 let mut found: HashSet<Uuid> = HashSet::new();
+                // Threads new to this project, in the index's order, which is
+                // newest first.
+                let mut discovered: Vec<Uuid> = Vec::new();
                 for entry in index.threads {
                     let identity = &entry.summary.identity;
                     if identity.provider_id != ticket.provider
@@ -3317,7 +3323,7 @@ impl AppState {
                             let mut agent = Agent::with_id(id, &entry.summary.title);
                             agent.configuration.provider_id = Some(identity.provider_id.clone());
                             record.agents.push(agent);
-                            record.project.as_mut().unwrap().agent_order.push(id);
+                            discovered.push(id);
                             slots.insert(id, record.agents.len() - 1);
                             record.agents.len() - 1
                         }
@@ -3389,6 +3395,15 @@ impl AppState {
                         (bound, binding_slots, repeated) = index_bindings(&record.native_bindings);
                     }
                 }
+                // Ahead of every thread already listed, which they are newer
+                // than: appended, a thread started in Codex or Claude was
+                // listed below the fold until "Show more".
+                record
+                    .project
+                    .as_mut()
+                    .unwrap()
+                    .agent_order
+                    .splice(0..0, discovered);
                 record
                     .missing_native_agent_ids
                     .retain(|agent| !found.contains(agent));
@@ -9136,6 +9151,71 @@ mod native_sync_tests {
                 );
                 state.toggle_project_expansion(other);
                 assert!(passes(state, cx).contains(&other));
+            })
+        });
+    }
+
+    #[test]
+    fn a_new_thread_is_listed_first_and_a_discovered_batch_keeps_its_order() {
+        // The first discovery lists newest first, but every thread after it
+        // was appended: below the sidebar's fold, and out of ⌘1–9's reach,
+        // until "Show more".
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().to_string_lossy().to_string();
+        let test = gpui::TestAppContext::single();
+        let (state, project) =
+            test.update(|cx| setup(cx, AppPaths::at(temp.path().join("store")), &root));
+        test.update(|cx| {
+            state.update(cx, |state, _| {
+                let session = |state: &AppState, session: &str| {
+                    state.snapshot.projects[0]
+                        .native_bindings
+                        .iter()
+                        .find(|binding| binding.session_id == session)
+                        .unwrap()
+                        .agent_id
+                };
+                let order = |state: &AppState| {
+                    state
+                        .visible_active_agents()
+                        .map(|agent| agent.id)
+                        .collect::<Vec<_>>()
+                };
+                let (a, b) = (
+                    entry(&root, "codex", "a", "A"),
+                    entry(&root, "codex", "b", "B"),
+                );
+                index(
+                    state,
+                    project,
+                    "codex",
+                    vec![b.clone(), a.clone()],
+                    Vec::new(),
+                );
+                let (b_id, a_id) = (session(state, "b"), session(state, "a"));
+                assert_eq!(order(state), vec![b_id, a_id]);
+                let created = state.create_thread().unwrap();
+                assert_eq!(order(state), vec![created, b_id, a_id]);
+                let worktree = state
+                    .create_workspace_thread(
+                        project,
+                        Uuid::new_v4(),
+                        AgentConfiguration::default(),
+                        None,
+                    )
+                    .unwrap();
+                assert_eq!(order(state), vec![worktree, created, b_id, a_id]);
+                // Two found in one pass go first, newest first, as listed.
+                let (c, d) = (
+                    entry(&root, "codex", "c", "C"),
+                    entry(&root, "codex", "d", "D"),
+                );
+                index(state, project, "codex", vec![d, c, b, a], Vec::new());
+                let (d_id, c_id) = (session(state, "d"), session(state, "c"));
+                assert_eq!(
+                    order(state),
+                    vec![d_id, c_id, worktree, created, b_id, a_id]
+                );
             })
         });
     }
