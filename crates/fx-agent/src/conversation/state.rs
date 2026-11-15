@@ -339,6 +339,27 @@ pub const MAX_LIVE_OUTPUTS: usize = 8;
 /// The most of one running call's output that is kept: its tail.
 pub const MAX_LIVE_OUTPUT_BYTES: usize = 16 * 1024;
 
+/// Output as a terminal leaves it: each line from its last `\r` on.
+///
+/// A progress bar rewrites its line with `\r`, and kept whole the live panel
+/// wrapped every state the bar went through end to end. A `\r` that ends the
+/// text is kept, because the next delta says whether it rewrites the line or
+/// ends it (`\r\n`, which becomes `\n`).
+fn rewrite_returns(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut lines = text.split('\n').peekable();
+    while let Some(line) = lines.next() {
+        let body = line.trim_end_matches('\r');
+        out.push_str(body.rsplit('\r').next().unwrap_or(body));
+        if lines.peek().is_some() {
+            out.push('\n');
+        } else if body.len() < line.len() {
+            out.push('\r');
+        }
+    }
+    out
+}
+
 /// The per-thread conversation state.
 #[derive(Debug, Clone, Default)]
 pub struct Conversation {
@@ -378,6 +399,10 @@ pub struct Conversation {
     /// Ids the provider said it read before anything was held under them.
     /// Codex's record of a steer can overtake its answer to the steer.
     read_early: VecDeque<String>,
+    /// The steers landed in the current or latest turn. Each is a user
+    /// message, which splits the transcript like a prompt, but the turn goes
+    /// on past it.
+    landed_steers: Vec<Uuid>,
     phase: Phase,
     error: Option<String>,
     queued: VecDeque<QueuedPrompt>,
@@ -524,11 +549,18 @@ impl Conversation {
         self.land(vec![steer]);
     }
 
+    /// The steers landed in the current or latest turn, oldest first.
+    pub fn landed_steers(&self) -> &[Uuid] {
+        &self.landed_steers
+    }
+
     fn land(&mut self, steers: Vec<Arc<ConversationMessage>>) {
         if steers.is_empty() {
             return;
         }
         self.commit_streaming();
+        self.landed_steers
+            .extend(steers.iter().map(|steer| steer.id));
         self.messages.extend(steers);
         self.trim();
         self.message_revision += 1;
@@ -629,7 +661,14 @@ impl Conversation {
             }
         };
         let text = &mut self.live_outputs[position].1;
+        // Only the last line can still hold a `\r` waiting to be rewritten.
+        let open_line = text.rfind('\n').map_or(0, |newline| newline + 1);
         text.push_str(delta);
+        if text[open_line..].contains('\r') {
+            let rewritten = rewrite_returns(&text[open_line..]);
+            text.truncate(open_line);
+            text.push_str(&rewritten);
+        }
         if text.len() > MAX_LIVE_OUTPUT_BYTES {
             // Keep the end: what a running command printed last is what says
             // where it is. Cut on a character boundary, at a line where one is
@@ -1189,6 +1228,7 @@ impl Conversation {
     }
 
     fn start_turn_clock(&mut self) {
+        self.landed_steers.clear();
         let now = fx_core::models::now();
         self.turn_started_at = Some(now);
         self.step_started_at = Some(now);
@@ -1215,25 +1255,42 @@ impl Conversation {
     /// where it happened, exactly where Claude's `TodoWrite` already is, so the
     /// view reads one kind of plan and a finished turn keeps its own. A repeat
     /// of the plan the turn already holds adds nothing.
+    ///
+    /// The turn's plan is looked for past the steers landed in it. Stopped at
+    /// the first, every update after a steer added a second card for the same
+    /// turn; one written before a steer is updated where it is instead.
     fn record_plan(&mut self, plan: &fx_core::policy::TurnPlan) {
         let input = plan.to_tool_input();
-        let unchanged = self
-            .messages
-            .iter()
-            .rev()
-            .take_while(|message| message.role != MessageRole::User)
-            .flat_map(|message| message.content.iter().rev())
-            .find_map(|block| match block {
-                fx_core::MessageContent::ToolUse { name, input, .. }
+        let mut past_steer = false;
+        let mut latest = None;
+        for message in self.messages.iter().rev() {
+            if message.role == MessageRole::User {
+                if !self.landed_steers.contains(&message.id) {
+                    break;
+                }
+                past_steer = true;
+                continue;
+            }
+            let call = message.content.iter().rev().find_map(|block| match block {
+                fx_core::MessageContent::ToolUse { id, name, input }
                     if fx_core::policy::TurnPlan::is_plan_tool(name) =>
                 {
-                    Some(input)
+                    Some((id, input))
                 }
                 _ => None,
-            })
-            .is_some_and(|latest| *latest == input);
-        if unchanged {
-            return;
+            });
+            if let Some((id, current)) = call {
+                latest = Some((id.clone(), *current == input));
+                break;
+            }
+        }
+        match latest {
+            Some((_, true)) => return,
+            Some((id, false)) if past_steer => {
+                self.update_tool_input(&id, |current| *current = input);
+                return;
+            }
+            _ => {}
         }
         self.append(ConversationMessage::new(
             MessageRole::Assistant,
@@ -2981,6 +3038,92 @@ mod tests {
             Some(plan(PlanStatus::Completed))
         );
         assert!(!c.is_streaming());
+    }
+
+    #[test]
+    fn a_plan_update_after_a_steer_updates_the_turns_plan() {
+        // A landed steer is a user message, and the search for the turn's plan
+        // stopped there: every update after it, even an unchanged one, added
+        // a second card for the same turn.
+        use fx_core::policy::{PlanStatus, PlanStep, TurnPlan};
+        let plan = |status| TurnPlan {
+            explanation: None,
+            steps: vec![PlanStep {
+                text: "Fix the bug".into(),
+                active_text: None,
+                status,
+            }],
+        };
+        let plans = |c: &Conversation| -> Vec<Option<TurnPlan>> {
+            c.messages()
+                .flat_map(|message| &message.content)
+                .filter_map(|block| match block {
+                    fx_core::MessageContent::ToolUse { name, input, .. }
+                        if TurnPlan::is_plan_tool(name) =>
+                    {
+                        Some(TurnPlan::from_tool_call(name, input))
+                    }
+                    _ => None,
+                })
+                .collect()
+        };
+        let mut c = Conversation::new(Uuid::nil());
+        c.append(user_message("fix it"));
+        c.apply(ProviderEvent::Lifecycle(
+            crate::provider::Lifecycle::TurnStarted,
+        ));
+        c.apply(ProviderEvent::PlanUpdated(plan(PlanStatus::InProgress)));
+        let steer = user_message("Use the staging config");
+        let steer_id = steer.id;
+        c.hold_steer(steer);
+        c.apply(ProviderEvent::InputTaken {
+            id: Some(steer_id.to_string()),
+        });
+        assert_eq!(c.landed_steers(), [steer_id]);
+
+        c.apply(ProviderEvent::PlanUpdated(plan(PlanStatus::InProgress)));
+        assert_eq!(c.message_count(), 3, "an unchanged plan added a row");
+        c.apply(ProviderEvent::PlanUpdated(plan(PlanStatus::Completed)));
+        assert_eq!(plans(&c), [Some(plan(PlanStatus::Completed))]);
+        assert_eq!(c.message_count(), 3);
+
+        // The next turn's plan is its own, after the prompt that started it.
+        c.set_phase(Phase::Idle);
+        c.append(user_message("now the docs"));
+        c.apply(ProviderEvent::Lifecycle(
+            crate::provider::Lifecycle::TurnStarted,
+        ));
+        assert!(c.landed_steers().is_empty());
+        c.apply(ProviderEvent::PlanUpdated(plan(PlanStatus::Completed)));
+        assert_eq!(plans(&c).len(), 2);
+    }
+
+    #[test]
+    fn a_progress_bar_keeps_only_its_latest_state() {
+        // A progress bar rewrites its line with `\r`. Kept whole, the live
+        // panel wrapped every state the bar had been through end to end.
+        let mut c = Conversation::new(Uuid::nil());
+        for delta in [
+            "Fetching\r\n",
+            "Downloading 1%\r",
+            "Downloading 2%",
+            "\rDownloading 3%\r",
+        ] {
+            c.apply(ProviderEvent::ToolOutputDelta {
+                id: "t1".into(),
+                delta: delta.into(),
+            });
+        }
+        assert_eq!(c.live_output("t1"), Some("Fetching\nDownloading 3%\r"));
+        // A `\r` that ends the line is a line ending, not a rewrite.
+        c.apply(ProviderEvent::ToolOutputDelta {
+            id: "t1".into(),
+            delta: "\nDone\n".into(),
+        });
+        assert_eq!(
+            c.live_output("t1"),
+            Some("Fetching\nDownloading 3%\nDone\n")
+        );
     }
 
     #[test]

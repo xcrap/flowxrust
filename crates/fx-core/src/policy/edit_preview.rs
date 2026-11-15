@@ -96,7 +96,16 @@ impl EditPreview {
                 .collect(),
             "write" => {
                 let content = object.get("content").and_then(Value::as_str)?;
-                vec![section(path, line_diff("", content))]
+                // Every line is an addition, so nothing folds: only the lines
+                // shown are built, and the rest are counted.
+                let shown = content
+                    .match_indices('\n')
+                    .nth(MAX_PREVIEW_LINES - 1)
+                    .map_or(content.len(), |(newline, _)| newline + 1);
+                let mut section = section(path, line_diff("", &content[..shown]));
+                section.added = line_count(content);
+                section.omitted = section.added - section.lines.len();
+                vec![section]
             }
             "filechange" | "apply_patch" | "applypatch" => object
                 .get("changes")
@@ -164,10 +173,20 @@ fn fold_context(lines: Vec<DiffLine>) -> Vec<DiffLine> {
     if changed.is_empty() {
         return lines;
     }
-    let keep = |index: usize| {
+    // One sweep down the sorted changes. Asking every change about every
+    // line was quadratic, and every line of a `Write` is a change: a second
+    // for 30,000 lines, on the frame the row opened.
+    let mut next = 0;
+    let mut keep = |index: usize| {
+        while changed
+            .get(next)
+            .is_some_and(|changed| changed + CONTEXT_LINES < index)
+        {
+            next += 1;
+        }
         changed
-            .iter()
-            .any(|changed| changed.abs_diff(index) <= CONTEXT_LINES)
+            .get(next)
+            .is_some_and(|changed| changed.abs_diff(index) <= CONTEXT_LINES)
     };
     let mut out = Vec::with_capacity(lines.len());
     let mut folded = 0usize;
@@ -290,6 +309,14 @@ fn split_lines(text: &str) -> Vec<&str> {
     lines
 }
 
+/// How many lines [`split_lines`] would make of a text, without making them.
+fn line_count(text: &str) -> usize {
+    if text.is_empty() {
+        return 0;
+    }
+    text.bytes().filter(|byte| *byte == b'\n').count() + 1 - usize::from(text.ends_with('\n'))
+}
+
 /// Claude's `structuredPatch`: hunks of `lines` each marked ` `, `-` or `+`.
 fn from_structured_patch(path: Option<String>, hunks: &[Value]) -> EditSection {
     let mut lines = Vec::new();
@@ -407,6 +434,39 @@ mod tests {
     }
 
     #[test]
+    fn a_large_write_previews_in_linear_time() {
+        // Every line of a `Write` is a change, and folding asked every change
+        // about every line: a second for 30,000 lines, on the frame the row
+        // opened.
+        let lines = 60_000;
+        let content: String = (1..=lines).map(|line| format!("line {line}\n")).collect();
+        let input = serde_json::json!({ "file_path": "big.txt", "content": content }).to_string();
+        let started = std::time::Instant::now();
+        let preview = EditPreview::from_tool("Write", &input).unwrap();
+        let elapsed = started.elapsed();
+        let section = &preview.sections[0];
+        assert_eq!(section.added, lines);
+        assert_eq!(section.lines.len(), MAX_PREVIEW_LINES);
+        assert_eq!(section.omitted, lines - MAX_PREVIEW_LINES);
+        assert!(
+            elapsed < std::time::Duration::from_millis(500),
+            "{lines} lines took {elapsed:?}"
+        );
+
+        // A long diff folds in one sweep, and keeps every change's context.
+        let old: String = (0..MAX_DIFFED_LINES).map(|n| format!("{n}\n")).collect();
+        let changed: Vec<DiffLine> = line_diff(&old, &old.replace("0\n", "o\n"))
+            .into_iter()
+            .cycle()
+            .take(lines)
+            .collect();
+        let started = std::time::Instant::now();
+        let folded = fold_context(changed);
+        assert!(started.elapsed() < std::time::Duration::from_millis(500));
+        assert!(folded.iter().any(|line| line.kind == DiffLineKind::Meta));
+    }
+
+    #[test]
     fn long_unchanged_runs_fold_into_a_notice() {
         let old: String = (1..=20).map(|n| format!("{n}\n")).collect();
         let new = old.replacen("10\n", "ten\n", 1);
@@ -507,5 +567,8 @@ mod tests {
         assert_eq!(split_lines("a\n\n"), ["a", ""]);
         // An edit that adds a trailing newline changes nothing visible.
         assert_eq!(kinds(&line_diff("a", "a\n")), " ");
+        for text in ["", "a", "a\n", "a\n\n", "\n", "a\nb"] {
+            assert_eq!(line_count(text), split_lines(text).len(), "{text:?}");
+        }
     }
 }

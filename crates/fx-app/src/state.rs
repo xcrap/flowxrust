@@ -4607,28 +4607,56 @@ fn native_binding(
 /// the same turn has ids of its own. Taking the history as it came changed
 /// every id in the turn just finished, so the transcript lost the reader's
 /// place in it, sending them to the top of the thread, and every disclosure
-/// keyed by those ids closed. Matched in order, by role and by tool id or
-/// text, so a repeated "Done." cannot take a later turn's id; a message with
-/// neither keeps the provider's.
+/// keyed by those ids closed. Matched in order, by role and by tool id, text,
+/// thought or compaction, so a repeated "Done." cannot take a later turn's id;
+/// a message with none of them keeps the provider's.
 fn carry_message_ids<'a>(
     local: impl Iterator<Item = &'a fx_core::ConversationMessage>,
     mut native: Vec<fx_core::ConversationMessage>,
 ) -> Vec<fx_core::ConversationMessage> {
+    fn normalized<'t>(parts: impl Iterator<Item = &'t str>) -> String {
+        parts
+            .flat_map(str::split_whitespace)
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
     fn key(message: &fx_core::ConversationMessage) -> Option<(fx_core::MessageRole, String)> {
         let tool = message.content.iter().find_map(|block| match block {
             fx_core::MessageContent::ToolUse { id, .. }
             | fx_core::MessageContent::ToolResult { id, .. } => Some(id.as_str()),
             _ => None,
         });
-        let key = match tool {
-            Some(id) => format!("tool:{id}"),
-            None => message
-                .text_content()
-                .split_whitespace()
-                .collect::<Vec<_>>()
-                .join(" "),
-        };
-        (!key.is_empty()).then_some((message.role, key))
+        if let Some(id) = tool {
+            return Some((message.role, format!("tool:{id}")));
+        }
+        let text = normalized(std::iter::once(message.text_content().as_str()));
+        if !text.is_empty() {
+            return Some((message.role, text));
+        }
+        // A thought or a compaction has no text, and a thought heads most
+        // groups: under the provider's id the group was keyed anew, so an
+        // open one closed and a selection in the thought was lost. A
+        // compaction is matched without its summary, which live arrives
+        // after the boundary, if at all.
+        let thought = normalized(message.content.iter().filter_map(|block| match block {
+            fx_core::MessageContent::Thinking { text } => Some(text.as_str()),
+            _ => None,
+        }));
+        if !thought.is_empty() {
+            return Some((message.role, format!("thinking:{thought}")));
+        }
+        message.content.iter().find_map(|block| match block {
+            fx_core::MessageContent::Compaction {
+                trigger,
+                pre_tokens,
+                post_tokens,
+                ..
+            } => Some((
+                message.role,
+                format!("compaction:{trigger:?}:{pre_tokens:?}:{post_tokens:?}"),
+            )),
+            _ => None,
+        })
     }
     let local: Vec<_> = local
         .filter_map(|message| Some((key(message)?, message.id)))
@@ -9949,6 +9977,57 @@ mod native_sync_tests {
             &carried[2].content[0],
             fx_core::MessageContent::ToolUse { input, .. } if input.contains("ls")
         ));
+    }
+
+    #[test]
+    fn a_thought_and_a_compaction_keep_their_ids_through_a_sync() {
+        // Neither has text or a tool id, so both took the provider's id, and
+        // every group a thought heads was keyed anew: an open group closed and
+        // a selection in the thought was lost.
+        use fx_core::{CompactionTrigger, MessageContent};
+        let thought = |text: &str| {
+            ConversationMessage::new(
+                MessageRole::Assistant,
+                vec![MessageContent::Thinking { text: text.into() }],
+            )
+        };
+        let compaction = |summary: Option<&str>| {
+            ConversationMessage::new(
+                MessageRole::System,
+                vec![MessageContent::Compaction {
+                    trigger: CompactionTrigger::Auto,
+                    pre_tokens: Some(610_000),
+                    post_tokens: Some(22_000),
+                    summary: summary.map(str::to_owned),
+                }],
+            )
+        };
+        let local = [
+            ConversationMessage::text(MessageRole::User, "continue"),
+            compaction(None),
+            thought("Check the parser first."),
+            thought("Now the tests."),
+        ];
+        let native = vec![
+            ConversationMessage::text(MessageRole::User, "continue"),
+            compaction(Some("The user asked for a parser fix.")),
+            thought("Check the parser\nfirst."),
+            thought("Something only the provider thought."),
+            thought("Now the tests."),
+        ];
+        let provider_only = native[3].id;
+        let carried = carry_message_ids(local.iter(), native);
+        let ids: Vec<Uuid> = carried.iter().map(|message| message.id).collect();
+        assert_eq!(
+            ids,
+            [
+                local[0].id,
+                local[1].id,
+                local[2].id,
+                provider_only,
+                local[3].id
+            ]
+        );
     }
 
     #[test]

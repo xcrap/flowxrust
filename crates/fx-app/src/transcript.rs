@@ -238,6 +238,12 @@ struct ViewMemory {
     disclosures: HashMap<String, bool>,
     /// Expanded groups reveal their newest page first, even after long runs.
     detail_limits: HashMap<String, usize>,
+    /// Each open edit row's preview, by the row's key. Kept for the rows the
+    /// last prune found open, so it is bounded by what the reader opened.
+    previews: HashMap<String, CachedPreview>,
+    /// How many edit previews have been built, for the tests.
+    #[cfg(test)]
+    previews_built: usize,
     /// Advances once per pass.
     ///
     /// GPUI 0.2.2 has no animation clock, so nothing could drive the spinner or
@@ -286,6 +292,9 @@ struct ThreadMemory {
     /// thread on screen keeps these: a handle held for a thread the reader
     /// left would keep messages alive that its conversation has since dropped.
     messages: Option<SharedMessages>,
+    /// The held steers the last pass rendered. Each is drawn with a prompt's
+    /// Copy button and menu, which find their message here.
+    steers: Rc<[Arc<ConversationMessage>]>,
     /// The live text the last pass rendered, at its streaming revision.
     streaming: Option<LiveText>,
     /// The background tasks the last pass rendered, with their revision.
@@ -319,6 +328,7 @@ impl ThreadMemory {
             blink_requested_at: None,
             tick_pending: false,
             messages: None,
+            steers: Rc::from(Vec::new()),
             streaming: None,
             tasks: None,
             clock_pending: false,
@@ -403,7 +413,8 @@ impl ThreadMemory {
         }
         let messages: Vec<&ConversationMessage> =
             snapshot.messages.iter().map(|message| &**message).collect();
-        let rows: Rc<[RowPlan]> = plan_rows(&messages, snapshot.busy).into();
+        let rows: Rc<[RowPlan]> =
+            plan_rows(&messages, snapshot.busy, &snapshot.landed_steers).into();
         let heads: Rc<HashMap<Uuid, usize>> = Rc::new(
             rows.iter()
                 .enumerate()
@@ -454,6 +465,7 @@ impl ViewMemory {
         self.disclosures.retain(|key, _| !key.starts_with(&prefix));
         self.detail_limits
             .retain(|key, _| !key.starts_with(&prefix));
+        self.previews.retain(|key, _| !key.starts_with(&prefix));
     }
 }
 
@@ -511,6 +523,7 @@ fn release_hidden_messages(shown: Uuid) {
         for (id, thread) in memory.borrow_mut().threads.iter_mut() {
             if *id != shown {
                 thread.messages = None;
+                thread.steers = Rc::from(Vec::new());
                 thread.streaming = None;
                 thread.tasks = None;
             }
@@ -649,13 +662,28 @@ fn prune_disclosures(
         thread.pruned_at = Some((message_revision, busy));
         // Only this conversation's keys are judged, so another thread's open
         // groups survive being filtered.
-        memory
-            .disclosures
-            .retain(|key, _| !key.starts_with(&prefix) || live.contains(key));
-        memory
-            .detail_limits
-            .retain(|key, _| !key.starts_with(&prefix) || live.contains(key));
+        let kept = |key: &str| !key.starts_with(&prefix) || names_live_group(key, &live);
+        let memory = &mut *memory;
+        memory.disclosures.retain(|key, _| kept(key));
+        memory.detail_limits.retain(|key, _| kept(key));
+        // A preview is only asked for while its row is open.
+        let disclosures = &memory.disclosures;
+        memory.previews.retain(|key, _| {
+            !key.starts_with(&prefix) || disclosures.get(key).copied().unwrap_or(false)
+        });
     });
+}
+
+/// Whether a key is a live group's or one of its rows'.
+///
+/// A call row is keyed under its group (`{group}:{position}:call`). Matched
+/// against the group keys whole, every call, result or input delta of a
+/// running turn closed the call row the reader had opened.
+fn names_live_group(key: &str, live: &HashSet<String>) -> bool {
+    live.contains(key)
+        || key
+            .match_indices(':')
+            .any(|(at, _)| live.contains(&key[..at]))
 }
 
 // ── The row model ──────────────────────────────────────────────────────────
@@ -1075,8 +1103,13 @@ struct ActivitySummary {
 ///
 /// Turns are separated by the reader's own prompts first: an assistant's reply is
 /// the unit the activity grouping is defined over, and two replies either side of
-/// a prompt are not one reply.
-fn plan_rows(messages: &[&ConversationMessage], turn_is_running: bool) -> Vec<RowPlan> {
+/// a prompt are not one reply. `landed_steers` are the user messages the running
+/// turn read as guidance, which split it the same way without ending it.
+fn plan_rows(
+    messages: &[&ConversationMessage],
+    turn_is_running: bool,
+    landed_steers: &[Uuid],
+) -> Vec<RowPlan> {
     let mut rows = Vec::new();
     let mut starts = HashMap::new();
     let mut turn_start = 0;
@@ -1094,6 +1127,26 @@ fn plan_rows(messages: &[&ConversationMessage], turn_is_running: bool) -> Vec<Ro
         turn_start..messages.len(),
         turn_is_running,
     );
+    if turn_is_running {
+        // A steer the turn read splits it as a prompt does, but the turn goes
+        // on: its latest plan is still the one being worked through, even
+        // when it was written before the steer.
+        for row in rows.iter_mut().rev() {
+            match row {
+                RowPlan::Plan { is_live, .. } => {
+                    *is_live = true;
+                    break;
+                }
+                RowPlan::Message(index)
+                    if messages[*index].role == MessageRole::User
+                        && !landed_steers.contains(&messages[*index].id) =>
+                {
+                    break;
+                }
+                _ => {}
+            }
+        }
+    }
     rows
 }
 
@@ -1250,7 +1303,7 @@ fn build_rows<'a>(
     turn_is_running: bool,
     conversation: Uuid,
 ) -> Vec<Row<'a>> {
-    plan_rows(messages, turn_is_running)
+    plan_rows(messages, turn_is_running, &[])
         .into_iter()
         .filter_map(|row| match row {
             RowPlan::Message(index) => Some(Row::Message(messages[index])),
@@ -1449,6 +1502,9 @@ pub(crate) struct Snapshot {
     live_outputs: Rc<[(Rc<str>, Rc<str>)]>,
     /// Guidance taken but not read yet, drawn after the live reply.
     steers: Rc<[Arc<ConversationMessage>]>,
+    /// The steers the running turn has read, which split it as prompts do
+    /// without ending it. Empty while nothing runs.
+    landed_steers: Rc<[Uuid]>,
     phase: Phase,
     busy: bool,
     waiting_for_user: bool,
@@ -1586,8 +1642,11 @@ pub(crate) fn snapshot(conversation: &crate::Conversation) -> Snapshot {
     let message_revision = conversation.message_revision();
     let streaming_revision = conversation.streaming_revision();
     let tasks_revision = conversation.tasks_revision();
-    let (messages, live, tasks) = with_thread(conversation.id, |thread| {
+    let (messages, steers, live, tasks) = with_thread(conversation.id, |thread| {
         thread.agent = conversation.agent_id;
+        let steers: Rc<[Arc<ConversationMessage>]> =
+            conversation.held_steers().iter().cloned().collect();
+        thread.steers = steers.clone();
         let messages = match thread
             .messages
             .as_ref()
@@ -1628,7 +1687,7 @@ pub(crate) fn snapshot(conversation: &crate::Conversation) -> Snapshot {
                 tasks
             }
         };
-        (messages, live, tasks)
+        (messages, steers, live, tasks)
     });
 
     let busy = conversation.is_busy();
@@ -1671,7 +1730,12 @@ pub(crate) fn snapshot(conversation: &crate::Conversation) -> Snapshot {
         thinking: live.thinking,
         thinking_tokens: conversation.thinking_tokens(),
         live_outputs: live.outputs,
-        steers: conversation.held_steers().iter().cloned().collect(),
+        steers,
+        landed_steers: if busy {
+            conversation.landed_steers().into()
+        } else {
+            Rc::from(Vec::new())
+        },
         phase: conversation.phase(),
         busy,
         waiting_for_user: conversation.is_waiting_for_user(),
@@ -2972,10 +3036,14 @@ fn copyable_text(message: &ConversationMessage) -> String {
 fn drawn_message(conversation: Uuid, message: Uuid) -> Option<Arc<ConversationMessage>> {
     MEMORY.with(|memory| {
         let memory = memory.borrow();
-        let shared = memory.threads.get(&conversation)?.messages.as_ref()?;
-        shared
+        let thread = memory.threads.get(&conversation)?;
+        // A held steer is drawn after the messages, with the same controls.
+        let committed = thread
             .messages
             .iter()
+            .flat_map(|shared| shared.messages.iter());
+        committed
+            .chain(thread.steers.iter())
             .find(|candidate| candidate.id == message)
             .cloned()
     })
@@ -3270,7 +3338,7 @@ fn group_paragraphs(group: &ActivityGroup<'_>, snapshot: &Snapshot) -> Vec<Parag
                 let key = call_key(group, position);
                 let open = is_disclosed(&key);
                 if open {
-                    match call_body(call) {
+                    match call_body(call, &key) {
                         Some(CallBody::Edit(preview)) => {
                             paragraphs.extend(preview_paragraphs(&preview, &key));
                         }
@@ -3323,16 +3391,63 @@ fn call_key(group: &ActivityGroup<'_>, position: usize) -> String {
 /// What an open call row shows above its output.
 enum CallBody {
     /// The change an edit tool described, as a diff.
-    Edit(EditPreview),
+    Edit(Rc<EditPreview>),
     /// The call's arguments, for a tool with any worth reading.
     Arguments,
 }
 
-fn call_body(call: &ToolCall<'_>) -> Option<CallBody> {
-    if let Some(preview) = EditPreview::from_tool(call.name, call.input) {
+/// An open edit row's preview, with the call it was read from.
+struct CachedPreview {
+    call: String,
+    input: String,
+    preview: Option<Rc<EditPreview>>,
+}
+
+/// What the open row under `key` shows above its output.
+fn call_body(call: &ToolCall<'_>, key: &str) -> Option<CallBody> {
+    if let Some(preview) = edit_preview(call, key) {
         return Some(CallBody::Edit(preview));
     }
     (!call.input.is_empty() && call.input != "{}").then_some(CallBody::Arguments)
+}
+
+/// An edit call's preview, read again only when its arguments change.
+///
+/// An open row asks on every frame, and a large `Write` is a parse of the
+/// whole file. Compared by the arguments rather than by a revision, so a call
+/// whose arguments are still arriving is read again and no other is.
+fn edit_preview(call: &ToolCall<'_>, key: &str) -> Option<Rc<EditPreview>> {
+    if !EditPreview::is_edit_tool(call.name) {
+        return None;
+    }
+    let cached = MEMORY.with(|memory| {
+        memory
+            .borrow()
+            .previews
+            .get(key)
+            .filter(|cached| cached.call == call.id && cached.input == call.input)
+            .map(|cached| cached.preview.clone())
+    });
+    if let Some(preview) = cached {
+        return preview;
+    }
+    let preview = EditPreview::from_tool(call.name, call.input).map(Rc::new);
+    MEMORY.with(|memory| {
+        let mut memory = memory.borrow_mut();
+        #[cfg(test)]
+        {
+            memory.previews_built += 1;
+        }
+        memory.previews.insert(
+            key.to_owned(),
+            CachedPreview {
+                call: call.id.clone(),
+                input: call.input.to_owned(),
+                preview: preview.clone(),
+            },
+        );
+    });
+    preview
 }
 
 /// What a call is printing, while it runs in a live group.
@@ -3357,7 +3472,11 @@ fn live_output_shown(output: &str, open: bool) -> String {
     } else {
         LIVE_OUTPUT_TAIL_LINES
     };
-    let lines: Vec<&str> = output.trim_end_matches('\n').lines().collect();
+    let lines: Vec<&str> = output
+        .trim_end_matches('\n')
+        .lines()
+        .map(rewritten_line)
+        .collect();
     let skipped = lines.len().saturating_sub(keep);
     let shown = lines[skipped..].join("\n");
     if skipped > 0 {
@@ -3372,9 +3491,18 @@ fn last_output_line(output: Option<&str>) -> Option<String> {
     let line = output?
         .lines()
         .rev()
-        .map(str::trim)
+        .map(|line| rewritten_line(line).trim())
         .find(|line| !line.is_empty())?;
     Some(summarize_line(line, SUMMARY_CHARACTER_LIMIT))
+}
+
+/// What a terminal shows of one printed line: the text after its last `\r`.
+/// A progress bar rewrites its line that way; read whole, the step said
+/// "Downloading 1%" while the download was nearly done. A trailing `\r` is
+/// the cursor going back for the next state, so the state before it reads.
+fn rewritten_line(line: &str) -> &str {
+    let line = line.trim_end_matches('\r');
+    line.rsplit('\r').next().unwrap_or(line)
 }
 
 /// One preview line as drawn: tabs as four spaces, bounded, never empty so
@@ -4298,7 +4426,7 @@ fn tool_row(
         .child(title);
 
     if open {
-        match call_body(call) {
+        match call_body(call, &key) {
             Some(CallBody::Edit(preview)) => {
                 column = column.child(edit_preview_panel(&preview, &key));
             }
@@ -6040,7 +6168,7 @@ mod tests {
             tool_result("b", "second", false),
         ];
         let keys = |messages: &[&ConversationMessage]| -> Vec<(Uuid, String)> {
-            plan_rows(messages, true)
+            plan_rows(messages, true, &[])
                 .iter()
                 .filter_map(|row| match row {
                     RowPlan::Activity {
@@ -7072,6 +7200,40 @@ mod tests {
                 .any(|(_, text, _)| text == "Use the staging config"),
             "the reader's own words went undrawn"
         );
+    }
+
+    #[test]
+    fn a_steer_waiting_to_be_read_copies_like_any_prompt() {
+        // It is drawn with a prompt's Copy button and menu, which looked for
+        // the message only among the committed ones and did nothing.
+        let mut conversation = Conversation::new(Uuid::new_v4());
+        let id = conversation.id;
+        conversation.apply(ProviderEvent::Lifecycle(Lifecycle::TurnStarted));
+        conversation.apply(ProviderEvent::TextDelta("Let me check th".into()));
+        let steer = text(MessageRole::User, "Use the staging config");
+        let steer_id = steer.id;
+        conversation.hold_steer(steer);
+        let (test, mut visual) = open(conversation, 700.0, 600.0);
+
+        test.update(|cx| apply_menu_choice(&menu_owner(id, steer_id, None), COPY_MESSAGE, cx));
+        assert_eq!(
+            clipboard_text(&test).as_deref(),
+            Some("Use the staging config")
+        );
+
+        test.write_to_clipboard(ClipboardItem::new_string(String::new()));
+        let button = visual
+            .debug_bounds(MESSAGE_COPY_SELECTOR)
+            .expect("the steer offers a copy button")
+            .center();
+        visual.simulate_mouse_move(button, None, Default::default());
+        visual.simulate_mouse_down(button, gpui::MouseButton::Left, Default::default());
+        visual.simulate_mouse_up(button, gpui::MouseButton::Left, Default::default());
+        assert_eq!(
+            clipboard_text(&test).as_deref(),
+            Some("Use the staging config")
+        );
+        assert!(is_copied(id, steer_id));
     }
 
     #[test]
@@ -8525,7 +8687,7 @@ mod tests {
 
         // While the turn runs, before the answer: the plan comes straight after
         // the live group, so the group is still found live.
-        let running = plan_rows(&messages[..7], true);
+        let running = plan_rows(&messages[..7], true, &[]);
         assert_eq!(
             running,
             vec![
@@ -8549,7 +8711,7 @@ mod tests {
         // Settled, with the answer below: the plan has not moved, and it is
         // the latest plan rather than the first.
         assert_eq!(
-            plan_rows(&messages, false),
+            plan_rows(&messages, false, &[]),
             vec![
                 RowPlan::Message(0),
                 RowPlan::Message(1),
@@ -8569,13 +8731,46 @@ mod tests {
     }
 
     #[test]
+    fn a_running_turns_plan_stays_live_past_a_steer_it_read() {
+        // A landed steer is a user message and splits the turn as a prompt
+        // does, so the plan written before it read as settled, its step no
+        // longer spinning, while the turn still worked through it.
+        let source = [
+            text(MessageRole::User, "fix it"),
+            tool_use("todo-1", "TodoWrite", TODOS),
+            tool_use("read", "Read", "{}"),
+            tool_result("read", "fn a() {}", false),
+            text(MessageRole::User, "Use the staging config"),
+        ];
+        let messages = borrowed(&source);
+        let plan = |is_live| RowPlan::Plan {
+            message: 1,
+            is_live,
+        };
+        assert!(plan_rows(&messages, true, &[source[4].id]).contains(&plan(true)));
+        // After a prompt, the plan is the finished turn's.
+        assert!(plan_rows(&messages, true, &[]).contains(&plan(false)));
+        assert!(plan_rows(&messages, false, &[source[4].id]).contains(&plan(false)));
+
+        // A plan the turn wrote after the steer is the one being worked.
+        let mut later = source.to_vec();
+        later.push(tool_use("todo-2", "TodoWrite", TODOS));
+        let rows = plan_rows(&borrowed(&later), true, &[source[4].id]);
+        assert!(rows.contains(&plan(false)));
+        assert!(rows.contains(&RowPlan::Plan {
+            message: 5,
+            is_live: true
+        }));
+    }
+
+    #[test]
     fn an_emptied_or_unreadable_plan_is_no_card() {
         let emptied = [
             tool_use("todo-1", "TodoWrite", TODOS),
             tool_use("todo-2", "TodoWrite", r#"{"todos":[]}"#),
         ];
         assert!(
-            !plan_rows(&borrowed(&emptied), false)
+            !plan_rows(&borrowed(&emptied), false, &[])
                 .iter()
                 .any(|row| matches!(row, RowPlan::Plan { .. })),
             "a cleared list still showed the one it replaced"
@@ -8601,7 +8796,7 @@ mod tests {
             stop_reason: "end_turn".into(),
         });
         let messages: Vec<_> = conversation.messages().collect();
-        assert!(plan_rows(&messages, false).contains(&RowPlan::Plan {
+        assert!(plan_rows(&messages, false, &[]).contains(&RowPlan::Plan {
             message: messages.len() - 2,
             is_live: false,
         }));
@@ -9111,6 +9306,144 @@ mod tests {
         assert_eq!(
             crate::selection::tests::document_paragraphs(),
             crate::selection::tests::painted_paragraphs()
+        );
+    }
+
+    #[test]
+    fn an_open_call_row_stays_open_while_its_turn_goes_on() {
+        // A call's row is keyed under its group's key, and pruning kept only
+        // the group keys themselves: the next call, result or input delta of
+        // a running turn closed the row the reader had opened.
+        let mut conversation = Conversation::new(Uuid::new_v4());
+        conversation.append(text(MessageRole::User, "Build it"));
+        conversation.apply(ProviderEvent::Lifecycle(Lifecycle::TurnStarted));
+        conversation.apply(ProviderEvent::ToolUse {
+            id: "build".into(),
+            name: "Bash".into(),
+            input: r#"{"command":"cargo build"}"#.into(),
+        });
+        let mut test = TestAppContext::single();
+        let window = test.add_window(move |_, _| Harness { conversation });
+        let visual = VisualTestContext::from_window(*window.deref(), &test);
+        visual.simulate_resize(size(px(900.0), px(2_000.0)));
+        redraw(&mut test);
+        let call = window
+            .update(&mut test, |view, _, cx| {
+                let first = view.conversation.messages().nth(1).unwrap().id;
+                let group = format!("{}:work:{first}:0", view.conversation.id);
+                toggle_disclosure(&group);
+                let call = format!("{group}:0:call");
+                toggle_disclosure(&call);
+                cx.notify();
+                call
+            })
+            .unwrap();
+        redraw(&mut test);
+        let arguments = format!("{call}:arguments");
+        let painted = || {
+            crate::selection::tests::painted_paragraphs()
+                .iter()
+                .any(|(paragraph, ..)| *paragraph == arguments)
+        };
+        assert!(painted(), "the open call shows its arguments");
+
+        window
+            .update(&mut test, |view, _, cx| {
+                view.conversation.apply(ProviderEvent::ToolResult {
+                    id: "build".into(),
+                    content: "Finished".into(),
+                    is_error: false,
+                });
+                view.conversation.apply(ProviderEvent::ToolUse {
+                    id: "test".into(),
+                    name: "Bash".into(),
+                    input: r#"{"command":"cargo test"}"#.into(),
+                });
+                cx.notify();
+            })
+            .unwrap();
+        redraw(&mut test);
+        assert!(is_disclosed(&call), "the next call closed the open row");
+        assert!(painted());
+    }
+
+    #[test]
+    fn an_open_edit_rows_preview_is_built_once_until_its_call_changes() {
+        // An open row was previewed on every frame, and a large `Write` took
+        // a frame's budget to preview.
+        let mut conversation = Conversation::new(Uuid::new_v4());
+        conversation.append(text(MessageRole::User, "Write it"));
+        conversation.apply(ProviderEvent::Lifecycle(Lifecycle::TurnStarted));
+        conversation.apply(ProviderEvent::ToolUse {
+            id: "write".into(),
+            name: "Write".into(),
+            input: r#"{"file_path":"/p/a.txt","content":"one\n"}"#.into(),
+        });
+        let mut test = TestAppContext::single();
+        let window = test.add_window(move |_, _| Harness { conversation });
+        let visual = VisualTestContext::from_window(*window.deref(), &test);
+        visual.simulate_resize(size(px(900.0), px(2_000.0)));
+        redraw(&mut test);
+        let built = || MEMORY.with(|memory| memory.borrow().previews_built);
+        let before = built();
+        let call = window
+            .update(&mut test, |view, _, cx| {
+                let first = view.conversation.messages().nth(1).unwrap().id;
+                let group = format!("{}:work:{first}:0", view.conversation.id);
+                toggle_disclosure(&group);
+                let call = format!("{group}:0:call");
+                toggle_disclosure(&call);
+                cx.notify();
+                call
+            })
+            .unwrap();
+        let diff = || {
+            crate::selection::tests::painted_paragraphs()
+                .into_iter()
+                .filter(|(paragraph, ..)| paragraph.starts_with(&format!("{call}:diff:")))
+                .map(|(_, text, _)| text)
+                .collect::<Vec<_>>()
+        };
+        for _ in 0..3 {
+            window.update(&mut test, |_, _, cx| cx.notify()).unwrap();
+            redraw(&mut test);
+        }
+        assert_eq!(diff(), ["+one"]);
+        assert_eq!(built() - before, 1, "a repaint rebuilt the preview");
+
+        // The call's arguments are replaced whole: the preview follows.
+        window
+            .update(&mut test, |view, _, cx| {
+                view.conversation.apply(ProviderEvent::ToolInput {
+                    id: "write".into(),
+                    input: r#"{"file_path":"/p/a.txt","content":"two\n"}"#.into(),
+                });
+                cx.notify();
+            })
+            .unwrap();
+        redraw(&mut test);
+        assert_eq!(diff(), ["+two"]);
+        assert_eq!(built() - before, 2);
+    }
+
+    #[test]
+    fn a_progress_line_reads_as_its_latest_state() {
+        // A progress bar rewrites its line with `\r`. Read whole, the step
+        // said "Downloading 1%" while the download was nearly done.
+        assert_eq!(
+            last_output_line(Some(
+                "Fetching\nDownloading 1%\rDownloading 2%\rDownloading 98%"
+            )),
+            Some("Downloading 98%".into())
+        );
+        // A trailing `\r` waits for what rewrites it; the line still reads.
+        assert_eq!(
+            last_output_line(Some("Downloading 1%\rDownloading 2%\r")),
+            Some("Downloading 2%".into())
+        );
+        assert_eq!(
+            live_output_shown("a\r\nstep 1\rstep 2\nb 1%\rb 2%\r", true),
+            "a\nstep 2\nb 2%"
         );
     }
 
