@@ -346,7 +346,15 @@ pub struct PushContext {
     pub branch_push_remote: Option<String>,
     pub push_default: Option<String>,
     pub remotes: Vec<String>,
+    /// The branch has an upstream, and a plain `git push` has nowhere to
+    /// send it (see [`push_destination`]).
+    pub plain_push_refused: bool,
 }
+
+/// What Push says for a branch whose upstream a plain `git push` refuses.
+pub const PLAIN_PUSH_REFUSED: &str = "This branch tracks a local branch, or a branch of another \
+     name, and a plain git push refuses that. Push it from a terminal, or track a branch of its \
+     own name.";
 
 /// Decide the push invocation.
 ///
@@ -359,6 +367,9 @@ pub fn push_arguments(context: &PushContext) -> Result<Vec<String>, String> {
         return Err("Check out a branch before pushing.".into());
     }
     if context.merge_ref.as_deref().is_some_and(|m| !m.is_empty()) {
+        if context.plain_push_refused {
+            return Err(PLAIN_PUSH_REFUSED.into());
+        }
         return Ok(vec!["push".into()]);
     }
     let remote = context
@@ -407,13 +418,41 @@ async fn push_context(root: &Path) -> PushContext {
         .await
         .map(|text| text.lines().map(str::to_string).collect())
         .unwrap_or_default();
+    let plain_push_refused = match (&branch, &merge_ref) {
+        (Some(branch), Some(_)) => push_destination(root, branch).await.is_none(),
+        _ => false,
+    };
     PushContext {
         branch,
         merge_ref,
         branch_push_remote,
         push_default,
         remotes,
+        plain_push_refused,
     }
+}
+
+/// Where a plain `git push` sends `branch`: its `@{push}`, or `None` when git
+/// has nowhere it would.
+///
+/// Under `push.default=simple`, git's default, a branch that pushes where it
+/// pulls from must track a branch of its own name there, so one tracking a
+/// local branch (remote `.`), or `origin/main` from `feature`, is refused; one
+/// that pushes to another remote goes to its own name. `%(push)` is git's own
+/// reading of all of that, `push.default` included, and needs no
+/// remote-tracking ref, so an empty clone's gone upstream still has one.
+pub async fn push_destination(root: &Path, branch: &str) -> Option<String> {
+    let reference = format!("refs/heads/{branch}");
+    // A pattern also matches refs below it, so the line is picked by name.
+    let listed = read(
+        root,
+        &["for-each-ref", "--format=%(refname)%00%(push)", &reference],
+    )
+    .await?;
+    listed.lines().find_map(|line| {
+        let (name, push) = line.split_once('\0')?;
+        (name == reference && !push.is_empty()).then(|| push.to_string())
+    })
 }
 
 /// The line naming the moved ref, or git's own "Everything up-to-date".
@@ -1326,6 +1365,50 @@ mod tests {
             git(remote.path(), &["rev-parse", "main"]),
             git(root, &["rev-parse", "HEAD"])
         );
+    }
+
+    #[test]
+    fn a_branch_tracking_another_branch_is_not_pushed_plainly() {
+        // Under `push.default=simple` a plain `git push` refuses both a local
+        // upstream and a remote branch of another name, so Push never ran it
+        // with any hope of working.
+        let temp = tempfile::tempdir().unwrap();
+        let clone = temp.path().join("clone");
+        git(
+            temp.path(),
+            &["init", "-q", "--bare", "-b", "main", "remote.git"],
+        );
+        git(temp.path(), &["clone", "-q", "remote.git", "clone"]);
+        identify(&clone);
+        std::fs::write(clone.join("a.txt"), "first\n").unwrap();
+        git(&clone, &["add", "."]);
+        git(&clone, &["commit", "-qm", "first"]);
+        git(&clone, &["push", "-q"]);
+        let refused = |clone: &Path| run(push_context(clone)).plain_push_refused;
+        assert!(!refused(&clone), "main tracks origin/main");
+
+        git(&clone, &["checkout", "-q", "-b", "feature"]);
+        std::fs::write(clone.join("b.txt"), "second\n").unwrap();
+        git(&clone, &["add", "."]);
+        git(&clone, &["commit", "-qm", "second"]);
+        for upstream in ["main", "origin/main"] {
+            git(
+                &clone,
+                &["branch", "-q", &format!("--set-upstream-to={upstream}")],
+            );
+            assert!(refused(&clone), "{upstream}");
+            assert_eq!(run(push(&clone)).unwrap_err(), PLAIN_PUSH_REFUSED);
+        }
+        assert_eq!(
+            git(
+                &temp.path().join("remote.git"),
+                &["for-each-ref", "--format=%(refname)", "refs/heads"]
+            ),
+            "refs/heads/main\n",
+            "nothing was pushed"
+        );
+        git(&clone, &["push", "-q", "-u", "origin", "feature"]);
+        assert!(!refused(&clone), "feature tracks origin/feature");
     }
 
     #[test]

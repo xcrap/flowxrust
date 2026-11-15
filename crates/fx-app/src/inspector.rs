@@ -935,6 +935,30 @@ mod tests {
     }
 
     #[test]
+    fn refresh_reads_the_diff_again_at_the_same_revision() {
+        // Whatever the revision misses, Refresh is how the reader asks for
+        // the diff again; with the same key shown, it read nothing.
+        let root = repo();
+        std::fs::write(root.path().join("sample.txt"), "after the edit\n").unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let mut test = gpui::TestAppContext::single();
+        let (inspector, _) = mount(&mut test, data.path(), Some(root.path()), 360.0);
+        inspector.update(&mut test, |inspector, cx| {
+            let shown = inspector.diff.shown;
+            assert!(shown.is_some() && inspector.diff.loading.is_none());
+            inspector.refresh(cx);
+            assert_eq!(inspector.diff.loading, shown, "Refresh reads the diff");
+            assert!(
+                inspector.diff.document.is_some(),
+                "and keeps the one shown until it lands"
+            );
+        });
+        wait_until(&mut test, &inspector, |i| {
+            i.diff.loading.is_none() && i.diff.shown.is_some()
+        });
+    }
+
+    #[test]
     fn late_diffs_cannot_cross_a_project_or_comparison_switch() {
         let data = tempfile::tempdir().unwrap();
         let mut test = gpui::TestAppContext::single();

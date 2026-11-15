@@ -15,6 +15,10 @@ pub struct RevisionInputs<'a> {
     pub status: &'a str,
     pub unstaged_numstat: &'a str,
     pub staged_numstat: &'a str,
+    /// The commit each changed submodule has checked out.
+    pub submodules: &'a str,
+    /// Where a plain `git push` goes, which configuration alone can change.
+    pub push: &'a str,
 }
 
 /// Hash a snapshot's inputs.
@@ -22,7 +26,9 @@ pub struct RevisionInputs<'a> {
 /// Status and numstat text alone cannot see a same-size rewrite of a changed
 /// file, nor an untracked file whose lines changed, so each changed path's
 /// metadata goes in as well. The index goes in because `git add` changes what
-/// is staged without changing a byte in the working tree.
+/// is staged without changing a byte in the working tree. A new commit in a
+/// submodule already at another commit changes none of those, so each
+/// changed submodule's commit goes in too.
 pub fn content_revision<'a>(
     root: &Path,
     git_dir: Option<&Path>,
@@ -33,7 +39,9 @@ pub fn content_revision<'a>(
     builder
         .field("status", inputs.status)
         .field("unstaged", inputs.unstaged_numstat)
-        .field("staged", inputs.staged_numstat);
+        .field("staged", inputs.staged_numstat)
+        .field("submodules", inputs.submodules)
+        .field("push", inputs.push);
     let mut paths: Vec<&str> = paths.into_iter().collect();
     paths.sort_unstable();
     paths.dedup();
@@ -100,6 +108,26 @@ mod tests {
         let before = revision(temp.path(), " M a.txt");
         std::fs::write(temp.path().join(".git/index"), "staged").unwrap();
         assert_ne!(before, revision(temp.path(), " M a.txt"));
+    }
+
+    #[test]
+    fn a_submodules_new_commit_changes_the_revision() {
+        // Its status line, counts and folder can all read as they did.
+        let temp = tempfile::tempdir().unwrap();
+        let at = |commit: &str| {
+            content_revision(
+                temp.path(),
+                None,
+                RevisionInputs {
+                    status: " M sub",
+                    unstaged_numstat: "1\t1\tsub",
+                    submodules: commit,
+                    ..Default::default()
+                },
+                ["sub"],
+            )
+        };
+        assert_ne!(at("sub\0aaaa\n"), at("sub\0bbbb\n"));
     }
 
     #[test]

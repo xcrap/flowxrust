@@ -66,6 +66,11 @@ pub struct LineCounts {
 
 pub struct GitStatusParser;
 
+/// Whether a status column reports a change on its side.
+fn changed(column: &str) -> bool {
+    column != " " && column != "?"
+}
+
 impl GitStatusParser {
     /// Parse `git status --porcelain=v1 --branch -z`.
     pub fn parse_status(output: &str) -> Status {
@@ -175,8 +180,16 @@ impl GitStatusParser {
             .files
             .iter()
             .map(|line| {
-                let unstaged = unstaged_numstat.get(&line.path);
-                let staged = staged_numstat.get(&line.path);
+                // A row takes only the sides it reports changed. `git rm
+                // --cached x`, with `x` still there, lists it as `D ` and as
+                // `??`; read by path alone, each row took both counts.
+                let untracked = line.staged_status == "?" && line.unstaged_status == "?";
+                let unstaged = (untracked || changed(&line.unstaged_status))
+                    .then(|| unstaged_numstat.get(&line.path))
+                    .flatten();
+                let staged = changed(&line.staged_status)
+                    .then(|| staged_numstat.get(&line.path))
+                    .flatten();
                 GitFileStatus {
                     path: line.path.clone(),
                     original_path: line.original_path.clone(),
@@ -566,6 +579,40 @@ mod tests {
         assert_eq!(f.unstaged_deletions, 2);
         assert_eq!(info.additions, 14);
         assert_eq!(info.deletions, 3);
+    }
+
+    #[test]
+    fn a_path_listed_twice_counts_each_side_once() {
+        // `git rm --cached x` with `x` still on disk lists it as `D ` and as
+        // `??`. Read by path alone, each row took both sides' counts, and the
+        // totals doubled.
+        let status = GitStatusParser::parse_status(&z(&["## main", "D  x.txt", "?? x.txt"]));
+        let unstaged = HashMap::from([(
+            "x.txt".to_string(),
+            LineCounts {
+                additions: 3,
+                deletions: 0,
+            },
+        )]);
+        let staged = HashMap::from([(
+            "x.txt".to_string(),
+            LineCounts {
+                additions: 0,
+                deletions: 3,
+            },
+        )]);
+        let info = GitStatusParser::make_info(&status, &unstaged, &staged, false, 1);
+        let counts = |f: &GitFileStatus| {
+            (
+                f.staged_additions,
+                f.staged_deletions,
+                f.unstaged_additions,
+                f.unstaged_deletions,
+            )
+        };
+        assert_eq!(counts(&info.files[0]), (0, 3, 0, 0), "the staged deletion");
+        assert_eq!(counts(&info.files[1]), (0, 0, 3, 0), "the new file");
+        assert_eq!((info.additions, info.deletions), (3, 3));
     }
 
     #[test]

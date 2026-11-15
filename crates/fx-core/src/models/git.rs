@@ -123,6 +123,11 @@ pub struct GitRepositoryInfo {
     /// reports no ahead count even though every local commit is unpublished.
     #[serde(rename = "upstreamGone", default)]
     pub upstream_gone: bool,
+    /// The branch tracks an upstream a plain `git push` refuses: under
+    /// `push.default=simple`, a local branch, or a remote branch of another
+    /// name. Push runs a plain `git push` for a branch with an upstream.
+    #[serde(rename = "plainPushRefused", default)]
+    pub plain_push_refused: bool,
     #[serde(default)]
     pub additions: usize,
     #[serde(default)]
@@ -163,6 +168,7 @@ impl GitRepositoryInfo {
         self.is_git_repo
             && self.has_remote
             && !self.is_detached_head()
+            && !self.plain_push_refused
             && (self.ahead_count > 0
                 || (self.has_commits && (self.upstream_branch.is_empty() || self.upstream_gone)))
     }
@@ -298,6 +304,15 @@ mod tests {
 
         info.has_remote = false;
         assert!(!info.can_push(), "no remote");
+
+        info.has_remote = true;
+        info.ahead_count = 1;
+        info.upstream_branch = "origin/main".into();
+        info.plain_push_refused = true;
+        assert!(
+            !info.can_push(),
+            "an upstream of another name, which a plain push refuses"
+        );
     }
 
     #[test]

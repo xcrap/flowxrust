@@ -788,9 +788,15 @@ impl Inspector {
         cx.notify();
     }
 
-    /// Re-read the tree, and retry a diff that failed.
+    /// Re-read the tree and the diff, and retry a diff that failed.
+    ///
+    /// The diff is read again even at the same key: whatever the revision
+    /// misses, Refresh is how the reader asks, and a new commit in a
+    /// submodule once moved nothing it hashed. The document shown stays
+    /// until the new one lands.
     pub(super) fn refresh(&mut self, cx: &mut Context<Self>) {
         self.diff.failed = None;
+        self.diff.shown = None;
         self.monitor.update(cx, |monitor, cx| monitor.refresh(cx));
         self.ensure_diff(cx);
     }

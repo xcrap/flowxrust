@@ -257,17 +257,28 @@ pub async fn changes_snapshot(root: &Path) -> Result<Snapshot, String> {
             "Changed-file lists and line totals are partial: limited to {MAX_FILES} entries and 1 MiB."
         ));
     }
-    let (unstaged_read, staged_read, remotes) = tokio::join!(
+    let push_destination = async {
+        // Push runs a plain `git push` only for a branch with an upstream.
+        if status.upstream_branch.is_empty() {
+            return None;
+        }
+        Some(git::operations::push_destination(&root, &status.branch).await)
+    };
+    let (unstaged_read, staged_read, remotes, submodules, push_destination) = tokio::join!(
         numstat(&root, &status, false),
         numstat(&root, &status, true),
         command(&root, &["remote"], MAX_LIST_BYTES),
+        submodule_commits(&root, &status),
+        push_destination,
     );
     let (mut unstaged, unstaged_text, unstaged_notice) = unstaged_read;
     let (staged, staged_text, staged_notice) = staged_read;
     notices.extend(unstaged_notice);
     notices.extend(staged_notice);
-    let has_remote = !status.upstream_branch.is_empty()
-        || remotes.is_ok_and(|output| output.success() && !output.stdout.trim().is_empty());
+    // From `git remote` alone: an upstream can be a local branch, which is
+    // nothing to push to.
+    let has_remote =
+        remotes.is_ok_and(|output| output.success() && !output.stdout.trim().is_empty());
     let mut remaining = MAX_UNTRACKED_TOTAL_BYTES;
     let mut uncounted = 0;
     for file in &status.files {
@@ -298,15 +309,53 @@ pub async fn changes_snapshot(root: &Path) -> Result<Snapshot, String> {
             status: status_text,
             unstaged_numstat: &unstaged_text,
             staged_numstat: &staged_text,
+            submodules: &submodules,
+            push: push_destination.clone().flatten().as_deref().unwrap_or(""),
         },
         status.files.iter().map(|file| file.path.as_str()),
     );
-    let info = GitStatusParser::make_info(&status, &unstaged, &staged, has_remote, revision);
+    let mut info = GitStatusParser::make_info(&status, &unstaged, &staged, has_remote, revision);
+    info.plain_push_refused = push_destination.is_some_and(|destination| destination.is_none());
     Ok(Snapshot {
         root,
         repository: Some(info),
         notice: (!notices.is_empty()).then(|| notices.join(" ")),
     })
+}
+
+/// The commit each changed submodule has checked out, a `path NUL commit`
+/// line each, for the revision.
+///
+/// A new commit in a submodule already at another commit leaves its status
+/// line, its `Subproject commit` counts, its folder and the index as they
+/// were. A gitlink is a folder, not a link, holding a repository; a nested
+/// repository, listed untracked as `vendor/lib/`, shows no commit.
+async fn submodule_commits(root: &Path, status: &git::Status) -> String {
+    let mut commits = String::new();
+    for file in &status.files {
+        let folder = root.join(&file.path);
+        let gitlink = !file.path.ends_with('/')
+            && std::fs::symlink_metadata(&folder).is_ok_and(|metadata| metadata.is_dir())
+            && std::fs::symlink_metadata(folder.join(".git")).is_ok();
+        if !gitlink {
+            continue;
+        }
+        let head = command(
+            &folder,
+            &["rev-parse", "--verify", "--quiet", "HEAD"],
+            MAX_LIST_BYTES,
+        )
+        .await
+        .ok()
+        .filter(CommandOutput::success)
+        .map(|output| output.stdout.trim().to_string())
+        .unwrap_or_default();
+        commits.push_str(&file.path);
+        commits.push('\0');
+        commits.push_str(&head);
+        commits.push('\n');
+    }
+    commits
 }
 
 /// Whether an untracked entry is a directory rather than a file: a trailing
@@ -370,25 +419,36 @@ fn changed(column: &str) -> bool {
     column != " " && column != "?"
 }
 
-/// The rename detection that pairs files as the status read did: `-C` when
-/// it reported a copy, `-M` when it reported a rename, and none otherwise.
+/// The rename detection that pairs files as the status read did on the
+/// sides given: `-C` when it reported a copy, `-M` when it reported a rename,
+/// and none otherwise.
 ///
 /// Porcelain `git diff` detected renames by default, as `diff.renames` said;
 /// plumbing reads no such setting, and status follows `status.renames` before
 /// it. The list beside the diff is status's, so the diff follows status.
-fn rename_detection<'a>(
-    columns: impl IntoIterator<Item = (&'a str, &'a str)>,
-) -> Option<&'static str> {
+fn rename_detection<'a>(columns: impl IntoIterator<Item = &'a str>) -> Option<&'static str> {
     let mut detection = None;
-    for (staged, unstaged) in columns {
-        if staged == "C" || unstaged == "C" {
+    for column in columns {
+        if column == "C" {
             return Some("-C");
         }
-        if staged == "R" || unstaged == "R" {
+        if column == "R" {
             detection = Some("-M");
         }
     }
     detection
+}
+
+/// Each file's status column for one side: the index against `HEAD`, or the
+/// working tree against the index.
+fn side(files: &[GitFileStatus], staged: bool) -> impl Iterator<Item = &str> {
+    files.iter().map(move |file| {
+        if staged {
+            file.staged_status.as_str()
+        } else {
+            file.unstaged_status.as_str()
+        }
+    })
 }
 
 /// What the index is compared with: `HEAD`, or on an unborn branch the empty
@@ -429,12 +489,13 @@ async fn numstat(
         })
         .map(|file| file.path.as_str())
         .collect();
-    let renames = rename_detection(
-        status
-            .files
-            .iter()
-            .map(|file| (file.staged_status.as_str(), file.unstaged_status.as_str())),
-    );
+    let renames = rename_detection(status.files.iter().map(|file| {
+        if cached {
+            file.staged_status.as_str()
+        } else {
+            file.unstaged_status.as_str()
+        }
+    }));
     let read = async {
         let base;
         let comparison = if cached {
@@ -596,41 +657,48 @@ pub async fn project_diff(
             ComparisonMode::Staged => Comparison::Index(&base),
             ComparisonMode::Base => Comparison::Tree(&base),
         };
-        let renames = rename_detection(
-            files
-                .iter()
-                .map(|file| (file.staged_status.as_str(), file.unstaged_status.as_str())),
-        );
-        let mut args = vec!["-c", "core.quotePath=false"];
-        args.extend(comparison.args(
-            renames,
-            &[
-                "-p",
-                "--submodule=short",
-                // The path parser relies on these prefixes, whatever
-                // `diff.noprefix` and `diff.mnemonicPrefix` say.
-                "--src-prefix=a/",
-                "--dst-prefix=b/",
-            ],
-        ));
-        let output = require_success(command(root, &args, remaining).await?)?;
-        let text = if output.truncated {
-            truncated = true;
-            complete_lines(&output.stdout)
-        } else {
-            &output.stdout
+        let tracked = match mode {
+            ComparisonMode::Base => {
+                base_sections(root, comparison, &files, &mut remaining, &mut truncated).await?
+            }
+            _ => {
+                let renames = rename_detection(side(&files, mode == ComparisonMode::Staged));
+                tracked_sections(
+                    root,
+                    comparison,
+                    renames,
+                    &[],
+                    &mut remaining,
+                    &mut truncated,
+                )
+                .await?
+            }
         };
-        remaining = remaining.saturating_sub(text.len());
-        sections.extend(git::parse_unified_diff(text));
+        // Labelled by a tracked row, one this comparison shows first:
+        // `git rm --cached x` lists `x` as `D ` and as `??`, and the last row
+        // by path labelled the deletion `?`.
+        let rows: HashMap<&str, &GitFileStatus> = files
+            .iter()
+            .filter(|file| !file.is_untracked())
+            .chain(visible.iter().copied().filter(|file| !file.is_untracked()))
+            .map(|file| (file.path.as_str(), file))
+            .collect();
+        sections.extend(tracked.into_iter().map(|section| {
+            let status = rows
+                .get(section.path.as_str())
+                .map(|file| mode.status(file))
+                .unwrap_or_default();
+            (section, status)
+        }));
     }
 
     if mode != ComparisonMode::Staged {
-        let new_files: Vec<&str> = visible
+        let new_files: Vec<&GitFileStatus> = visible
             .iter()
+            .copied()
             .filter(|file| file.is_untracked())
-            .map(|file| file.path.as_str())
             .collect();
-        for (shown, path) in new_files.iter().enumerate() {
+        for (shown, file) in new_files.iter().enumerate() {
             if shown >= MAX_NEW_FILES_IN_DIFF || remaining == 0 {
                 notices.push(format!(
                     "{} more new file(s) are listed but not shown.",
@@ -638,26 +706,15 @@ pub async fn project_diff(
                 ));
                 break;
             }
-            let (section, cut) = untracked_section(root, path, &mut remaining);
+            let (section, cut) = untracked_section(root, &file.path, &mut remaining);
             truncated |= cut;
-            sections.push(section);
+            sections.push((section, mode.status(file)));
         }
     }
 
-    sections.sort_by(|a, b| a.path.cmp(&b.path));
-    let by_path: HashMap<&str, &GitFileStatus> = files
-        .iter()
-        .map(|file| (file.path.as_str(), file))
-        .collect();
-    let statuses = sections
-        .iter()
-        .map(|section| {
-            by_path
-                .get(section.path.as_str())
-                .map(|file| mode.status(file))
-                .unwrap_or_default()
-        })
-        .collect();
+    // Stable, so a tracked section stays ahead of a new file at its path.
+    sections.sort_by(|a, b| a.0.path.cmp(&b.0.path));
+    let (sections, statuses): (Vec<_>, Vec<_>) = sections.into_iter().unzip();
     if truncated {
         notices.insert(
             0,
@@ -670,6 +727,83 @@ pub async fn project_diff(
         statuses,
         notice: (!notices.is_empty()).then(|| notices.join(" ")),
     })
+}
+
+/// What every shown diff asks for, after its comparison's own options.
+const DIFF_OPTIONS: [&str; 4] = [
+    "-p",
+    "--submodule=short",
+    // The path parser relies on these prefixes, whatever `diff.noprefix` and
+    // `diff.mnemonicPrefix` say.
+    "--src-prefix=a/",
+    "--dst-prefix=b/",
+];
+
+/// One comparison's sections, limited to `paths` when any are given, within
+/// what is left of the byte budget.
+async fn tracked_sections(
+    root: &Path,
+    comparison: Comparison<'_>,
+    renames: Option<&'static str>,
+    paths: &[&str],
+    remaining: &mut usize,
+    truncated: &mut bool,
+) -> Result<Vec<DiffSection>, String> {
+    let mut args = vec!["-c", "core.quotePath=false"];
+    args.extend(comparison.args(renames, &DIFF_OPTIONS));
+    if !paths.is_empty() {
+        args.push("--");
+        args.extend_from_slice(paths);
+    }
+    let output = require_success(command(root, &args, *remaining).await?)?;
+    let text = if output.truncated {
+        *truncated = true;
+        complete_lines(&output.stdout)
+    } else {
+        &output.stdout
+    };
+    *remaining = remaining.saturating_sub(text.len());
+    Ok(git::parse_unified_diff(text))
+}
+
+/// Base's tracked sections, renames paired only where status paired them.
+///
+/// Status pairs a rename within a side: `HEAD` to the index, or the index to
+/// the working tree. Base compares `HEAD` with the working tree, where `-M`
+/// also paired a file added in the index with one deleted only in the working
+/// tree, and the deleted file vanished from the list. So Base is read with no
+/// detection, and the paths of the renames status reported are read again
+/// with it, on their own.
+async fn base_sections(
+    root: &Path,
+    comparison: Comparison<'_>,
+    files: &[GitFileStatus],
+    remaining: &mut usize,
+    truncated: &mut bool,
+) -> Result<Vec<DiffSection>, String> {
+    let renames = rename_detection(side(files, true).chain(side(files, false)));
+    let paired: Vec<&str> = files
+        .iter()
+        .filter(|file| {
+            rename_detection([file.staged_status.as_str(), file.unstaged_status.as_str()]).is_some()
+        })
+        .flat_map(|file| std::iter::once(file.path.as_str()).chain(file.original_path.as_deref()))
+        .collect();
+    // Past this, the paths would crowd the command line; every path is then
+    // read with detection, as it was before.
+    const MAX_PAIRED_BYTES: usize = 256 * 1024;
+    if paired.iter().map(|path| path.len() + 1).sum::<usize>() > MAX_PAIRED_BYTES {
+        return tracked_sections(root, comparison, renames, &[], remaining, truncated).await;
+    }
+    let mut sections = tracked_sections(root, comparison, None, &[], remaining, truncated).await?;
+    if renames.is_none() || paired.is_empty() || *remaining == 0 {
+        return Ok(sections);
+    }
+    let paired_set: HashSet<&str> = paired.iter().copied().collect();
+    sections.retain(|section| !paired_set.contains(section.path.as_str()));
+    sections
+        .extend(tracked_sections(root, comparison, renames, &paired, remaining, truncated).await?);
+    Ok(sections)
 }
 
 /// The empty tree in this repository's object format.
@@ -1107,14 +1241,14 @@ mod tests {
 
     #[test]
     fn renames_and_copies_are_detected_as_status_reported_them() {
-        assert_eq!(rename_detection([("M", " "), ("A", " "), ("?", "?")]), None);
-        assert_eq!(rename_detection([("R", " "), ("M", "M")]), Some("-M"));
-        assert_eq!(
-            rename_detection([(" ", "R")]),
-            Some("-M"),
-            "an intent-to-add file renamed in the working tree"
-        );
-        assert_eq!(rename_detection([("R", " "), ("C", " ")]), Some("-C"));
+        assert_eq!(rename_detection(["M", "A", "?"]), None);
+        assert_eq!(rename_detection(["R", "M"]), Some("-M"));
+        assert_eq!(rename_detection(["R", "C"]), Some("-C"));
+        // Each side follows its own column: an intent-to-add file renamed in
+        // the working tree is the working tree's rename, not the index's.
+        let renamed = [GitFileStatus::new("new", " ", "R")];
+        assert_eq!(rename_detection(side(&renamed, false)), Some("-M"));
+        assert_eq!(rename_detection(side(&renamed, true)), None);
     }
 
     #[test]
@@ -1301,6 +1435,166 @@ mod tests {
         assert_ne!(first, rewritten, "a same-size rewrite must change it");
         git(root, &["add", "a.txt"]);
         assert_ne!(rewritten, revision(), "staging must change it");
+    }
+
+    #[test]
+    fn a_file_untracked_but_still_on_disk_is_counted_once_and_labelled_per_comparison() {
+        // `git rm --cached` lists the path as `D ` and as `??`. Both rows read
+        // both sides' counts by path, so the totals doubled, and Staged
+        // labelled the deletion with the new file's `?`.
+        let temp = repository();
+        let root = temp.path();
+        std::fs::write(root.join("x.txt"), "one\ntwo\nthree\n").unwrap();
+        git(root, &["add", "."]);
+        git(root, &["commit", "-qm", "initial"]);
+        git(root, &["rm", "--cached", "-q", "x.txt"]);
+        let snapshot = block_on(changes_snapshot(root)).unwrap();
+        let info = snapshot.repository.unwrap();
+        let rows: Vec<(&str, String)> = info
+            .files
+            .iter()
+            .map(|file| (file.path.as_str(), file.status()))
+            .collect();
+        assert_eq!(rows, [("x.txt", "D".into()), ("x.txt", "??".into())]);
+        assert_eq!((info.additions, info.deletions), (3, 3));
+        let diff = |mode| {
+            block_on(project_diff(&snapshot.root, mode, info.files.clone(), true))
+                .unwrap()
+                .statuses
+        };
+        assert_eq!(diff(ComparisonMode::Staged), ["D"]);
+        assert_eq!(diff(ComparisonMode::Unstaged), ["?"]);
+        assert_eq!(diff(ComparisonMode::Base), ["D", "??"]);
+    }
+
+    #[test]
+    fn base_pairs_only_the_renames_status_reported() {
+        // Status pairs within a side. `-M` over HEAD and the working tree
+        // also paired a file added in the index with another deleted only
+        // in the working tree, and the deleted one vanished from Base.
+        let temp = repository();
+        let root = temp.path();
+        let lines = |word: &str| -> String { (0..12).map(|n| format!("{word} {n}\n")).collect() };
+        std::fs::write(root.join("a.txt"), lines("moved")).unwrap();
+        std::fs::write(root.join("old.txt"), lines("copied")).unwrap();
+        git(root, &["add", "."]);
+        git(root, &["commit", "-qm", "initial"]);
+        git(root, &["mv", "a.txt", "b.txt"]);
+        std::fs::write(root.join("new.txt"), lines("copied")).unwrap();
+        git(root, &["add", "new.txt"]);
+        std::fs::remove_file(root.join("old.txt")).unwrap();
+        let snapshot = block_on(changes_snapshot(root)).unwrap();
+        let info = snapshot.repository.unwrap();
+        let base = block_on(project_diff(
+            &snapshot.root,
+            ComparisonMode::Base,
+            info.files.clone(),
+            true,
+        ))
+        .unwrap();
+        let paths: Vec<&str> = base.sections.iter().map(|s| s.path.as_str()).collect();
+        assert_eq!(paths, ["b.txt", "new.txt", "old.txt"]);
+        assert_eq!(base.statuses, ["R", "A", "D"]);
+        assert_eq!(
+            (base.sections[0].additions, base.sections[0].deletions),
+            (0, 0),
+            "the rename status reported is still one"
+        );
+        let staged = block_on(project_diff(
+            &snapshot.root,
+            ComparisonMode::Staged,
+            info.files.clone(),
+            true,
+        ))
+        .unwrap();
+        let paths: Vec<&str> = staged.sections.iter().map(|s| s.path.as_str()).collect();
+        assert_eq!(paths, ["b.txt", "new.txt"]);
+    }
+
+    #[test]
+    fn a_new_commit_in_a_submodule_already_moved_is_a_new_revision() {
+        // Status, numstat, the folder's metadata and the index all read the
+        // same before and after, so the revision stood still and Refresh
+        // showed the old commit.
+        let temp = repository();
+        let root = temp.path();
+        let sub = root.join("sub");
+        std::fs::create_dir(&sub).unwrap();
+        git(&sub, &["init", "-q"]);
+        git(&sub, &["config", "user.email", "test@example.invalid"]);
+        git(&sub, &["config", "user.name", "FlowX test"]);
+        std::fs::write(sub.join("a.txt"), "one\n").unwrap();
+        git(&sub, &["add", "."]);
+        git(&sub, &["commit", "-qm", "one"]);
+        git(root, &["-c", "advice.addEmbeddedRepo=false", "add", "sub"]);
+        git(root, &["commit", "-qm", "with a submodule"]);
+        // Rewritten in place, so the submodule's folder keeps its metadata.
+        std::fs::write(sub.join("a.txt"), "two\n").unwrap();
+        git(&sub, &["commit", "-qam", "two"]);
+        let revision = || {
+            block_on(changes_snapshot(root))
+                .unwrap()
+                .repository
+                .unwrap()
+                .revision
+        };
+        let first = revision();
+        std::fs::write(sub.join("a.txt"), "six\n").unwrap();
+        git(&sub, &["commit", "-qam", "six"]);
+        assert_ne!(first, revision());
+    }
+
+    #[test]
+    fn a_branch_that_tracks_another_branch_is_not_offered_a_plain_push() {
+        // A plain `git push`, which is what Push runs for a branch with an
+        // upstream, refuses both under `push.default=simple`.
+        let temp = repository();
+        let root = temp.path();
+        let commit = |name: &str| {
+            std::fs::write(root.join(name), "text\n").unwrap();
+            git(root, &["add", name]);
+            git(root, &["commit", "-qm", name]);
+        };
+        commit("a.txt");
+        git(root, &["branch", "-M", "main"]);
+        git(root, &["checkout", "-q", "-b", "feature"]);
+        commit("b.txt");
+        let read = || {
+            block_on(changes_snapshot(root))
+                .unwrap()
+                .repository
+                .unwrap()
+        };
+        git(root, &["branch", "-q", "--set-upstream-to=main"]);
+        let local = read();
+        assert_eq!(
+            (local.upstream_branch.as_str(), local.ahead_count),
+            ("main", 1)
+        );
+        assert!(!local.has_remote, "a local branch is not a remote");
+        assert!(!local.can_push());
+
+        let remote = tempfile::tempdir().unwrap();
+        git(remote.path(), &["init", "-q", "--bare"]);
+        git(
+            root,
+            &["remote", "add", "origin", &remote.path().to_string_lossy()],
+        );
+        git(root, &["push", "-q", "origin", "main"]);
+        git(root, &["branch", "-q", "--set-upstream-to=origin/main"]);
+        let elsewhere = read();
+        assert_eq!(elsewhere.upstream_branch, "origin/main");
+        assert!(elsewhere.has_remote);
+        assert!(!elsewhere.can_push(), "{elsewhere:?}");
+
+        git(root, &["push", "-q", "-u", "origin", "feature"]);
+        commit("c.txt");
+        let own = read();
+        assert_eq!(
+            (own.upstream_branch.as_str(), own.ahead_count),
+            ("origin/feature", 1)
+        );
+        assert!(own.can_push());
     }
 
     #[test]
