@@ -37,6 +37,8 @@ pub struct ClaudeNativeStore {
     desktop_root: Option<PathBuf>,
     cache: Mutex<Cache>,
     maximum_transcript_bytes: u64,
+    maximum_summaries: usize,
+    maximum_files: usize,
 }
 
 #[derive(Default)]
@@ -144,6 +146,8 @@ impl ClaudeNativeStore {
             desktop_root: None,
             cache: Mutex::default(),
             maximum_transcript_bytes: MAX_TRANSCRIPT_BYTES,
+            maximum_summaries: MAX_SUMMARIES,
+            maximum_files: MAX_FILES,
         }
     }
 
@@ -167,10 +171,7 @@ impl ClaudeNativeStore {
         // history shared a cause listed it seventy times over.
         let mut refused = std::collections::BTreeMap::<String, Vec<String>>::new();
         for directory in &directories {
-            for path in children(directory)? {
-                if path.extension().and_then(|value| value.to_str()) != Some("jsonl") {
-                    continue;
-                }
+            for path in transcripts(directory, self.maximum_files)? {
                 let Some(id) = path
                     .file_stem()
                     .and_then(|value| value.to_str())
@@ -193,6 +194,11 @@ impl ClaudeNativeStore {
                     }
                     // Not a thread yet: nothing to list and nothing wrong.
                     Err(ProviderError::Protocol(reason)) if reason == EMPTY_TRANSCRIPT => {}
+                    // A neighbour's thread (`my-app` beside `my_app`), which
+                    // its own project lists. Warned about, it was a warning
+                    // Retry could never clear, and any warning stops this
+                    // project's deleted threads being hidden.
+                    Err(ProviderError::Protocol(reason)) if reason == FOREIGN_WORKSPACE => {}
                     Err(error) => refused.entry(error.to_string()).or_default().push(id),
                 }
             }
@@ -207,6 +213,7 @@ impl ClaudeNativeStore {
                 .any(|directory| path.parent() == Some(directory))
                 || current_paths.contains(path)
         });
+        evict_summaries(&mut cache, &directories, self.maximum_summaries);
         cache.transcripts.retain(|path, _| {
             !directories
                 .iter()
@@ -314,17 +321,16 @@ impl ClaudeNativeStore {
         let mut cache = self.cache.lock().unwrap_or_else(|error| error.into_inner());
         let desktop = self.desktop_state(&mut cache)?;
         let mut best = None;
-        for directory in directories {
+        for directory in &directories {
             // Native UUID filenames are normally lower-case. Match UUID values
             // rather than accepting arbitrary caller-supplied path components.
-            for path in children(&directory)? {
-                if path.extension().and_then(|value| value.to_str()) != Some("jsonl")
-                    || path
-                        .file_stem()
-                        .and_then(|value| value.to_str())
-                        .and_then(safe_session_id)
-                        .as_deref()
-                        != Some(&id)
+            for path in transcripts(directory, self.maximum_files)? {
+                if path
+                    .file_stem()
+                    .and_then(|value| value.to_str())
+                    .and_then(safe_session_id)
+                    .as_deref()
+                    != Some(&id)
                 {
                     continue;
                 }
@@ -342,6 +348,7 @@ impl ClaudeNativeStore {
                 }
             }
         }
+        evict_summaries(&mut cache, &directories, self.maximum_summaries);
         let Some((path, entry, summary, fingerprint)) = best else {
             return Err(protocol("Claude session was not found in this workspace"));
         };
@@ -462,15 +469,6 @@ impl ClaudeNativeStore {
                 accessed: cache.tick,
             },
         );
-        while cache.summaries.len() > MAX_SUMMARIES {
-            let oldest = cache
-                .summaries
-                .iter()
-                .min_by_key(|(_, value)| value.accessed)
-                .map(|(key, _)| key.clone())
-                .unwrap();
-            cache.summaries.remove(&oldest);
-        }
         match parsed {
             Ok(parsed) => Ok((parsed, fingerprint)),
             Err(reason) => Err(protocol(reason)),
@@ -1407,6 +1405,60 @@ fn children(path: &Path) -> Result<Vec<PathBuf>, ProviderError> {
     paths.sort();
     Ok(paths)
 }
+/// A history folder's transcripts, at most `limit` of them.
+///
+/// Only transcripts count. Claude keeps a folder beside a session's file
+/// (its subagents, its tool results), so counted as entries, 5,000 sessions
+/// were 10,000 and the whole listing failed.
+fn transcripts(path: &Path, limit: usize) -> Result<Vec<PathBuf>, ProviderError> {
+    let entries = match fs::read_dir(path) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error.into()),
+    };
+    let mut paths = Vec::new();
+    for entry in entries {
+        let path = entry?.path();
+        if path.extension().and_then(|value| value.to_str()) != Some("jsonl") {
+            continue;
+        }
+        if paths.len() >= limit {
+            return Err(protocol(format!(
+                "Claude history directory holds more than {limit} transcripts"
+            )));
+        }
+        paths.push(path);
+    }
+    paths.sort();
+    Ok(paths)
+}
+
+/// Bound the summary cache without evicting the folders just read.
+///
+/// One cache serves every project, so a project with more transcripts than
+/// it holds evicted its own entries as a pass read them, and the next pass
+/// read every one in full again. Past the limit, the oldest entries of other
+/// folders go, sorted once rather than scanned for each eviction.
+fn evict_summaries(cache: &mut Cache, keep: &[PathBuf], limit: usize) {
+    let excess = cache.summaries.len().saturating_sub(limit);
+    if excess == 0 {
+        return;
+    }
+    let mut others: Vec<(u64, PathBuf)> = cache
+        .summaries
+        .iter()
+        .filter(|(path, _)| {
+            !keep
+                .iter()
+                .any(|directory| path.parent() == Some(directory))
+        })
+        .map(|(path, summary)| (summary.accessed, path.clone()))
+        .collect();
+    others.sort_unstable_by_key(|(accessed, _)| *accessed);
+    for (_, path) in others.into_iter().take(excess) {
+        cache.summaries.remove(&path);
+    }
+}
 fn regular_fingerprint(path: &Path) -> Result<Fingerprint, ProviderError> {
     let metadata = fs::symlink_metadata(path)?;
     if !metadata.file_type().is_file() {
@@ -2299,6 +2351,109 @@ mod tests {
         );
     }
 
+    /// A one-record transcript of `session` in `folder`, run in `cwd`.
+    fn transcript(folder: &Path, session: &str, cwd: &Path) {
+        let record = json!({"type":"user","uuid":Uuid::new_v4(),"sessionId":session,"cwd":cwd,"timestamp":"2026-10-12T12:00:00.125Z","message":{"content":[{"type":"text","text":"Hello"}]}});
+        fs::write(
+            folder.join(format!("{session}.jsonl")),
+            format!("{record}\n"),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn a_project_past_the_cache_is_not_read_again_on_every_pass() {
+        // One summary cache serves every project. Past its size, a project's
+        // own transcripts evicted each other as the pass read them, so every
+        // one was read in full again on the next pass.
+        let fixture = Fixture::new();
+        let folder = fixture.file.parent().unwrap();
+        for _ in 0..5 {
+            transcript(folder, &Uuid::new_v4().to_string(), &fixture.workspace);
+        }
+        let mut store = fixture.store();
+        store.maximum_summaries = 4;
+        assert_eq!(store.list(fixture.root()).unwrap().threads.len(), 5);
+        let parses = store.cache.lock().unwrap().parses;
+        assert_eq!(store.list(fixture.root()).unwrap().threads.len(), 5);
+        assert_eq!(
+            store.cache.lock().unwrap().parses,
+            parses,
+            "a pass read its own transcripts again"
+        );
+        // Another project's are what make room for the one being listed.
+        let other = fixture.workspace.with_file_name("other");
+        fs::create_dir(&other).unwrap();
+        let other = fs::canonicalize(other).unwrap();
+        let other_folder = fixture.config.join("projects").join(project_key(&other));
+        fs::create_dir(&other_folder).unwrap();
+        transcript(&other_folder, &Uuid::new_v4().to_string(), &other);
+        let other = other.to_str().unwrap();
+        assert_eq!(store.list(other).unwrap().threads.len(), 1);
+        assert_eq!(store.cache.lock().unwrap().summaries.len(), 4);
+        let parses = store.cache.lock().unwrap().parses;
+        assert_eq!(store.list(other).unwrap().threads.len(), 1);
+        assert_eq!(store.cache.lock().unwrap().parses, parses);
+    }
+
+    #[test]
+    fn a_sessions_own_folder_does_not_count_toward_the_transcript_limit() {
+        // Claude keeps a folder beside each session's transcript, so counted
+        // as entries, 5,000 sessions were 10,000 and the whole listing failed.
+        let fixture = Fixture::new();
+        let folder = fixture.file.parent().unwrap();
+        transcript(folder, SESSION, &fixture.workspace);
+        fs::create_dir_all(folder.join(SESSION).join("subagents")).unwrap();
+        for _ in 0..2 {
+            let session = Uuid::new_v4().to_string();
+            transcript(folder, &session, &fixture.workspace);
+            fs::create_dir_all(folder.join(&session).join("tool-results")).unwrap();
+        }
+        let mut store = fixture.store();
+        store.maximum_files = 3;
+        let index = store.list(fixture.root()).unwrap();
+        assert_eq!(index.threads.len(), 3);
+        assert!(index.warnings.is_empty(), "{:?}", index.warnings);
+        assert_eq!(
+            store.read(fixture.root(), SESSION).unwrap().messages.len(),
+            1
+        );
+        // A transcript past the limit still is.
+        transcript(folder, &Uuid::new_v4().to_string(), &fixture.workspace);
+        assert!(store.list(fixture.root()).is_err());
+    }
+
+    #[test]
+    fn a_neighbours_transcripts_are_not_a_warning() {
+        // `my-app` and `my_app` both exist and encode to one history folder,
+        // so each one's transcripts are in the other's. Refused with a
+        // warning, they were a "Thread sync needs attention" Retry could
+        // never clear, and a warning stops deleted threads being hidden.
+        let fixture = Fixture::new();
+        let folder = fixture.file.parent().unwrap();
+        let neighbour = fixture.workspace.with_file_name("Açores-project-with-dots");
+        assert_eq!(project_key(&fixture.workspace), project_key(&neighbour));
+        fs::create_dir(&neighbour).unwrap();
+        let neighbour = fs::canonicalize(neighbour).unwrap();
+        transcript(folder, SESSION, &fixture.workspace);
+        let theirs = Uuid::new_v4().to_string();
+        transcript(folder, &theirs, &neighbour);
+        let store = fixture.store();
+        for (root, session) in [
+            (fixture.root(), SESSION),
+            (neighbour.to_str().unwrap(), theirs.as_str()),
+        ] {
+            let index = store.list(root).unwrap();
+            assert_eq!(index.warnings, Vec::<String>::new());
+            let listed: Vec<_> = index
+                .threads
+                .iter()
+                .map(|entry| entry.summary.identity.session_id.as_str())
+                .collect();
+            assert_eq!(listed, [session]);
+        }
+    }
+
     #[test]
     fn a_rename_that_keeps_the_folders_name_keeps_its_history() {
         // `project_with` to `project-with` encodes the same, so the folder
@@ -2313,14 +2468,12 @@ mod tests {
         let store = fixture.store();
         assert_eq!(store.list(fixture.root()).unwrap().threads.len(), 1);
         // The same transcript once that other directory exists is its
-        // session, and it is asked again rather than remembered.
+        // session, not listed and not a warning here, and it is asked again
+        // rather than remembered.
         fs::create_dir(&before).unwrap();
         let index = store.list(fixture.root()).unwrap();
         assert!(index.threads.is_empty());
-        assert_eq!(
-            index.warnings,
-            [format!("Claude thread {SESSION}: {FOREIGN_WORKSPACE}")]
-        );
+        assert_eq!(index.warnings, Vec::<String>::new());
         fs::remove_dir(&before).unwrap();
         assert_eq!(store.list(fixture.root()).unwrap().threads.len(), 1);
     }
