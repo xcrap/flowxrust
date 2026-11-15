@@ -74,7 +74,7 @@ pub use status::{
 };
 pub use surface::{
     DividerAxis, FloatingPalette, card, card_default, divider, divider_with_axis, empty_state,
-    floating, floating_palette, floating_scroll, inline_notice, panel, section_divider,
-    section_header, titlebar_control, window_title,
+    floating, floating_palette, floating_scroll, inline_notice, list_row_fill, panel, path_label,
+    section_divider, section_header, split_path, titlebar_control, window_title,
 };
 pub use tooltip::tooltip;

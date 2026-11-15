@@ -40,28 +40,12 @@ const THREAD_ROW_HEIGHT: f32 = Layout::SIDEBAR_ROW_HEIGHT;
 /// Height of the sidebar's own header.
 const SIDEBAR_HEADER_HEIGHT: f32 = Layout::PANE_HEADER_HEIGHT;
 
-/// A fill that paints nothing, so a row can have a background or not.
-fn no_fill() -> Rgba {
-    Rgba {
-        r: 0.0,
-        g: 0.0,
-        b: 0.0,
-        a: 0.0,
-    }
-}
-
 /// A thread row's fill.
 ///
 /// The open thread keeps its selection under the pointer: the hover wash is
 /// half as strong, so replacing it read as the selection dropping away.
 fn thread_row_fill(selected: bool, hovered: bool, theme: &fx_design::theme::Theme) -> Rgba {
-    if selected {
-        Colors::bg_selected(theme)
-    } else if hovered {
-        Colors::bg_hover(theme)
-    } else {
-        no_fill()
-    }
+    fx_design::components::list_row_fill(selected, hovered, theme)
 }
 
 /// Render the sidebar column, or collapse it to nothing when hidden.

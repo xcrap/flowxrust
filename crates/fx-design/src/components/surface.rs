@@ -7,7 +7,7 @@ use gpui::{
 
 use super::rich_text::{InlineSpan, InlineStyle, inline_run};
 use crate::styled::{FxStyled, px_len};
-use crate::theme::{BorderWidth, Colors, Radii, Shadow, Spacing, TextRole, global};
+use crate::theme::{BorderWidth, Colors, Radii, Shadow, Spacing, TextRole, Theme, global};
 
 /// Which way a divider runs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -249,6 +249,73 @@ pub fn titlebar_control(control: impl IntoElement) -> impl IntoElement {
         .child(control)
 }
 
+/// A list row's fill: the selection, which it keeps under the pointer, or
+/// the hover wash, or nothing.
+///
+/// GPUI's hover refinement replaces the background rather than layering on
+/// it, so an unconditional `.hover(bg_hover)` turned a selected row's 8%
+/// selection into a 4% wash, which read as the selection dropping away.
+pub fn list_row_fill(selected: bool, hovered: bool, theme: &Theme) -> gpui::Rgba {
+    if selected {
+        Colors::bg_selected(theme)
+    } else if hovered {
+        Colors::bg_hover(theme)
+    } else {
+        gpui::Rgba {
+            r: 0.0,
+            g: 0.0,
+            b: 0.0,
+            a: 0.0,
+        }
+    }
+}
+
+/// A path's folders, with their trailing slash, and its file name.
+///
+/// A path with no folder is shown from the root it is relative to, `./`, so
+/// a file at the top of a repository still reads as a path.
+pub fn split_path(path: &str) -> (String, String) {
+    let trimmed = path.trim_end_matches('/');
+    match trimmed.rsplit_once('/') {
+        Some((folder, name)) => (format!("{folder}/"), name.to_string()),
+        None => ("./".to_string(), trimmed.to_string()),
+    }
+}
+
+/// A path on one line whose folders give way before its file name does.
+///
+/// GPUI 0.2.2 truncates text only at its end (`TextOverflow::Truncate`), so a
+/// path is two runs: the folders shrink first and end in an ellipsis, and the
+/// file name keeps its width unless it alone is wider than the line. The
+/// caller sets the type role; both runs inherit it.
+pub fn path_label(path: &str, folder_ink: gpui::Rgba, name_ink: gpui::Rgba) -> gpui::Div {
+    let (folder, name) = split_path(path);
+    div()
+        .min_w_0()
+        .flex()
+        .flex_row()
+        .overflow_hidden()
+        .child(
+            div()
+                .debug_selector(|| "path-label-folder".into())
+                .min_w_0()
+                .flex_shrink()
+                .truncate()
+                .text_color(folder_ink)
+                .child(folder),
+        )
+        .child(
+            div()
+                .debug_selector(|| "path-label-name".into())
+                .min_w_0()
+                .max_w_full()
+                .flex_shrink_0()
+                .truncate()
+                .text_color(name_ink)
+                .child(name),
+        )
+}
+
 /// The hairline thickness used for every card and panel edge.
 pub const HAIRLINE: f32 = BorderWidth::HAIRLINE;
 
@@ -279,6 +346,40 @@ mod tests {
         assert!(
             style.overflow.y.is_none_or(|o| o == Overflow::Visible),
             "the panel itself scrolls"
+        );
+    }
+
+    #[test]
+    fn a_selected_row_keeps_its_fill_under_the_pointer() {
+        for appearance_mode in [
+            crate::theme::AppearanceMode::Light,
+            crate::theme::AppearanceMode::Dark,
+        ] {
+            let theme = Theme {
+                appearance_mode,
+                ..Default::default()
+            };
+            let selected = list_row_fill(true, false, &theme);
+            assert_eq!(selected, Colors::bg_selected(&theme));
+            assert_eq!(list_row_fill(true, true, &theme), selected);
+            assert_eq!(list_row_fill(false, true, &theme), Colors::bg_hover(&theme));
+            assert_eq!(list_row_fill(false, false, &theme).a, 0.0);
+        }
+    }
+
+    #[test]
+    fn a_path_splits_into_its_folders_and_its_file_name() {
+        assert_eq!(
+            split_path("crates/fx-app/src/diff_view.rs"),
+            ("crates/fx-app/src/".to_string(), "diff_view.rs".to_string())
+        );
+        assert_eq!(
+            split_path("README.md"),
+            ("./".to_string(), "README.md".to_string())
+        );
+        assert_eq!(
+            split_path("vendor/lib/"),
+            ("vendor/".to_string(), "lib".to_string())
         );
     }
 

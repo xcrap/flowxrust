@@ -1429,6 +1429,38 @@ mod tests {
     }
 
     #[test]
+    fn a_narrow_diff_header_gives_up_its_folders_before_the_file_name() {
+        let root = repo();
+        let folder = root
+            .path()
+            .join("a/very/deeply/nested/folder/structure/inside/the/repository");
+        std::fs::create_dir_all(&folder).unwrap();
+        std::fs::write(folder.join("notes.txt"), "first\n").unwrap();
+        git(root.path(), &["add", "."]);
+        git(root.path(), &["commit", "-qm", "Nested"]);
+        std::fs::write(folder.join("notes.txt"), "second\n").unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let mut test = gpui::TestAppContext::single();
+        let (inspector, window) = mount(&mut test, data.path(), Some(root.path()), 280.0);
+        wait_until(&mut test, &inspector, |i| i.diff.document.is_some());
+        test.refresh().unwrap();
+        let mut visual = gpui::VisualTestContext::from_window(window.into(), &test);
+        let path = visual.debug_bounds("diff-header-path").unwrap();
+        let folders = visual.debug_bounds("path-label-folder").unwrap();
+        let name = visual.debug_bounds("path-label-name").unwrap();
+        let reference = visual
+            .debug_bounds("glyph-button:Reference file in prompt")
+            .unwrap();
+        assert!(name.size.width > px(0.0), "the file name was squeezed out");
+        assert!(name.right() <= path.right() && path.right() <= reference.left());
+        assert!(folders.right() <= name.left());
+        assert!(
+            folders.size.width < path.size.width - name.size.width + px(1.0),
+            "the folders did not give way"
+        );
+    }
+
+    #[test]
     fn an_error_note_clears_aa_on_the_panel_and_under_the_pointer() {
         // `error` was 3.7:1 on `bg_surface` in both modes.
         for base_tone in fx_design::theme::BaseTone::ALL {

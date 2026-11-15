@@ -20,7 +20,7 @@ use fx_core::policy::prompt_context::DiffSelection;
 use fx_core::policy::{DiffDisclosureState, DiffRowLayout};
 use fx_design::components::{
     DividerAxis, IconButtonProps, SegmentedOption, compact_action_toggle, divider_with_axis,
-    glyph_button, icon_button, segmented_control,
+    glyph_button, icon_button, list_row_fill, path_label, segmented_control,
 };
 use fx_design::icon::Icon;
 use fx_design::styled::{FxRefinement, FxStyled, px_len};
@@ -491,6 +491,22 @@ struct HeaderRow<'a> {
     pinned: f32,
 }
 
+/// A file header's fill. The header is a button, so it answers the pointer;
+/// the selected one keeps its selection, as a selected list row does.
+///
+/// The hover wash is laid over the header's own `bg_elevated` rather than
+/// replacing it: GPUI's hover replaces the background, and a bare 4% wash let
+/// the canvas through, so the hovered header would be the flatter one.
+fn header_fill(selected: bool, hovered: bool, theme: &Theme) -> gpui::Rgba {
+    if selected {
+        Colors::bg_selected(theme)
+    } else if hovered {
+        fx_design::theme::composite(Colors::bg_hover(theme), Colors::bg_elevated(theme))
+    } else {
+        Colors::bg_elevated(theme)
+    }
+}
+
 fn header_row(
     header: HeaderRow<'_>,
     metrics: RowMetrics,
@@ -498,11 +514,8 @@ fn header_row(
     inspector: WeakEntity<Inspector>,
 ) -> AnyElement {
     let path = header.section.path.clone();
-    let display = if path.contains('/') {
-        path.clone()
-    } else {
-        format!("./{path}")
-    };
+    let selected = header.selected;
+    let hovered = header_fill(selected, true, theme);
     let toggle_path = path.clone();
     let toggle = inspector.clone();
     let open_path = path.clone();
@@ -537,11 +550,8 @@ fn header_row(
         .gap(px_len(Spacing::XS))
         .pl(px(Spacing::SM + header.pinned))
         .pr(px_len(Spacing::SM))
-        .bg(if header.selected {
-            Colors::bg_selected(theme)
-        } else {
-            Colors::bg_elevated(theme)
-        })
+        .bg(header_fill(selected, false, theme))
+        .hover(move |style| style.fx_background(hovered))
         .border_t(px_len(BorderWidth::HAIRLINE))
         .border_color(Colors::border_subtle(theme))
         .cursor_pointer()
@@ -557,17 +567,23 @@ fn header_row(
             .render(IconSize::Small, Colors::fg_tertiary(theme), theme),
         )
         .child(
+            // The folders give way first, so the file name stays in view in
+            // a narrow inspector.
             div()
+                .debug_selector(|| "diff-header-path".into())
                 .flex_1()
                 .min_w_0()
-                .truncate()
+                .flex()
                 .fx_role(TextRole::CaptionMedium)
-                .text_color(if header.selected {
-                    Colors::fg(theme)
-                } else {
-                    Colors::fg_secondary(theme)
-                })
-                .child(SharedString::from(display)),
+                .child(path_label(
+                    &path,
+                    Colors::fg_tertiary(theme),
+                    if selected {
+                        Colors::fg(theme)
+                    } else {
+                        Colors::fg_secondary(theme)
+                    },
+                )),
         )
         .child(counts)
         .child(glyph_button(
@@ -1256,7 +1272,7 @@ fn navigator_row(
     let select_path = path.clone();
     let open_path = path.clone();
     let tooltip_path = path.clone();
-    let hover = Colors::bg_hover(theme);
+    let hover = list_row_fill(selected, true, theme);
     let mut counts = div()
         .flex_shrink_0()
         .flex()
@@ -1276,7 +1292,7 @@ fn navigator_row(
                 .child(SharedString::from(format!("−{}", section.deletions))),
         );
     }
-    let mut row = div()
+    div()
         .id(SharedString::from(format!("inspector-file:{path}")))
         .debug_selector(|| "inspector-file-row".into())
         .h(px(Layout::SIDEBAR_ROW_HEIGHT))
@@ -1287,6 +1303,7 @@ fn navigator_row(
         .px(px_len(Spacing::XS))
         .rounded(px_len(fx_design::theme::Radii::XS))
         .cursor_pointer()
+        .bg(list_row_fill(selected, false, theme))
         .hover(move |style| style.fx_background(hover))
         .on_click(move |_, _, cx| {
             let _ = select.update(cx, |this, cx| this.select_path(&select_path, cx));
@@ -1331,11 +1348,8 @@ fn navigator_row(
             move |_, _, cx| {
                 let _ = inspector.update(cx, |this, cx| this.open_path(&open_path, cx));
             },
-        ));
-    if selected {
-        row = row.bg(Colors::bg_selected(theme));
-    }
-    row.into_any_element()
+        ))
+        .into_any_element()
 }
 
 #[cfg(test)]
@@ -1485,6 +1499,31 @@ mod tests {
                     }
                 }
             }
+        }
+    }
+
+    #[test]
+    fn a_selected_file_keeps_its_fill_under_the_pointer_and_a_header_answers_it() {
+        for appearance_mode in [
+            fx_design::theme::AppearanceMode::Light,
+            fx_design::theme::AppearanceMode::Dark,
+        ] {
+            let theme = Theme {
+                appearance_mode,
+                ..Default::default()
+            };
+            // A selected header keeps its selection under the pointer.
+            assert_eq!(
+                header_fill(true, true, &theme),
+                header_fill(true, false, &theme)
+            );
+            // An unselected one answers it, over its own fill rather than
+            // in place of it.
+            let rest = header_fill(false, false, &theme);
+            let hovered = header_fill(false, true, &theme);
+            assert_ne!(hovered, rest);
+            assert_eq!(rest.a, 1.0);
+            assert_eq!(hovered.a, 1.0, "the hover let the canvas through");
         }
     }
 
