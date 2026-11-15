@@ -50,27 +50,31 @@ pub use palette::{
 };
 
 pub use button::{
-    ButtonStyle, ICON_BUTTON_SIZE, IconButtonProps, IconButtonVariant, button, button_palette,
-    button_with_icon, choice_row, compact_action_button, compact_action_palette,
-    compact_action_toggle, glyph_button, icon_button, icon_button_palette, navigation_button,
-    navigation_palette,
+    ButtonPalette, ButtonStyle, ICON_BUTTON_SIZE, IconButtonProps, IconButtonVariant, button,
+    button_palette, button_with_icon, choice_row, choice_row_fill, choice_row_focus_ring,
+    compact_action_button, compact_action_palette, compact_action_toggle, glyph_button,
+    icon_button, icon_button_palette, navigation_button, navigation_palette,
 };
 pub use checkbox::{CheckboxPalette, checkbox, checkbox_palette};
 pub use checklist::{
     ChecklistInk, ChecklistMark, checklist, checklist_ink, checklist_row, checklist_surface,
 };
-pub use segmented::{SegmentedOption, segmented_control};
+pub use segmented::{
+    SegmentPalette, SegmentedOption, segment_palette, segmented_control, segmented_track,
+};
 pub use settings::{
     SettingsGroupPalette, SwitchPalette, breadcrumb, settings_group, settings_group_palette,
     settings_nav_label, settings_row, settings_row_custom, settings_row_dense, settings_row_label,
     settings_search, settings_section, settings_section_with_action, switch, switch_palette,
 };
 pub use status::{
-    ActivityState, BadgeTone, activity_dot, badge, context_ring_color, context_ring_icon,
-    pulsing_dot, spinner_arc, static_ring, typing_indicator,
+    ActivityState, BadgeTone, STATUS_GLYPH_SIZE, StatusGlyph, activity_dot, badge,
+    context_ring_color, context_ring_icon, spinner_arc, static_ring, status_glyph,
+    status_glyph_ink, typing_indicator,
 };
 pub use surface::{
-    DividerAxis, card, card_default, divider, divider_with_axis, empty_state, inline_notice, panel,
-    section_divider, section_header, titlebar_control, window_title,
+    DividerAxis, FloatingPalette, card, card_default, divider, divider_with_axis, empty_state,
+    floating, floating_palette, floating_scroll, inline_notice, panel, section_divider,
+    section_header, titlebar_control, window_title,
 };
 pub use tooltip::tooltip;

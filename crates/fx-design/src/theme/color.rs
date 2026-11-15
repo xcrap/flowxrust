@@ -186,6 +186,10 @@ pub struct Palette {
 
     /// Teal secondary accent; adapts per mode.
     pub accent_secondary: Rgba,
+    /// `accent_secondary` as text: the hue where it clears AA on every
+    /// surface and hover wash, teal-800 where it does not (light mode, where
+    /// teal-700 is 4.3:1 on `bg_surface`).
+    pub accent_secondary_ink: Rgba,
     pub accent_secondary_muted: Rgba,
     /// The base tone's darkest ink, used as `on_accent` for accents too light
     /// to carry white text.
@@ -197,10 +201,17 @@ pub struct Palette {
 
     // Semantic (mode-adapted)
     pub success: Rgba,
+    /// `success` deep enough to stand alone as a graphic on a light surface.
+    pub success_ink: Rgba,
     pub warning: Rgba,
     /// `warning` deep enough to stand alone on a light surface.
     pub warning_ink: Rgba,
     pub error: Rgba,
+    /// `error` as text: the hue where it clears AA on every surface and hover
+    /// wash, a step further from the surface where it does not. Both modes
+    /// fall short with the hue (3.7:1 on `bg_surface`), so this is red-300 in
+    /// dark mode and red-700 in light.
+    pub error_ink: Rgba,
     pub info: Rgba,
     pub success_muted: Rgba,
     pub warning_muted: Rgba,
@@ -236,6 +247,55 @@ impl Palette {
     }
 
     pub fn generate(tone: BaseTone, dark: bool) -> Palette {
+        let mut palette = Self::generate_base(tone, dark);
+        // Text inks are resolved once, here, against the surfaces this palette
+        // just produced: the hue where it reads, a deeper step where it does
+        // not. A lookup at draw time then costs nothing.
+        let text_fills = palette.text_fills();
+        let (error_deep, accent_secondary_deep) = if dark {
+            (h(0xFCA5A5), palette.accent_secondary)
+        } else {
+            (h(0xB91C1C), h(0x115E59))
+        };
+        palette.error_ink = legible_or(palette.error, error_deep, &text_fills, TEXT_FLOOR);
+        palette.accent_secondary_ink = legible_or(
+            palette.accent_secondary,
+            accent_secondary_deep,
+            &text_fills,
+            TEXT_FLOOR,
+        );
+        palette
+    }
+
+    /// Every fill text is drawn on: the three surfaces, bare and under the
+    /// hover wash, composited as they render.
+    pub fn text_fills(&self) -> [Rgba; 6] {
+        let [bg, elevated, surface] = [self.bg, self.bg_elevated, self.bg_surface];
+        [
+            bg,
+            elevated,
+            surface,
+            composite(self.bg_hover, bg),
+            composite(self.bg_hover, elevated),
+            composite(self.bg_hover, surface),
+        ]
+    }
+
+    /// Every neutral fill a control can be drawn on: the three surfaces, bare
+    /// and under each of the hover, pressed and selected washes.
+    pub fn control_fills(&self) -> [Rgba; 12] {
+        let surfaces = [self.bg, self.bg_elevated, self.bg_surface];
+        let washes = [self.bg_hover, self.bg_pressed, self.bg_selected];
+        std::array::from_fn(|i| {
+            let surface = surfaces[i % 3];
+            match i / 3 {
+                0 => surface,
+                n => composite(washes[n - 1], surface),
+            }
+        })
+    }
+
+    fn generate_base(tone: BaseTone, dark: bool) -> Palette {
         let t = ToneScale::for_tone(tone);
 
         // Semantic hues are brighter on dark backgrounds, deeper on light ones.
@@ -247,6 +307,9 @@ impl Palette {
         // graphic needs, so light mode steps down to amber-700 where `warning`
         // is the only thing carrying the state. Dark amber already clears it.
         let warning_ink = if dark { warning } else { h(0xB45309) };
+        // Emerald-600 is 2.9:1 on a light `bg_surface`; emerald-700 clears 3:1
+        // wherever a graphic in `success` is the only sign of the state.
+        let success_ink = if dark { success } else { h(0x047857) };
         let provider_codex = if dark { h(0xA99AF5) } else { h(0x6251D8) };
         let provider_claude = if dark { h(0x55D6A0) } else { h(0x137C53) };
         // The light value is teal-700 so it stays readable as text; #4ECDC4 is
@@ -284,6 +347,7 @@ impl Palette {
                     ..t.shade(shade::P900)
                 },
                 accent_secondary,
+                accent_secondary_ink: accent_secondary,
                 accent_secondary_muted: Rgba {
                     a: accent_tint,
                     ..accent_secondary
@@ -292,9 +356,11 @@ impl Palette {
                 provider_codex,
                 provider_claude,
                 success,
+                success_ink,
                 warning,
                 warning_ink,
                 error,
+                error_ink: error,
                 info,
                 success_muted: tint(success),
                 warning_muted: tint(warning),
@@ -335,6 +401,7 @@ impl Palette {
                 overlay_light: ha(0x000000, 0.10),
                 terminal_bg: t.shade(shade::P100),
                 accent_secondary,
+                accent_secondary_ink: accent_secondary,
                 accent_secondary_muted: Rgba {
                     a: accent_tint,
                     ..accent_secondary
@@ -343,9 +410,11 @@ impl Palette {
                 provider_codex,
                 provider_claude,
                 success,
+                success_ink,
                 warning,
                 warning_ink,
                 error,
+                error_ink: error,
                 info,
                 success_muted: tint(success),
                 warning_muted: tint(warning),
@@ -813,6 +882,12 @@ impl Colors {
     pub fn accent_secondary(t: &Theme) -> Rgba {
         t.palette().accent_secondary
     }
+    /// `accent_secondary` for text, such as a link: it clears AA on every
+    /// surface and under the hover wash, where light-mode `accent_secondary`
+    /// is 4.3:1 on `bg_surface`.
+    pub fn accent_secondary_ink(t: &Theme) -> Rgba {
+        t.palette().accent_secondary_ink
+    }
     pub fn accent_muted(t: &Theme) -> Rgba {
         Rgba {
             a: if t.is_dark() { 0.16 } else { 0.12 },
@@ -848,6 +923,12 @@ impl Colors {
     pub fn success(t: &Theme) -> Rgba {
         t.palette().success
     }
+    /// The success hue for a graphic that alone carries the state, such as a
+    /// done mark: it clears 3:1 on every surface in both modes, where
+    /// light-mode `success` is 2.9:1 on `bg_surface`.
+    pub fn success_ink(t: &Theme) -> Rgba {
+        t.palette().success_ink
+    }
     pub fn warning(t: &Theme) -> Rgba {
         t.palette().warning
     }
@@ -859,6 +940,12 @@ impl Colors {
     }
     pub fn error(t: &Theme) -> Rgba {
         t.palette().error
+    }
+    /// `error` for text: a destructive menu row, an inline failure. It clears
+    /// AA on every surface and under the hover wash; `error` itself is 3.7:1
+    /// on `bg_surface` in both modes and 4.4:1 on light `bg_elevated`.
+    pub fn error_ink(t: &Theme) -> Rgba {
+        t.palette().error_ink
     }
     pub fn info(t: &Theme) -> Rgba {
         t.palette().info
@@ -909,6 +996,61 @@ impl Colors {
     }
     pub fn border_subtle(t: &Theme) -> Rgba {
         t.palette().border_subtle
+    }
+
+    // ── Focus ──────────────────────────────────────────────────────────────
+
+    /// The accent as a graphic that stands on its own: a focus ring, a
+    /// running mark.
+    ///
+    /// The accent, drawn toward `fg` a quarter at a time until it clears the
+    /// 3:1 a graphic needs on every neutral fill a control sits on: the three
+    /// surfaces, bare and under the hover, pressed and selected washes. Dark
+    /// violet is 1.7:1 on a hovered `bg_surface` and light emerald 1.8:1, so
+    /// the raw accent cannot stand alone; mixing keeps its hue where `fg`
+    /// alone would drop it.
+    ///
+    /// Resolved once per tone, appearance and accent.
+    pub fn accent_ink(t: &Theme) -> Rgba {
+        static INKS: std::sync::OnceLock<[Rgba; 40]> = std::sync::OnceLock::new();
+        let table = INKS.get_or_init(|| {
+            std::array::from_fn(|i| {
+                let accent = AccentColor::ALL[i % AccentColor::ALL.len()];
+                let palette = i / AccentColor::ALL.len();
+                let tone = BaseTone::from_index(palette / 2);
+                Self::resolve_accent_ink(Palette::get(tone, palette % 2 == 1), accent)
+            })
+        });
+        let accent = AccentColor::ALL
+            .iter()
+            .position(|a| *a == t.accent_color)
+            .unwrap_or(0);
+        let palette = t.base_tone.index() * 2 + usize::from(t.is_dark());
+        table[palette * AccentColor::ALL.len() + accent]
+    }
+
+    /// The keyboard focus ring: [`Self::accent_ink`], which clears 3:1 on
+    /// every neutral fill a focusable control can sit on.
+    ///
+    /// A control whose own fill is the accent draws `on_accent` instead,
+    /// since a ring in its fill's color is no ring.
+    pub fn focus_ring(t: &Theme) -> Rgba {
+        Self::accent_ink(t)
+    }
+
+    fn resolve_accent_ink(palette: &Palette, accent: AccentColor) -> Rgba {
+        let fills = palette.control_fills();
+        ACCENT_INK_STEPS
+            .iter()
+            .rev()
+            .fold(palette.fg, |fallback, &amount| {
+                legible_or(
+                    blend(accent.color(), palette.fg, amount),
+                    fallback,
+                    &fills,
+                    NON_TEXT_FLOOR,
+                )
+            })
     }
 
     // ── Overlays ───────────────────────────────────────────────────────────
@@ -1005,6 +1147,26 @@ pub fn composite(foreground: Rgba, background: Rgba) -> Rgba {
 /// every `*_muted` tint.
 pub fn contrast(foreground: Rgba, background: Rgba) -> f64 {
     contrast_ratio(composite(foreground, background), background)
+}
+
+/// AA, the floor for text.
+pub const TEXT_FLOOR: f64 = 4.5;
+/// The floor for a graphic that carries meaning on its own: a mark, a ring.
+pub const NON_TEXT_FLOOR: f64 = 3.0;
+
+/// How far toward `fg` the accent ink may be drawn from the accent, tried in
+/// order; past the last it is `fg`.
+const ACCENT_INK_STEPS: [f32; 4] = [0.0, 0.25, 0.5, 0.75];
+
+/// Interpolate two opaque colors: 0.0 is `from`, 1.0 is `to`.
+pub fn blend(from: Rgba, to: Rgba, amount: f32) -> Rgba {
+    let mix = |a: f32, b: f32| a + (b - a) * amount;
+    Rgba {
+        r: mix(from.r, to.r),
+        g: mix(from.g, to.g),
+        b: mix(from.b, to.b),
+        a: 1.0,
+    }
 }
 
 /// `hue` where it clears `floor` on every one of `backgrounds`, and `fallback`

@@ -3,12 +3,14 @@
 //! Positioning and window clamping come from GPUI's [`anchored`] element, so
 //! this file only draws the panel and handles dismissal.
 //!
-//! Two behaviours are carried over from the original design system deliberately:
+//! Two behaviours are worth knowing:
 //!
-//! - The panel is sized to its content rather than carrying a shadow. A styled
-//!   element shadow is clipped to the element's own bounds, so a menu that
-//!   grows past its shadow looks wrong. Here the elevation is expressed with an
-//!   edge and a surface fill instead, which cannot clip.
+//! - The panel is a [`floating`](crate::components::surface::floating)
+//!   surface: an edge, a fill and the popover shadow on an element that never
+//!   scrolls, around the one that does. The original went without a shadow on
+//!   the belief that a styled shadow is clipped to its element's bounds. It is
+//!   not: GPUI 0.2.2 paints an element's shadow before it pushes that
+//!   element's own overflow mask, so only a clipping ancestor can cut it.
 //! - A menu shows at most one open at a time. Rather than a broadcast, opening
 //!   any menu closes the others through a shared [`MenuLayer`].
 
@@ -22,9 +24,10 @@ use gpui::{
 };
 
 use crate::components::menu_model::{MenuItem, MenuItemTone, MenuModel};
+use crate::components::surface::floating_scroll;
 use crate::icon::Icon;
 use crate::styled::{FxRefinement, FxStyled, px_len};
-use crate::theme::{Colors, Layout, Radii, Spacing, TextRole, global};
+use crate::theme::{BorderWidth, Colors, Layout, Radii, Spacing, TextRole, global};
 
 /// The one open menu, app-wide.
 ///
@@ -214,7 +217,8 @@ pub fn row_palette(item: &MenuItem, hovered: bool, theme: &crate::theme::Theme) 
     let title = if !item.enabled {
         Colors::fg_tertiary(theme)
     } else if item.tone == MenuItemTone::Destructive {
-        Colors::error(theme)
+        // `error` itself is 3.7:1 on the menu.
+        Colors::error_ink(theme)
     } else {
         Colors::fg(theme)
     };
@@ -402,7 +406,8 @@ pub fn menu_surface(
         if index > 0 {
             body = body.child(
                 div()
-                    .h(px_len(1.0))
+                    .flex_shrink_0()
+                    .h(px_len(BorderWidth::HAIRLINE))
                     .my(px_len(Spacing::XXS))
                     .bg(Colors::border(&theme)),
             );
@@ -436,22 +441,13 @@ pub fn menu_surface(
         }
     }
 
-    // The panel is sized to its content and given an edge rather than a shadow:
-    // a styled shadow would be clipped to the panel's own bounds.
-    div()
-        .id("menu-panel")
-        .flex()
-        .flex_col()
+    // The rows scroll inside the panel; the panel itself, which carries the
+    // edge and the shadow, does not.
+    floating_scroll("menu-panel", Layout::MENU_MAX_PANEL_HEIGHT, body)
+        .debug_selector(|| "menu-panel".into())
         .w(px_len(Layout::MENU_WIDTH))
-        .max_h(px_len(Layout::MENU_MAX_PANEL_HEIGHT))
-        .overflow_y_scroll()
-        .bg(Colors::bg_surface(&theme))
-        .rounded(px_len(Radii::MD))
-        .border_1()
-        .border_color(Colors::border_medium(&theme))
         .occlude()
         .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-        .child(body)
         .into_any_element()
 }
 
@@ -942,14 +938,16 @@ mod tests {
     }
 
     #[test]
-    fn a_destructive_row_uses_the_error_hue() {
-        let theme = Theme::default();
-        let p = row_palette(
-            &MenuItem::new("x", "X").tone(MenuItemTone::Destructive),
-            false,
-            &theme,
-        );
-        assert_eq!(p.title, Colors::error(&theme));
+    fn a_destructive_row_uses_the_error_ink() {
+        for theme in themes() {
+            let p = row_palette(
+                &MenuItem::new("x", "X").tone(MenuItemTone::Destructive),
+                false,
+                &theme,
+            );
+            assert_eq!(p.title, Colors::error_ink(&theme));
+            assert!(p.title.r > p.title.g && p.title.r > p.title.b, "not a red");
+        }
     }
 
     #[test]

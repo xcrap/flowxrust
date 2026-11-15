@@ -36,14 +36,67 @@ pub(crate) const PRESSED_OPACITY: f32 = 0.94;
 /// How a button looks, as a function of style and hover.
 ///
 /// Split out from rendering so the color decisions can be asserted directly,
-/// without standing up a window.
+/// without standing up a window. `labelled_button` applies the hovered
+/// palette's `background` and `foreground` and nothing else, so a hover has
+/// to live in those two fields.
 #[derive(Debug, Clone, Copy)]
 pub struct ButtonPalette {
     pub foreground: gpui::Rgba,
     pub background: gpui::Rgba,
     pub border: gpui::Rgba,
-    /// An extra wash laid over the background, used by the danger hover.
-    pub hover_tint: gpui::Rgba,
+    /// The keyboard focus ring, drawn as the border while focused.
+    pub focus_ring: gpui::Rgba,
+}
+
+/// A translucent tint laid over itself: what painting it twice would show,
+/// as one fill.
+fn layered(tint: gpui::Rgba) -> gpui::Rgba {
+    tint.with_alpha(1.0 - (1.0 - tint.a) * (1.0 - tint.a))
+}
+
+/// The Danger fill, deepened under the pointer by layering the muted token a
+/// second time rather than by a hand-tuned second opacity.
+fn danger_fill(hovered: bool, theme: &crate::theme::Theme) -> gpui::Rgba {
+    let tint = Colors::error_muted(theme);
+    if hovered { layered(tint) } else { tint }
+}
+
+/// The Danger label: `error_ink` where it clears AA on the button's own fill,
+/// at rest and hovered, over every surface a button sits on; `fg` where it
+/// does not.
+///
+/// The badge's rule. `error` on its own tint was 3.1:1 over `bg_surface`, and
+/// even `error_ink` stays under 4.5:1 there, so today the label is `fg` in
+/// both modes: the tint and the red edge carry the tone.
+fn danger_label_ink(theme: &crate::theme::Theme) -> gpui::Rgba {
+    crate::theme::legible_or(
+        Colors::error_ink(theme),
+        Colors::fg(theme),
+        &danger_fills(theme),
+        crate::theme::TEXT_FLOOR,
+    )
+}
+
+/// The Danger ring: the focus color where it clears 3:1 on the red tint,
+/// rest and hovered, and `fg` where it does not (light violet is 2.9:1 on
+/// the hovered tint over `bg_surface`).
+fn danger_focus_ring(theme: &crate::theme::Theme) -> gpui::Rgba {
+    crate::theme::legible_or(
+        Colors::focus_ring(theme),
+        Colors::fg(theme),
+        &danger_fills(theme),
+        crate::theme::NON_TEXT_FLOOR,
+    )
+}
+
+/// The Danger fill at rest and hovered, over every surface a button sits on.
+fn danger_fills(theme: &crate::theme::Theme) -> [gpui::Rgba; 6] {
+    let surfaces = [
+        Colors::bg(theme),
+        Colors::bg_elevated(theme),
+        Colors::bg_surface(theme),
+    ];
+    std::array::from_fn(|i| crate::theme::composite(danger_fill(i >= 3, theme), surfaces[i % 3]))
 }
 
 pub fn button_palette(
@@ -67,17 +120,22 @@ pub fn button_palette(
                 Colors::accent(theme)
             },
             border: clear,
-            hover_tint: clear,
+            // A ring in the focus color can be the accent itself, which on an
+            // accent fill is no ring at all.
+            focus_ring: Colors::on_accent(theme),
         },
         ButtonStyle::Secondary => ButtonPalette {
             foreground: Colors::fg(theme),
+            // The wash is laid over the surface rather than replacing it:
+            // GPUI's hover replaces the background, and a bare 4% wash let the
+            // panel through, so the hovered button was the flatter one.
             background: if hovered {
-                Colors::bg_hover(theme)
+                crate::theme::composite(Colors::bg_hover(theme), Colors::bg_surface(theme))
             } else {
                 Colors::bg_surface(theme)
             },
             border: Colors::border(theme),
-            hover_tint: clear,
+            focus_ring: Colors::focus_ring(theme),
         },
         ButtonStyle::Ghost => ButtonPalette {
             foreground: if hovered {
@@ -91,30 +149,27 @@ pub fn button_palette(
                 clear
             },
             border: clear,
-            hover_tint: clear,
+            focus_ring: Colors::focus_ring(theme),
         },
         ButtonStyle::Danger => ButtonPalette {
-            foreground: Colors::error(theme),
-            // The tint deepens on hover by layering the muted token a second
-            // time, rather than introducing a hand-tuned second opacity.
-            background: Colors::error_muted(theme),
+            foreground: danger_label_ink(theme),
+            background: danger_fill(hovered, theme),
             border: Colors::error(theme).with_alpha(0.3),
-            hover_tint: if hovered {
-                Colors::error_muted(theme)
-            } else {
-                clear
-            },
+            focus_ring: danger_focus_ring(theme),
         },
     }
 }
 
 /// A labelled button, optionally with a leading glyph.
+///
+/// Returned as the element itself, so a view can `track_focus` it and show
+/// its focus ring.
 pub fn button(
     label: impl Into<SharedString>,
     style: ButtonStyle,
     enabled: bool,
     on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
-) -> impl IntoElement {
+) -> gpui::Stateful<gpui::Div> {
     button_with_icon(label, None, style, enabled, on_click)
 }
 
@@ -184,9 +239,17 @@ fn labelled_button(
         .bg(palette.background)
         .text_color(palette.foreground);
 
+    // The ring is wider than the resting hairline, so the padding gives the
+    // difference back and the button keeps its size while focused.
+    let give_back = BorderWidth::focus_give_back(BorderWidth::HAIRLINE);
     content
         .opacity(if enabled { 1.0 } else { DISABLED_OPACITY })
         .id(button_id)
+        .focus(|s: StyleRefinement| {
+            s.fx_focus_ring_in(palette.focus_ring)
+                .px(px_len(Spacing::MD - give_back))
+                .py(px_len(Spacing::XXS - give_back))
+        })
         .hover(|s: StyleRefinement| {
             if !enabled {
                 return s;
@@ -235,7 +298,7 @@ pub fn navigation_palette(
         foreground: Colors::fg(theme),
         background: Colors::bg_selected(theme),
         border: clear,
-        hover_tint: clear,
+        focus_ring: Colors::focus_ring(theme),
     }
 }
 
@@ -245,7 +308,7 @@ pub fn navigation_button(
     icon: Icon,
     selected: bool,
     on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
-) -> impl IntoElement {
+) -> gpui::Stateful<gpui::Div> {
     labelled_button(
         label,
         Some(icon),
@@ -333,12 +396,11 @@ pub fn icon_button_palette(
         Colors::bg_surface(theme).with_alpha(0.55)
     };
 
-    let border = if variant == IconButtonVariant::Ghost {
-        clear
-    } else if selected {
+    // The edge does not answer the pointer: the focus ring is drawn as the
+    // border, and GPUI applies a hover after the focus refinement, so a hover
+    // edge would hide the ring under the pointer. The fill carries the hover.
+    let border = if variant == IconButtonVariant::Filled && selected {
         Colors::border_medium(theme)
-    } else if hovered {
-        Colors::border_subtle(theme)
     } else {
         clear
     };
@@ -448,10 +510,12 @@ impl IconButtonProps {
 const TINY_ICON_BUTTON_HIT: f32 = Layout::CONTROL_COMPACT_HEIGHT;
 
 /// A square icon-only control.
+///
+/// Its edge is fixed, so the focus ring needs no padding given back.
 pub fn icon_button(
     props: IconButtonProps,
     on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
-) -> impl IntoElement {
+) -> gpui::Stateful<gpui::Div> {
     let theme = global::current();
     // Resolve the id before destructuring, since it reads the whole struct.
     let button_id = props.element_id();
@@ -474,7 +538,7 @@ pub fn icon_button(
         Radii::XS
     };
 
-    let control = div()
+    div()
         .debug_selector(move || debug_label.clone())
         .flex()
         .size(px_len(size.max(TINY_ICON_BUTTON_HIT)))
@@ -490,9 +554,10 @@ pub fn icon_button(
         // `.id` upgrades the element to `Stateful<Div>`, which is what carries
         // `on_click` and `tooltip` in GPUI 0.2.2.
         .id(button_id)
+        .focus(|s: StyleRefinement| s.fx_focus_ring())
         .hover(|s: StyleRefinement| {
             let p = icon_button_palette(variant, selected, true, enabled, tint, &theme);
-            s.fx_background(p.background).fx_border_color(p.border)
+            s.fx_background(p.background)
         })
         .active(|s| {
             if enabled {
@@ -511,9 +576,7 @@ pub fn icon_button(
             if enabled {
                 on_click(event, window, cx);
             }
-        });
-
-    control.into_any_element()
+        })
 }
 
 /// A dense button for panel toolbars, where vertical space is scarce.
@@ -521,7 +584,7 @@ pub fn compact_action_button(
     label: impl Into<SharedString>,
     icon: Option<Icon>,
     on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
-) -> impl IntoElement {
+) -> gpui::Stateful<gpui::Div> {
     compact_action_toggle(label, icon, false, true, on_click)
 }
 
@@ -596,6 +659,11 @@ pub fn compact_action_toggle(
 
     content
         .id(button_id)
+        .focus(|s: StyleRefinement| {
+            s.fx_focus_ring().px(px_len(
+                Spacing::SM - BorderWidth::focus_give_back(BorderWidth::HAIRLINE),
+            ))
+        })
         .hover(move |s: StyleRefinement| {
             if !enabled || selected {
                 return s;
@@ -632,7 +700,7 @@ pub fn glyph_button(
     icon: Icon,
     label: impl Into<SharedString>,
     on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
-) -> impl IntoElement {
+) -> gpui::Stateful<gpui::Div> {
     let theme = global::current();
     let label = label.into();
     let debug_label = format!("glyph-button:{label}");
@@ -646,6 +714,10 @@ pub fn glyph_button(
         .rounded(px_len(Radii::XS))
         .child(icon.render(IconSize::Small, Colors::fg_tertiary(&theme), &theme))
         .id(id.into())
+        .focus(|s: StyleRefinement| {
+            s.fx_focus_ring()
+                .p(px_len(Spacing::XXXS - BorderWidth::focus_give_back(0.0)))
+        })
         .hover(|s: StyleRefinement| s.fx_background(Colors::bg_hover(&theme)))
         .active(|s| s.fx_opacity(PRESSED_OPACITY))
         .cursor(CursorStyle::PointingHand)
@@ -686,11 +758,40 @@ pub fn text_disclosure(
                 .child(label.clone()),
         )
         .child(chevron.render(IconSize::Micro, Colors::fg_secondary(&theme), &theme))
+        .rounded(px_len(Radii::XS))
         .id(SharedString::from(format!("disclosure:{label}")))
+        // No padding to give back, so the ring takes its width from a
+        // negative margin and nothing beside the disclosure moves.
+        .focus(|s: StyleRefinement| {
+            s.fx_focus_ring()
+                .m(px_len(-BorderWidth::focus_give_back(0.0)))
+        })
         .hover(|s: StyleRefinement| s.fx_text_color(Colors::fg(&theme)))
         .active(|s| s.fx_opacity(PRESSED_OPACITY))
         .cursor(CursorStyle::PointingHand)
         .on_click(on_click)
+}
+
+/// The focus ring of a choice row.
+///
+/// A selected row's edge is already the accent, and the focus color can be
+/// the accent itself, so focusing the selected row would change only the
+/// edge's width. It takes `fg` instead, which reads on its fill like any ring.
+pub fn choice_row_focus_ring(selected: bool, theme: &crate::theme::Theme) -> gpui::Rgba {
+    if selected {
+        Colors::fg(theme)
+    } else {
+        Colors::focus_ring(theme)
+    }
+}
+
+/// The fill a choice row is painted with.
+pub fn choice_row_fill(selected: bool, theme: &crate::theme::Theme) -> gpui::Rgba {
+    if selected {
+        Colors::bg_selected(theme)
+    } else {
+        Colors::bg_elevated(theme)
+    }
 }
 
 /// A selectable answer or preference, with enough room for its explanation.
@@ -745,16 +846,18 @@ pub fn choice_row(
         } else {
             Colors::border_subtle(&theme)
         })
-        .bg(if selected {
-            Colors::bg_selected(&theme)
-        } else {
-            Colors::bg_elevated(&theme)
-        })
+        .bg(choice_row_fill(selected, &theme))
         .opacity(if enabled { 1.0 } else { DISABLED_OPACITY })
         .cursor(if enabled {
             CursorStyle::PointingHand
         } else {
             CursorStyle::default()
+        })
+        .focus(move |s| {
+            s.fx_focus_ring_in(choice_row_focus_ring(selected, &theme))
+                .p(px_len(
+                    Spacing::MD - BorderWidth::focus_give_back(BorderWidth::REGULAR),
+                ))
         })
         .hover(move |s| {
             if enabled && !selected {
@@ -837,61 +940,51 @@ mod tests {
         }
     }
 
-    /// How a button looks once its background and hover tint are combined.
-    ///
-    /// An absent tint means "no change", so it is skipped rather than
-    /// composited: `composite` deliberately returns an opaque color, which
-    /// would flatten a transparent resting fill to opaque black.
-    fn effective_fill(p: ButtonPalette, _theme: &Theme) -> gpui::Rgba {
-        if p.hover_tint.a == 0.0 {
-            p.background
-        } else {
-            crate::theme::composite(p.hover_tint, p.background)
+    const STYLES: [ButtonStyle; 4] = [
+        ButtonStyle::Primary,
+        ButtonStyle::Secondary,
+        ButtonStyle::Ghost,
+        ButtonStyle::Danger,
+    ];
+
+    #[test]
+    fn every_style_changes_the_fill_its_hover_applies() {
+        // `labelled_button` applies the hovered palette's background and
+        // foreground, nothing else. A style whose hover lived only in a field
+        // the renderer never read gave no feedback at all: Danger did.
+        for theme in themes() {
+            for style in STYLES {
+                let rest = button_palette(style, false, &theme);
+                let hover = button_palette(style, true, &theme);
+                assert_ne!(
+                    rest.background, hover.background,
+                    "{style:?} in {:?} {:?} draws the same fill under the pointer",
+                    theme.base_tone, theme.appearance_mode
+                );
+            }
         }
     }
 
     #[test]
-    fn a_hovered_button_never_matches_its_resting_appearance() {
-        let theme = Theme::default();
-        for style in [
-            ButtonStyle::Primary,
-            ButtonStyle::Secondary,
-            ButtonStyle::Ghost,
-            ButtonStyle::Danger,
-        ] {
-            let rest = button_palette(style, false, &theme);
-            let hover = button_palette(style, true, &theme);
-            assert_ne!(
-                effective_fill(rest, &theme),
-                effective_fill(hover, &theme),
-                "{style:?} gives no hover feedback"
-            );
-        }
-    }
-
-    #[test]
-    fn every_theme_gives_every_button_style_hover_feedback() {
-        for tone in BaseTone::ALL {
-            for mode in [AppearanceMode::Light, AppearanceMode::Dark] {
-                let theme = Theme {
-                    base_tone: tone,
-                    appearance_mode: mode,
-                    ..Default::default()
-                };
-                for style in [
-                    ButtonStyle::Primary,
-                    ButtonStyle::Secondary,
-                    ButtonStyle::Ghost,
-                    ButtonStyle::Danger,
-                ] {
-                    let rest = button_palette(style, false, &theme);
-                    let hover = button_palette(style, true, &theme);
-                    assert_ne!(
-                        effective_fill(rest, &theme),
-                        effective_fill(hover, &theme),
-                        "{style:?} is inert in {tone:?} {mode:?}"
-                    );
-                }
+    fn a_hovered_secondary_button_stands_further_from_its_panel() {
+        // GPUI's hover replaces the background. Swapping the opaque surface
+        // for a 4% wash let the panel show through, so the hovered button
+        // was flatter than the resting one.
+        for theme in themes() {
+            let rest = button_palette(ButtonStyle::Secondary, false, &theme);
+            let hover = button_palette(ButtonStyle::Secondary, true, &theme);
+            assert_eq!(hover.background.a, 1.0, "the hovered fill is a wash");
+            for panel in [Colors::bg(&theme), Colors::bg_elevated(&theme)] {
+                let lift =
+                    |fill| crate::theme::contrast(crate::theme::composite(fill, panel), panel);
+                assert!(
+                    lift(hover.background) > lift(rest.background),
+                    "{:?} {:?}: hovered {:.3} vs resting {:.3}",
+                    theme.base_tone,
+                    theme.appearance_mode,
+                    lift(hover.background),
+                    lift(rest.background)
+                );
             }
         }
     }
@@ -915,12 +1008,110 @@ mod tests {
     }
 
     #[test]
-    fn the_danger_hover_layers_a_second_tint() {
-        let theme = Theme::default();
-        let rest = button_palette(ButtonStyle::Danger, false, &theme);
-        let hover = button_palette(ButtonStyle::Danger, true, &theme);
-        assert_eq!(rest.hover_tint.a, 0.0);
-        assert!(hover.hover_tint.a > 0.0, "danger has no hover depth");
+    fn the_danger_hover_is_its_tint_laid_over_itself() {
+        // One fill that paints what the muted token painted twice would, so
+        // the renderer, which applies a single background, shows it.
+        for theme in themes() {
+            let rest = button_palette(ButtonStyle::Danger, false, &theme).background;
+            let hover = button_palette(ButtonStyle::Danger, true, &theme).background;
+            assert_eq!((hover.r, hover.g, hover.b), (rest.r, rest.g, rest.b));
+            for surface in [Colors::bg(&theme), Colors::bg_surface(&theme)] {
+                let twice = crate::theme::composite(rest, crate::theme::composite(rest, surface));
+                let once = crate::theme::composite(hover, surface);
+                for (a, b) in [(once.r, twice.r), (once.g, twice.g), (once.b, twice.b)] {
+                    assert!((a - b).abs() < 1e-5, "{once:?} is not {twice:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn every_focus_ring_clears_non_text_contrast_on_its_own_fill() {
+        // The ring is the element's border, painted at the edge of its own
+        // fill, so it has to read against that fill over every surface, at
+        // rest and hovered. Primary's fill is the accent, so its ring is
+        // `on_accent`, held to its label's 3:1 on the resting accent; the
+        // lighter hovered accent is a label question too (blue's is 2.96:1).
+        for theme in themes() {
+            for accent in crate::theme::AccentColor::ALL {
+                let theme = Theme {
+                    accent_color: accent,
+                    ..theme
+                };
+                for style in STYLES {
+                    let ring = button_palette(style, false, &theme).focus_ring;
+                    let states: &[bool] = if style == ButtonStyle::Primary {
+                        &[false]
+                    } else {
+                        &[false, true]
+                    };
+                    for &hovered in states {
+                        let fill = button_palette(style, hovered, &theme).background;
+                        for surface in [
+                            Colors::bg(&theme),
+                            Colors::bg_elevated(&theme),
+                            Colors::bg_surface(&theme),
+                        ] {
+                            let ratio = crate::theme::contrast(
+                                ring,
+                                crate::theme::composite(fill, surface),
+                            );
+                            assert!(
+                                ratio >= 3.0,
+                                "{accent:?} {:?} {:?}: the {style:?} ring is {ratio:.2}:1 (hovered {hovered})",
+                                theme.base_tone,
+                                theme.appearance_mode
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_focused_choice_row_never_draws_the_edge_it_has_when_selected() {
+        for theme in themes() {
+            for accent in crate::theme::AccentColor::ALL {
+                let theme = Theme {
+                    accent_color: accent,
+                    ..theme
+                };
+                for selected in [false, true] {
+                    let ring = choice_row_focus_ring(selected, &theme);
+                    let fill = crate::theme::composite(
+                        choice_row_fill(selected, &theme),
+                        Colors::bg_elevated(&theme),
+                    );
+                    assert!(crate::theme::contrast(ring, fill) >= 3.0);
+                }
+                assert_ne!(
+                    choice_row_focus_ring(true, &theme),
+                    Colors::accent(&theme),
+                    "focusing the selected row would only thicken its edge"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_focus_ring_keeps_every_control_its_size() {
+        // A control gives back from its padding what the ring adds to its
+        // resting border, so nothing beside it moves when it takes focus.
+        for resting in [0.0, BorderWidth::HAIRLINE, BorderWidth::REGULAR] {
+            let give_back = BorderWidth::focus_give_back(resting);
+            assert_eq!(resting + give_back, BorderWidth::FOCUS_RING);
+        }
+        // Every padding that gives some back has that much to give.
+        for (padding, resting) in [
+            (Spacing::MD, BorderWidth::HAIRLINE),
+            (Spacing::XXS, BorderWidth::HAIRLINE),
+            (Spacing::SM, BorderWidth::HAIRLINE),
+            (Spacing::XXXS, 0.0),
+            (Spacing::MD, BorderWidth::REGULAR),
+        ] {
+            assert!(padding - BorderWidth::focus_give_back(resting) >= 0.0);
+        }
     }
 
     #[test]
@@ -962,12 +1153,24 @@ mod tests {
     }
 
     #[test]
-    fn a_ghost_icon_button_gains_its_border_only_on_hover() {
+    fn an_icon_button_answers_the_pointer_with_its_fill_never_its_edge() {
+        // The edge belongs to the focus ring, which a hover applied after it
+        // would otherwise replace under the pointer.
+        for theme in themes() {
+            for variant in [IconButtonVariant::Filled, IconButtonVariant::Ghost] {
+                for selected in [false, true] {
+                    let rest = icon_button_palette(variant, selected, false, true, None, &theme);
+                    let hover = icon_button_palette(variant, selected, true, true, None, &theme);
+                    assert_eq!(rest.border, hover.border, "{variant:?} {selected}");
+                    if !selected {
+                        assert_ne!(rest.background, hover.background, "{variant:?} is inert");
+                    }
+                }
+            }
+        }
         let theme = Theme::default();
         let rest = icon_button_palette(IconButtonVariant::Filled, false, false, true, None, &theme);
-        let hover = icon_button_palette(IconButtonVariant::Filled, false, true, true, None, &theme);
         assert_eq!(rest.border.a, 0.0, "resting border should be invisible");
-        assert!(hover.border.a > 0.0);
     }
 
     #[test]

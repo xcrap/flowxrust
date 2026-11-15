@@ -1,10 +1,13 @@
 //! Surfaces and separators: cards, dividers, and the flat panel look.
 
-use gpui::{InteractiveElement, IntoElement, MouseButton, ParentElement, Styled, StyledText, div};
+use gpui::{
+    InteractiveElement, IntoElement, MouseButton, ParentElement, StatefulInteractiveElement,
+    Styled, StyledText, div,
+};
 
 use super::rich_text::{InlineSpan, InlineStyle, inline_run};
 use crate::styled::{FxStyled, px_len};
-use crate::theme::{BorderWidth, Colors, Radii, Spacing, TextRole, global};
+use crate::theme::{BorderWidth, Colors, Radii, Shadow, Spacing, TextRole, global};
 
 /// Which way a divider runs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -61,6 +64,63 @@ pub fn panel(content: impl IntoElement) -> impl IntoElement {
         .border(px_len(BorderWidth::HAIRLINE))
         .border_color(Colors::border_medium(&theme))
         .child(content)
+}
+
+/// A surface that floats above the window: a menu, a tooltip, a popup.
+///
+/// The fill, the hairline edge, the `xl` corner and the popover shadow are on
+/// this element, and whatever scrolls is a child of it ([`floating_scroll`]).
+/// GPUI 0.2.2 paints an element's shadow before it pushes that element's own
+/// overflow mask, so the shadow is never clipped by the element's bounds; it
+/// is clipped by an ancestor that clips. Keeping the scroll on a child keeps
+/// it that way: the scroll offset and its mask reach the rows, and nothing
+/// that frames the panel.
+pub fn floating(content: impl IntoElement) -> gpui::Div {
+    let theme = global::current();
+    let palette = floating_palette(&theme);
+    div()
+        .flex()
+        .flex_col()
+        .bg(palette.fill)
+        .rounded(px_len(Radii::XL))
+        .border(px_len(BorderWidth::HAIRLINE))
+        .border_color(palette.edge)
+        .fx_shadow(Shadow::popover(palette.shadow))
+        .child(content)
+}
+
+/// A floating surface whose content scrolls past `max_height`.
+pub fn floating_scroll(
+    id: impl Into<gpui::ElementId>,
+    max_height: f32,
+    content: impl IntoElement,
+) -> gpui::Div {
+    floating(
+        div()
+            .id(id)
+            .flex()
+            .flex_col()
+            .max_h(px_len(max_height))
+            .overflow_y_scroll()
+            .child(content),
+    )
+}
+
+/// How a floating surface is painted.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct FloatingPalette {
+    pub fill: gpui::Rgba,
+    pub edge: gpui::Rgba,
+    /// The shadow's base color, faded by the popover recipe.
+    pub shadow: gpui::Rgba,
+}
+
+pub fn floating_palette(theme: &crate::theme::Theme) -> FloatingPalette {
+    FloatingPalette {
+        fill: Colors::bg_surface(theme),
+        edge: Colors::border_medium(theme),
+        shadow: Colors::overlay(theme),
+    }
 }
 
 /// An empty-state block: a large muted glyph, a title, and a hint.
@@ -191,3 +251,50 @@ pub fn titlebar_control(control: impl IntoElement) -> impl IntoElement {
 
 /// The hairline thickness used for every card and panel edge.
 pub const HAIRLINE: f32 = BorderWidth::HAIRLINE;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gpui::{AbsoluteLength, Overflow};
+
+    fn hairline(width: Option<AbsoluteLength>) -> bool {
+        width == Some(px_len(BorderWidth::HAIRLINE))
+    }
+
+    #[test]
+    fn a_floating_surface_carries_the_popover_shadow_a_hairline_and_never_scrolls() {
+        // The panel frames; its child scrolls. The menu panel scrolled itself
+        // and went without a shadow, on the belief that its bounds clipped it.
+        let mut panel = floating_scroll("probe", 120.0, div());
+        let style = panel.style();
+        let shadow = style.box_shadow.clone().unwrap_or_default();
+        assert_eq!(shadow.len(), 1, "a floating surface has one shadow");
+        let recipe = Shadow::popover(Colors::overlay(&global::current()));
+        assert_eq!(shadow[0].blur_radius, gpui::px(recipe.blur));
+        assert_eq!(shadow[0].offset.y, gpui::px(recipe.y));
+        let edges = &style.border_widths;
+        assert!(hairline(edges.top) && hairline(edges.right));
+        assert!(hairline(edges.bottom) && hairline(edges.left));
+        assert_eq!(style.corner_radii.top_left, Some(px_len(Radii::XL)));
+        assert!(
+            style.overflow.y.is_none_or(|o| o == Overflow::Visible),
+            "the panel itself scrolls"
+        );
+    }
+
+    #[test]
+    fn a_floating_surface_is_an_opaque_fill_with_a_visible_edge() {
+        for appearance_mode in [
+            crate::theme::AppearanceMode::Light,
+            crate::theme::AppearanceMode::Dark,
+        ] {
+            let theme = crate::theme::Theme {
+                appearance_mode,
+                ..Default::default()
+            };
+            let palette = floating_palette(&theme);
+            assert_eq!(palette.fill.a, 1.0, "a floating panel is opaque");
+            assert_ne!(palette.edge, palette.fill);
+        }
+    }
+}

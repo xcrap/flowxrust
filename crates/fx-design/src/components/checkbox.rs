@@ -97,7 +97,14 @@ pub fn checkbox(
                 .child(label.into()),
         )
         .opacity(if enabled { 1.0 } else { DISABLED_OPACITY })
+        .rounded(px_len(Radii::XS))
         .id(id)
+        // The row has no padding to give back, so the ring takes its width
+        // from a negative margin and the row keeps its place.
+        .focus(|s: StyleRefinement| {
+            s.fx_focus_ring()
+                .m(px_len(-BorderWidth::focus_give_back(0.0)))
+        })
         .cursor(if enabled {
             CursorStyle::PointingHand
         } else {
@@ -129,6 +136,10 @@ mod tests {
                     let on = checkbox_palette(true, &theme);
                     let off = checkbox_palette(false, &theme);
                     assert!(crate::theme::contrast(on.check, on.fill) >= 3.0);
+                    // The row's ring sits on whatever the row is on, which the
+                    // focus color is held to everywhere.
+                    let row = Colors::bg_elevated(&theme);
+                    assert!(crate::theme::contrast(Colors::focus_ring(&theme), row) >= 3.0);
                     assert_ne!(on.fill, off.fill, "checked and unchecked look alike");
                     assert_ne!(
                         checkbox_label_ink(true, &theme),

@@ -49,7 +49,7 @@ pub fn inline_run(span: &InlineSpan, role: TextRole, theme: &Theme) -> TextRun {
         len: span.range.len(),
         font,
         color: if span.style.link {
-            Colors::accent_secondary(theme)
+            Colors::accent_secondary_ink(theme)
         } else {
             Colors::fg(theme)
         }
@@ -103,7 +103,7 @@ mod tests {
         assert_eq!(run.font.family.as_ref(), FAMILY_MONO);
         assert_eq!(run.font.weight, FontWeight::SEMIBOLD);
         assert_eq!(run.font.style, FontStyle::Italic);
-        assert_eq!(run.color, Colors::accent_secondary(&theme).into());
+        assert_eq!(run.color, Colors::accent_secondary_ink(&theme).into());
         assert!(run.underline.is_some());
         assert!(run.background_color.is_some());
     }

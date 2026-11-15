@@ -10,7 +10,9 @@
 
 use gpui::{AbsoluteLength, Fill, Hsla, Pixels, Rgba, SharedString, StyleRefinement, Styled};
 
-use crate::theme::{Colors, Layout, Radii, ShadowStyle, TextRole, TextStyle, Typography, global};
+use crate::theme::{
+    BorderWidth, Colors, Layout, Radii, ShadowStyle, TextRole, TextStyle, Typography, global,
+};
 
 /// Shorthand for turning a token value into the length type a style wants.
 #[inline]
@@ -122,6 +124,30 @@ pub trait FxStyled: Styled + Sized {
     /// A hairline separator across the current axis.
     fn fx_divider(self) -> Self {
         self.bg(Colors::border(&global::current()))
+    }
+
+    // ── Focus ──────────────────────────────────────────────────────────────
+
+    /// The keyboard focus ring, for a `.focus(|s| s.fx_focus_ring())`
+    /// refinement: the element's border, at [`BorderWidth::FOCUS_RING`], in
+    /// [`Colors::focus_ring`].
+    ///
+    /// GPUI applies a focus refinement only to an element that tracks a focus
+    /// handle, so a component carries it unconditionally and it shows once a
+    /// view calls `track_focus` on the component. Hover and press refinements
+    /// are applied after it, so a component's hover must not set the border
+    /// color, or the pointer hides the ring.
+    fn fx_focus_ring(self) -> Self {
+        let color = Colors::focus_ring(&global::current());
+        self.fx_focus_ring_in(color)
+    }
+
+    /// The focus ring in a color of the caller's choosing: `on_accent` on a
+    /// control whose own fill is the accent, which a ring in
+    /// [`Colors::focus_ring`] could match.
+    fn fx_focus_ring_in(self, color: Rgba) -> Self {
+        self.border(px_len(BorderWidth::FOCUS_RING))
+            .border_color(color)
     }
 
     // ── Elevation ──────────────────────────────────────────────────────────

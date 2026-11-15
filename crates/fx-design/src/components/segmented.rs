@@ -1,10 +1,10 @@
 use std::rc::Rc;
 
 use gpui::prelude::*;
-use gpui::{App, CursorStyle, IntoElement, ParentElement, SharedString, Styled, Window, div};
+use gpui::{App, CursorStyle, ParentElement, SharedString, Styled, Window, div};
 
 use crate::styled::{FxRefinement, FxStyled, px_len};
-use crate::theme::{Colors, Layout, Radii, Spacing, TextRole, global};
+use crate::theme::{BorderWidth, Colors, Layout, Radii, Spacing, TextRole, global};
 
 /// Height of a segment.
 const SEGMENT_HEIGHT: f32 = Layout::CONTROL_COMPACT_HEIGHT - Spacing::XXS;
@@ -31,15 +31,63 @@ impl<T> SegmentedOption<T> {
     }
 }
 
+/// How one segment is painted.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SegmentPalette {
+    pub foreground: gpui::Rgba,
+    pub background: gpui::Rgba,
+}
+
+/// The selected segment is `fg` on the selection wash and keeps it under the
+/// pointer. The others are `fg_secondary`, and `fg` on the hover wash.
+///
+/// The unselected labels were `fg_tertiary`, 3.7:1 on the track: a caption
+/// that names a choice is text, and needs AA. The selected one still leads,
+/// by its fill and a step of ink.
+pub fn segment_palette(
+    selected: bool,
+    hovered: bool,
+    theme: &crate::theme::Theme,
+) -> SegmentPalette {
+    if selected {
+        SegmentPalette {
+            foreground: Colors::fg(theme),
+            background: Colors::bg_selected(theme),
+        }
+    } else if hovered {
+        SegmentPalette {
+            foreground: Colors::fg(theme),
+            background: Colors::bg_hover(theme),
+        }
+    } else {
+        SegmentPalette {
+            foreground: Colors::fg_secondary(theme),
+            background: gpui::Rgba {
+                r: 0.0,
+                g: 0.0,
+                b: 0.0,
+                a: 0.0,
+            },
+        }
+    }
+}
+
+/// The track every segment is painted over.
+pub fn segmented_track(theme: &crate::theme::Theme) -> gpui::Rgba {
+    Colors::bg_surface(theme)
+}
+
 /// A row of exclusive choices, with the selected one filled.
 ///
 /// Sized to its content rather than stretched, so a two-option control in a
-/// toolbar does not read as a full-width field.
+/// toolbar does not read as a full-width field. The control is one focus
+/// target, its track: a view that tracks focus on it gets the ring around
+/// the whole control.
 pub fn segmented_control<T: PartialEq + Clone + 'static>(
     options: &[SegmentedOption<T>],
     selected: &T,
     on_select: impl Fn(&T, &mut Window, &mut App) + 'static,
-) -> impl IntoElement {
+) -> gpui::Stateful<gpui::Div> {
     let theme = global::current();
 
     // Every segment needs the same callback, so share one copy rather than
@@ -49,6 +97,8 @@ pub fn segmented_control<T: PartialEq + Clone + 'static>(
     let segments = options.iter().map(|option| {
         let is_selected = &option.value == selected;
         let value = option.value.clone();
+        let rest = segment_palette(is_selected, false, &theme);
+        let hover = segment_palette(is_selected, true, &theme);
         div()
             .flex()
             .flex_shrink_0()
@@ -58,21 +108,8 @@ pub fn segmented_control<T: PartialEq + Clone + 'static>(
             .justify_center()
             .whitespace_nowrap()
             .rounded(px_len(Radii::XS))
-            .bg(if is_selected {
-                Colors::bg_selected(&theme)
-            } else {
-                gpui::Rgba {
-                    r: 0.0,
-                    g: 0.0,
-                    b: 0.0,
-                    a: 0.0,
-                }
-            })
-            .text_color(if is_selected {
-                Colors::fg(&theme)
-            } else {
-                Colors::fg_tertiary(&theme)
-            })
+            .bg(rest.background)
+            .text_color(rest.foreground)
             .fx_role(TextRole::CaptionMedium)
             .child(option.title.clone())
             // `.id` upgrades to `Stateful<Div>`, which carries `on_click`.
@@ -81,13 +118,9 @@ pub fn segmented_control<T: PartialEq + Clone + 'static>(
                 option.title
             )))
             .cursor(CursorStyle::PointingHand)
-            .hover(|s| {
-                if is_selected {
-                    s
-                } else {
-                    s.fx_background(Colors::bg_hover(&theme))
-                        .fx_text_color(Colors::fg_secondary(&theme))
-                }
+            .hover(move |s| {
+                s.fx_background(hover.background)
+                    .fx_text_color(hover.foreground)
             })
             .on_click({
                 let on_select = Rc::clone(&on_select);
@@ -95,6 +128,11 @@ pub fn segmented_control<T: PartialEq + Clone + 'static>(
             })
     });
 
+    let id = options
+        .iter()
+        .map(|option| option.title.as_ref())
+        .collect::<Vec<_>>()
+        .join("|");
     div()
         .debug_selector(|| "segmented-control".into())
         .flex()
@@ -102,9 +140,15 @@ pub fn segmented_control<T: PartialEq + Clone + 'static>(
         .flex_row()
         .gap(px_len(Spacing::XXXS))
         .p(px_len(Spacing::XXXS))
-        .bg(Colors::bg_surface(&theme))
+        .bg(segmented_track(&theme))
         .rounded(px_len(Radii::SM))
         .children(segments.collect::<Vec<_>>())
+        .id(gpui::SharedString::from(format!("segmented:{id}")))
+        // The track has no edge at rest, so its padding gives back the ring.
+        .focus(|s| {
+            s.fx_focus_ring()
+                .p(px_len(Spacing::XXXS - BorderWidth::focus_give_back(0.0)))
+        })
 }
 
 #[cfg(test)]

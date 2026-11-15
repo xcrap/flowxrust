@@ -7,6 +7,7 @@ use gpui::{App, ClickEvent, IntoElement, Rgba, SharedString, Window, div, px};
 
 use crate::icon::Icon;
 use crate::styled::FxRefinement;
+use crate::theme::animation::Easing;
 use crate::theme::{
     BorderWidth, Colors, FxAnimation, IconSize, Layout, Radii, Spacing, Theme, Typography, global,
 };
@@ -129,8 +130,7 @@ impl Feedback {
             return self.target;
         }
         let progress = elapsed.as_secs_f32() / FxAnimation::QUICK.as_secs_f32();
-        self.from
-            .mix(self.target, FxAnimation::ease_out()(progress))
+        self.from.mix(self.target, Easing::Enter.apply(progress))
     }
 
     fn retarget(&mut self, target: Visuals, now: Instant) {

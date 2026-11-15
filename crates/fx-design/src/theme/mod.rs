@@ -9,11 +9,11 @@ pub mod global;
 pub mod metrics;
 pub mod typography;
 
-pub use animation::FxAnimation;
+pub use animation::{Easing, FxAnimation};
 pub use color::{
-    AccentColor, AppearanceMode, BaseTone, Colors, Palette, Rgba, TextSizePreset, Theme,
-    ThemeSignature, ToneScale, WithAlpha, composite, contrast, contrast_ratio, h, ha, legible_or,
-    relative_luminance,
+    AccentColor, AppearanceMode, BaseTone, Colors, NON_TEXT_FLOOR, Palette, Rgba, TEXT_FLOOR,
+    TextSizePreset, Theme, ThemeSignature, ToneScale, WithAlpha, blend, composite, contrast,
+    contrast_ratio, h, ha, legible_or, relative_luminance,
 };
 pub use global::{ThemeGuard, current, set, set_system_appearance, update};
 pub use metrics::{BorderWidth, Layout, Radii, Shadow, ShadowStyle, Spacing};

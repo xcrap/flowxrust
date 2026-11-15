@@ -294,6 +294,84 @@ pub fn static_ring(color: Rgba) -> impl IntoElement {
         .border_color(color.with_alpha(0.75))
 }
 
+/// Where a piece of work is: a tool call, a background task, a step.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StatusGlyph {
+    Running,
+    Done,
+    Failed,
+    /// Ended before it finished, by the reader or by the work around it.
+    Stopped,
+}
+
+impl StatusGlyph {
+    pub const ALL: [Self; 4] = [Self::Running, Self::Done, Self::Failed, Self::Stopped];
+
+    /// The word a test or an accessibility label uses for the state.
+    pub const fn word(self) -> &'static str {
+        match self {
+            Self::Running => "running",
+            Self::Done => "done",
+            Self::Failed => "failed",
+            Self::Stopped => "stopped",
+        }
+    }
+}
+
+/// The one size every status glyph is drawn at, so a done mark, a failure
+/// and the spinner beside them line up. The spinner's ring is 14pt, which is
+/// this size's edge at the standard text size.
+pub const STATUS_GLYPH_SIZE: IconSize = IconSize::Medium;
+
+/// The colour of a status glyph.
+///
+/// Each glyph is the only sign of its state, so it clears the 3:1 a graphic
+/// needs on every surface a row sits on, bare and hovered: the hue where it
+/// reads, a deeper ink where it does not. Light-mode `success` is 2.9:1 on
+/// `bg_surface` and takes `success_ink`; the accent takes `accent_ink`,
+/// since dark violet is 3.0:1 on `bg_elevated`. `error` reads everywhere.
+pub fn status_glyph_ink(glyph: StatusGlyph, theme: &crate::theme::Theme) -> Rgba {
+    let fills = theme.palette().text_fills();
+    let legible = |hue, fallback| {
+        crate::theme::legible_or(hue, fallback, &fills, crate::theme::NON_TEXT_FLOOR)
+    };
+    match glyph {
+        StatusGlyph::Running => Colors::accent_ink(theme),
+        StatusGlyph::Done => legible(Colors::success(theme), Colors::success_ink(theme)),
+        StatusGlyph::Failed => legible(Colors::error(theme), Colors::error_ink(theme)),
+        StatusGlyph::Stopped => legible(Colors::fg_tertiary(theme), Colors::fg_secondary(theme)),
+    }
+}
+
+/// A status glyph at [`STATUS_GLYPH_SIZE`].
+///
+/// `spin` turns a running glyph into the spinner at that angle, in degrees;
+/// without it, a running glyph is a still ring, which is what reduced motion
+/// or a stalled frame should show.
+pub fn status_glyph(glyph: StatusGlyph, spin: Option<f32>) -> gpui::AnyElement {
+    let theme = global::current();
+    let ink = status_glyph_ink(glyph, &theme);
+    let slot = Typography::icon(STATUS_GLYPH_SIZE, &theme).size;
+    let mark = match glyph {
+        StatusGlyph::Running => match spin {
+            Some(spin) => spinner_arc(ink, spin).into_any_element(),
+            None => static_ring(ink).into_any_element(),
+        },
+        StatusGlyph::Done => Icon::CHECKMARK_CIRCLE_FILL.render(STATUS_GLYPH_SIZE, ink, &theme),
+        StatusGlyph::Failed => Icon::XMARK_CIRCLE_FILL.render(STATUS_GLYPH_SIZE, ink, &theme),
+        StatusGlyph::Stopped => Icon::STOP_CIRCLE_FILL.render(STATUS_GLYPH_SIZE, ink, &theme),
+    };
+    div()
+        .debug_selector(move || format!("status-glyph:{}", glyph.word()))
+        .flex()
+        .flex_shrink_0()
+        .items_center()
+        .justify_center()
+        .size(px(slot))
+        .child(mark)
+        .into_any_element()
+}
+
 /// One dot of the typing indicator.
 const TYPING_DOT_SIZE: f32 = 4.0;
 
@@ -320,33 +398,6 @@ pub fn typing_indicator(phase: usize, reduce_motion: bool) -> impl IntoElement {
                         .opacity(FxAnimation::typing_dot_opacity(i, phase, reduce_motion))
                 })
                 .collect::<Vec<_>>(),
-        )
-}
-
-/// Outer ring diameter of the pulsing status indicator.
-const PULSE_OUTER: f32 = 18.0;
-const PULSE_INNER: f32 = 8.0;
-
-/// A dot that breathes, for a thread that is working but not streaming.
-pub fn pulsing_dot(color: Rgba, progress: f32, reduce_motion: bool) -> impl IntoElement {
-    let glow_size = FxAnimation::status_pulse_size(progress, reduce_motion);
-    div()
-        .relative()
-        .size(px_len(PULSE_OUTER))
-        .flex_shrink_0()
-        .child(
-            centered_layer(PULSE_OUTER, glow_size)
-                .rounded_full()
-                .bg(color.with_alpha(FxAnimation::status_pulse_opacity(progress, reduce_motion))),
-        )
-        .child(
-            centered_layer(PULSE_OUTER, PULSE_INNER)
-                .rounded_full()
-                .bg(color)
-                .opacity(FxAnimation::status_pulse_dot_opacity(
-                    progress,
-                    reduce_motion,
-                )),
         )
 }
 
@@ -679,6 +730,39 @@ mod tests {
     fn an_unknown_context_level_falls_back_to_the_accent() {
         let theme = Theme::default();
         assert_eq!(context_ring_color(None, &theme), Colors::accent(&theme));
+    }
+
+    #[test]
+    fn every_status_glyph_shares_the_spinners_size() {
+        // The transcript drew a 9pt check, an 11pt failure and a 14pt
+        // spinner side by side. One slot, the spinner's, holds all four.
+        let theme = Theme::default();
+        assert_eq!(
+            Typography::icon(STATUS_GLYPH_SIZE, &theme).size,
+            SPINNER_RING_SIZE
+        );
+    }
+
+    #[test]
+    fn every_status_glyph_reads_as_its_own_state() {
+        for theme in themes() {
+            let inks: Vec<_> = StatusGlyph::ALL
+                .iter()
+                .map(|glyph| status_glyph_ink(*glyph, &theme))
+                .collect();
+            for (i, a) in inks.iter().enumerate() {
+                for b in &inks[i + 1..] {
+                    assert_ne!(a, b, "two states share a colour in {theme:?}");
+                }
+            }
+            let done = status_glyph_ink(StatusGlyph::Done, &theme);
+            assert!(done.g > done.r && done.g > done.b, "done is not a green");
+            let failed = status_glyph_ink(StatusGlyph::Failed, &theme);
+            assert!(
+                failed.r > failed.g && failed.r > failed.b,
+                "failed is not a red"
+            );
+        }
     }
 
     #[test]

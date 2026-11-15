@@ -9,13 +9,14 @@
 use fx_design::components::context_meter::context_meter_palette;
 use fx_design::components::provider_status::provider_status_palette;
 use fx_design::components::{
-    ActivityState, BadgeTone, ChecklistMark, ContextUsage, MenuItem, ProviderIdentity,
-    change_indicator_palette, change_indicator_surface, checklist_ink, checklist_surface,
-    row_palette,
+    ActivityState, BadgeTone, ButtonStyle, ChecklistMark, ContextUsage, MenuItem, MenuItemTone,
+    ProviderIdentity, StatusGlyph, button_palette, change_indicator_palette,
+    change_indicator_surface, checklist_ink, checklist_surface, row_palette, segment_palette,
+    segmented_track, status_glyph_ink,
 };
 use fx_design::theme::{
-    AccentColor, AppearanceMode, BaseTone, Colors, Rgba, TextSizePreset, Theme, composite,
-    contrast, h,
+    AccentColor, AppearanceMode, BaseTone, Colors, Rgba, TextSizePreset, Theme, WithAlpha,
+    composite, contrast, h,
 };
 
 /// Every tone and appearance combination. A test that must hold everywhere
@@ -292,6 +293,226 @@ fn a_menu_checkmark_clears_non_text_contrast_with_every_accent() {
                     "{tone:?} {mode:?} {accent:?}: the checkmark is {ratio}:1 (hovered {hovered})"
                 );
             }
+        }
+    }
+}
+
+/// A fill over each surface it can sit on, as it renders, with the pointer
+/// over it and not.
+fn under_the_pointer(t: &Theme, fill: Rgba) -> Vec<(String, Rgba)> {
+    let mut out = Vec::new();
+    for (name, surface) in surfaces(t) {
+        let filled = composite(fill, surface);
+        out.push((name.to_string(), filled));
+        out.push((
+            format!("{name} hovered"),
+            composite(Colors::bg_hover(t), filled),
+        ));
+    }
+    out
+}
+
+#[test]
+fn every_button_label_clears_its_floor_on_its_fill_at_rest_and_hovered() {
+    // 14pt medium text needs AA. The Danger label, `error` on `errorMuted`,
+    // was 3.1:1 over `bgSurface`. Primary keeps the 3:1 every solid accent
+    // fill is held to above, at rest: white on blue's lighter hover fill is
+    // 2.96:1, a palette question this does not settle.
+    for (tone, mode) in all_theme_combinations() {
+        for accent in AccentColor::ALL {
+            let t = Theme {
+                accent_color: accent,
+                ..theme_for(tone, mode)
+            };
+            for style in [
+                ButtonStyle::Primary,
+                ButtonStyle::Secondary,
+                ButtonStyle::Ghost,
+                ButtonStyle::Danger,
+            ] {
+                let (floor, states): (f64, &[bool]) = if style == ButtonStyle::Primary {
+                    (3.0, &[false])
+                } else {
+                    (4.5, &[false, true])
+                };
+                for &hovered in states {
+                    let palette = button_palette(style, hovered, &t);
+                    for (surface_name, surface) in surfaces(&t) {
+                        let fill = composite(palette.background, surface);
+                        let ratio = contrast(palette.foreground, fill);
+                        assert!(
+                            ratio >= floor,
+                            "{tone:?} {mode:?} {accent:?}: the {style:?} label over {surface_name} is {ratio}:1 (hovered {hovered})"
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn every_menu_row_title_clears_aa_on_the_menu_hovered_or_not() {
+    // A destructive row was `error` on `bgSurface`, 3.7:1.
+    for (tone, mode) in all_theme_combinations() {
+        let t = theme_for(tone, mode);
+        let surface = Colors::bg_surface(&t);
+        for item in [
+            MenuItem::new("plain", "Plain"),
+            MenuItem::new("delete", "Delete").tone(MenuItemTone::Destructive),
+        ] {
+            for hovered in [false, true] {
+                let palette = row_palette(&item, hovered, &t);
+                let fill = composite(palette.background, surface);
+                let ratio = contrast(palette.title, fill);
+                assert!(
+                    ratio >= 4.5,
+                    "{tone:?} {mode:?}: the {:?} title is {ratio}:1 (hovered {hovered})",
+                    item.tone
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn error_and_link_inks_clear_aa_on_every_surface_hovered_or_not() {
+    // `error` was 3.7:1 on `bgSurface` in both modes and 4.4:1 on light
+    // `bgElevated`; light `accentSecondary` was 4.3:1 on `bgSurface`. The
+    // inks keep their hue family and clear AA wherever text is drawn.
+    for (tone, mode) in all_theme_combinations() {
+        let t = theme_for(tone, mode);
+        for (ink_name, ink) in [
+            ("errorInk", Colors::error_ink(&t)),
+            ("accentSecondaryInk", Colors::accent_secondary_ink(&t)),
+        ] {
+            for (surface_name, fill) in under_the_pointer(&t, h(0x000000).with_alpha(0.0)) {
+                let ratio = contrast(ink, fill);
+                assert!(
+                    ratio >= 4.5,
+                    "{tone:?} {mode:?}: {ink_name} on {surface_name} is {ratio}:1"
+                );
+            }
+        }
+        let error = Colors::error_ink(&t);
+        assert!(
+            error.r > error.g && error.r > error.b,
+            "errorInk is not a red"
+        );
+        let teal = Colors::accent_secondary_ink(&t);
+        assert!(
+            teal.g > teal.r && teal.b > teal.r,
+            "accentSecondaryInk is not a teal"
+        );
+        if mode == AppearanceMode::Dark {
+            assert_eq!(
+                Colors::accent_secondary_ink(&t),
+                Colors::accent_secondary(&t),
+                "the hue is kept wherever it reads"
+            );
+        }
+    }
+}
+
+#[test]
+fn success_ink_clears_non_text_contrast_on_every_surface_and_stays_green() {
+    // Light `success` is 2.9:1 on `bgSurface`, under the 3:1 a done mark
+    // needs when it is the only sign the work finished.
+    for (tone, mode) in all_theme_combinations() {
+        let t = theme_for(tone, mode);
+        let ink = Colors::success_ink(&t);
+        for (surface_name, fill) in under_the_pointer(&t, h(0x000000).with_alpha(0.0)) {
+            let ratio = contrast(ink, fill);
+            assert!(
+                ratio >= 3.0,
+                "{tone:?} {mode:?}: successInk on {surface_name} is {ratio}:1"
+            );
+        }
+        assert!(ink.g > ink.r && ink.g > ink.b, "successInk is not a green");
+        if mode == AppearanceMode::Dark {
+            assert_eq!(ink, Colors::success(&t), "dark mode needs no step down");
+        }
+    }
+}
+
+#[test]
+fn every_segment_label_clears_aa_on_the_track() {
+    // Unselected segments were `fgTertiary` on the track, 3.7:1.
+    for (tone, mode) in all_theme_combinations() {
+        let t = theme_for(tone, mode);
+        let track = segmented_track(&t);
+        for selected in [false, true] {
+            for hovered in [false, true] {
+                let palette = segment_palette(selected, hovered, &t);
+                let ratio = contrast(palette.foreground, composite(palette.background, track));
+                assert!(
+                    ratio >= 4.5,
+                    "{tone:?} {mode:?}: a segment label is {ratio}:1 (selected {selected}, hovered {hovered})"
+                );
+            }
+        }
+        // The selected segment still leads.
+        let on = segment_palette(true, false, &t);
+        let off = segment_palette(false, false, &t);
+        assert!(
+            contrast(on.foreground, composite(on.background, track))
+                > contrast(off.foreground, composite(off.background, track))
+        );
+    }
+}
+
+#[test]
+fn the_focus_ring_clears_non_text_contrast_on_every_fill_with_every_accent() {
+    // The ring is the only sign of where the keyboard is, so it needs the
+    // 3:1 a graphic does on every neutral fill a focusable control sits on.
+    // The raw accent did not manage it: dark violet is 1.7:1 on a hovered
+    // `bgSurface`, light emerald 1.8:1.
+    for (tone, mode) in all_theme_combinations() {
+        let mut kept = 0;
+        for accent in AccentColor::ALL {
+            let t = Theme {
+                accent_color: accent,
+                ..theme_for(tone, mode)
+            };
+            let ring = Colors::focus_ring(&t);
+            for (i, fill) in t.palette().control_fills().into_iter().enumerate() {
+                let ratio = contrast(ring, fill);
+                assert!(
+                    ratio >= 3.0,
+                    "{tone:?} {mode:?} {accent:?}: the focus ring is {ratio}:1 on fill {i}"
+                );
+            }
+            assert_ne!(ring, Colors::fg(&t), "{accent:?} lost its hue entirely");
+            kept += usize::from(ring == Colors::accent(&t));
+        }
+        assert!(kept > 0, "{tone:?} {mode:?}: no accent is its own ring");
+    }
+}
+
+#[test]
+fn every_status_glyph_clears_non_text_contrast_on_every_surface_hovered_or_not() {
+    // One glyph is all a tool row or task shows of its state.
+    for (tone, mode) in all_theme_combinations() {
+        for accent in AccentColor::ALL {
+            let t = Theme {
+                accent_color: accent,
+                ..theme_for(tone, mode)
+            };
+            for glyph in StatusGlyph::ALL {
+                let ink = status_glyph_ink(glyph, &t);
+                for (surface_name, fill) in under_the_pointer(&t, h(0x000000).with_alpha(0.0)) {
+                    let ratio = contrast(ink, fill);
+                    assert!(
+                        ratio >= 3.0,
+                        "{tone:?} {mode:?} {accent:?}: the {glyph:?} glyph on {surface_name} is {ratio}:1"
+                    );
+                }
+            }
+            // The hue is kept where it reads.
+            if mode == AppearanceMode::Dark {
+                assert_eq!(status_glyph_ink(StatusGlyph::Done, &t), Colors::success(&t));
+            }
+            assert_eq!(status_glyph_ink(StatusGlyph::Failed, &t), Colors::error(&t));
         }
     }
 }

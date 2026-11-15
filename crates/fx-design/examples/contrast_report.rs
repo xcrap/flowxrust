@@ -73,4 +73,62 @@ fn main() {
             contrast(Colors::fg_tertiary(&t), Colors::bg(&t)),
         );
     }
+
+    println!("\n--- inks, worst case over every surface bare and hovered ---");
+    println!("(errorInk/accentSecondaryInk target 4.5, successInk 3.0)");
+    for mode in [AppearanceMode::Dark, AppearanceMode::Light] {
+        for tone in BaseTone::ALL {
+            let t = Theme {
+                base_tone: tone,
+                appearance_mode: mode,
+                ..Default::default()
+            };
+            let fills = t.palette().text_fills();
+            let worst = |ink| {
+                fills
+                    .iter()
+                    .map(|fill| contrast(ink, *fill))
+                    .fold(f64::INFINITY, f64::min)
+            };
+            println!(
+                "{mode:?} {tone:<8} error {:>5.2} errorInk {:>5.2}  accentSecondary {:>5.2} accentSecondaryInk {:>5.2}  success {:>5.2} successInk {:>5.2}",
+                worst(Colors::error(&t)),
+                worst(Colors::error_ink(&t)),
+                worst(Colors::accent_secondary(&t)),
+                worst(Colors::accent_secondary_ink(&t)),
+                worst(Colors::success(&t)),
+                worst(Colors::success_ink(&t)),
+            );
+        }
+    }
+
+    println!("\n--- focus ring (accent ink), worst case over every control fill (target 3.0) ---");
+    for mode in [AppearanceMode::Dark, AppearanceMode::Light] {
+        for accent in AccentColor::ALL {
+            let mut worst_accent = f64::INFINITY;
+            let mut worst_ring = f64::INFINITY;
+            let mut kept = true;
+            for tone in BaseTone::ALL {
+                let t = Theme {
+                    base_tone: tone,
+                    appearance_mode: mode,
+                    accent_color: accent,
+                    ..Default::default()
+                };
+                for fill in t.palette().control_fills() {
+                    worst_accent = worst_accent.min(contrast(Colors::accent(&t), fill));
+                    worst_ring = worst_ring.min(contrast(Colors::focus_ring(&t), fill));
+                }
+                kept &= Colors::focus_ring(&t) == Colors::accent(&t);
+            }
+            println!(
+                "{mode:?} {accent:<8} accent {worst_accent:>5.2}  ring {worst_ring:>5.2}  {}",
+                if kept {
+                    "(the accent itself)"
+                } else {
+                    "(drawn toward fg)"
+                }
+            );
+        }
+    }
 }

@@ -78,6 +78,21 @@ impl BorderWidth {
     pub const STRONG: f32 = 1.5;
 
     pub const ALL: [f32; 3] = [Self::HAIRLINE, Self::REGULAR, Self::STRONG];
+
+    /// The keyboard focus ring, drawn as the focused element's border.
+    ///
+    /// A ring wider than the element's resting border would grow the element
+    /// by the difference, so a component gives that difference back from its
+    /// padding while focused (`focus_give_back`), and one with no padding to
+    /// spare takes it from a negative margin. Nothing beside a focused control
+    /// moves.
+    pub const FOCUS_RING: f32 = Self::STRONG;
+
+    /// How much padding a focused element gives back to keep its size, given
+    /// the border it has at rest.
+    pub const fn focus_give_back(resting: f32) -> f32 {
+        Self::FOCUS_RING - resting
+    }
 }
 
 /// Elevation recipes for surfaces that float above the shell.

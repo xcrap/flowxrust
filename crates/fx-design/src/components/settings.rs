@@ -256,21 +256,28 @@ pub fn settings_search(field: impl IntoElement, shortcut: impl Into<SharedString
 pub struct SwitchPalette {
     pub track: gpui::Rgba,
     pub knob: gpui::Rgba,
+    /// The keyboard focus ring, drawn as the track's edge while focused.
+    pub focus_ring: gpui::Rgba,
 }
 
 /// On is the accent with its own ink for the knob, the pairing every solid
 /// accent fill already guarantees. Off is a recessed track whose knob is the
 /// secondary ink, so the knob's position stays readable without the hue.
+///
+/// The ring follows the knob: on an accent track it is `on_accent`, since
+/// the focus color can be the accent itself.
 pub fn switch_palette(on: bool, theme: &crate::theme::Theme) -> SwitchPalette {
     if on {
         SwitchPalette {
             track: Colors::accent(theme),
             knob: Colors::on_accent(theme),
+            focus_ring: Colors::on_accent(theme),
         }
     } else {
         SwitchPalette {
             track: Colors::bg_pressed(theme),
             knob: Colors::fg_secondary(theme),
+            focus_ring: Colors::focus_ring(theme),
         }
     }
 }
@@ -310,6 +317,12 @@ pub fn switch(
         )
         .opacity(if enabled { 1.0 } else { DISABLED_OPACITY })
         .id(id)
+        // The track's size is fixed, so the ring comes out of its inset and
+        // the knob keeps its room.
+        .focus(move |s: StyleRefinement| {
+            s.fx_focus_ring_in(palette.focus_ring)
+                .p(px_len(inset - BorderWidth::focus_give_back(0.0)))
+        })
         .cursor(if enabled {
             CursorStyle::PointingHand
         } else {
@@ -360,6 +373,27 @@ mod tests {
                 assert!(
                     ratio >= 3.0,
                     "{:?} {:?} {:?} on={on}: knob {ratio:.2}:1",
+                    theme.base_tone,
+                    theme.appearance_mode,
+                    theme.accent_color,
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_switch_focus_ring_clears_non_text_contrast_on_its_track_either_way() {
+        // The ring is the track's edge, so it reads against the track itself
+        // over the group card, as the knob does.
+        for theme in every_theme() {
+            let group = settings_group_palette(&theme).fill;
+            for on in [true, false] {
+                let palette = switch_palette(on, &theme);
+                let track = crate::theme::composite(palette.track, group);
+                let ratio = contrast(palette.focus_ring, track);
+                assert!(
+                    ratio >= 3.0,
+                    "{:?} {:?} {:?} on={on}: ring {ratio:.2}:1",
                     theme.base_tone,
                     theme.appearance_mode,
                     theme.accent_color,
