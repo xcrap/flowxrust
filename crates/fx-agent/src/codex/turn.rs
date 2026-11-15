@@ -131,17 +131,15 @@ impl ApprovalPolicy {
         }
     }
 
-    /// Why a call was refused, for the transcript.
+    /// Why a call was refused, for the transcript and for the model.
     ///
     /// Owned rather than `&'static`, because this is called on every refusal in
     /// a turn and a leaked `String` is never freed.
-    fn message(&self, tool_name: &str) -> String {
+    pub fn message(&self, tool_name: &str) -> String {
         let reason = match self {
             Self::AllowAll => return String::new(),
             Self::Ask | Self::DenyAll => "FlowX refused this tool call.",
-            Self::DenyUnlessReadOnly => {
-                "FlowX only approves read-only tools when running without a prompt."
-            }
+            Self::DenyUnlessReadOnly => "FlowX allows only read-only tools here.",
         };
         format!("{reason} ({tool_name})")
     }

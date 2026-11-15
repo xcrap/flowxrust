@@ -29,6 +29,7 @@ use gpui::{
     AnyElement, AnyView, App, Context, Entity, SharedString, Subscription, Window, div, px,
 };
 
+use crate::review;
 use crate::state::AppState;
 use commit_composer::{CommitComposer, Operation};
 use diff_view::DiffState;
@@ -187,6 +188,40 @@ impl Inspector {
             .into_any_element()
     }
 
+    /// Review the changes with either provider, the one that did not write
+    /// them first. Beside the count of what changed: the header has no room
+    /// left at the panel's narrowest, and here the branch name gives way.
+    fn review_button(&self, cx: &Context<Self>) -> impl IntoElement + use<> {
+        let state = self.state.clone();
+        let open = state
+            .read(cx)
+            .menu_layer
+            .read(cx)
+            .is_owner(review::MENU_OWNER);
+        let has_changes = self
+            .repository(cx)
+            .is_some_and(GitRepositoryInfo::has_changes);
+        icon_button(
+            IconButtonProps::new(Icon::SPARKLE_MAGNIFYINGGLASS, "Review changes")
+                .small()
+                .ghost()
+                .selected(open)
+                .enabled(has_changes),
+            move |event, _, cx| {
+                let author = review::author(state.read(cx));
+                let layer = state.read(cx).menu_layer.clone();
+                layer.update(cx, |layer, cx| {
+                    if layer.is_owner(review::MENU_OWNER) {
+                        layer.dismiss();
+                    } else {
+                        layer.open_at(review::menu(&author), review::MENU_OWNER, event.position());
+                    }
+                    cx.notify();
+                });
+            },
+        )
+    }
+
     fn summary(&self, cx: &Context<Self>) -> AnyElement {
         let theme = global::current();
         let monitor = self.monitor.read(cx);
@@ -261,6 +296,7 @@ impl Inspector {
                     .text_color(Colors::fg_tertiary(&theme))
                     .child(SharedString::from(count)),
             )
+            .child(self.review_button(cx))
             .into_any_element()
     }
 
@@ -863,7 +899,12 @@ mod tests {
                 "{last} runs past the panel edge: {placed:?} in {panel:?}"
             );
         }
-        for name in ["diff-mode-picker", "commit-scope-picker", "commit-button"] {
+        for name in [
+            "diff-mode-picker",
+            "commit-scope-picker",
+            "commit-button",
+            "icon-button:Review changes",
+        ] {
             let placed = bounds(name);
             assert!(
                 placed.right() <= inner_right + px(0.5),

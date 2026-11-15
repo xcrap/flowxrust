@@ -306,6 +306,16 @@ impl TurnRequest {
             Some(AgentAccess::Supervised) | Some(AgentAccess::FullAccess) => {
                 push_permission_mode(&mut arguments, "manual")
             }
+            // Asks like Supervised, and FlowX refuses what is not a read. The
+            // edit tools are taken away besides: a settings file's allow rule
+            // would otherwise let an edit through without asking, and with no
+            // edit tools the model does not spend calls being refused. Written
+            // with `=`, because the flag takes a list and would read a bare
+            // argument after it as one more tool.
+            Some(AgentAccess::ReadOnly) => {
+                push_permission_mode(&mut arguments, "manual");
+                arguments.push(format!("--disallowedTools={READ_ONLY_DISALLOWED_TOOLS}"));
+            }
             None => {}
         }
         if let Some(session) = non_empty(self.resume_session_id.as_deref()) {
@@ -325,6 +335,9 @@ impl TurnRequest {
 /// refused by the API for some, and the default print-mode `updates`
 /// withholds the text.
 pub const THINKING_DISPLAY: &str = "summarized";
+
+/// Claude's tools that only write, removed from a Read Only turn.
+pub const READ_ONLY_DISALLOWED_TOOLS: &str = "Edit,Write,MultiEdit,NotebookEdit";
 
 fn push_permission_mode(arguments: &mut Vec<String>, mode: &str) {
     arguments.push("--permission-mode".into());
@@ -706,6 +719,12 @@ impl ClaudeTransport {
     /// Answer a tool Claude asked to run.
     pub async fn approve(&self, id: &str, approved: bool) -> Result<(), TransportError> {
         self.reply(id, "approval", |parser| parser.approve(id, approved))
+            .await
+    }
+
+    /// Refuse a tool call with the reason the model is told.
+    pub async fn deny(&self, id: &str, reason: &str) -> Result<(), TransportError> {
+        self.reply(id, "approval", |parser| parser.deny(id, reason))
             .await
     }
 
@@ -1431,6 +1450,7 @@ mod tests {
     #[test]
     fn execution_permissions_follow_only_the_selected_access() {
         for (access, permission) in [
+            (AgentAccess::ReadOnly, "manual"),
             (AgentAccess::Supervised, "manual"),
             (AgentAccess::AcceptEdits, "acceptEdits"),
             (AgentAccess::FullAccess, "manual"),
@@ -1449,6 +1469,23 @@ mod tests {
                 !arguments
                     .iter()
                     .any(|argument| argument == "--append-system-prompt")
+            );
+        }
+    }
+
+    #[test]
+    fn read_only_takes_the_edit_tools_away_and_only_there() {
+        let flag = format!("--disallowedTools={READ_ONLY_DISALLOWED_TOOLS}");
+        for access in AgentAccess::ALL {
+            let arguments = TurnRequest {
+                access: Some(access),
+                ..request()
+            }
+            .arguments();
+            assert_eq!(
+                arguments.contains(&flag),
+                access == AgentAccess::ReadOnly,
+                "{access:?}: {arguments:?}"
             );
         }
     }

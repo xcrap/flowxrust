@@ -187,6 +187,19 @@ pub enum ComposerAction {
     MentionChoose(Option<String>),
     /// Close the picker without taking anything (⎋).
     MentionDismiss,
+    /// Send a review's findings to the thread it reviewed.
+    SendReview,
+}
+
+/// The row above a review's composer: what it reviews, and the way its
+/// findings go back there.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReviewRow {
+    pub source_title: SharedString,
+    /// The review has answered its latest prompt, and the thread it reviewed
+    /// is still there to take the answer.
+    pub can_send: bool,
+    pub source_exists: bool,
 }
 
 /// The `@` file picker, as the composer draws it: what was typed after the
@@ -330,6 +343,8 @@ pub struct ComposerChrome {
     pub follow_up: FollowUp,
     /// The thread's goal, drawn above the card.
     pub goal: Option<ConversationGoal>,
+    /// What the thread reviews, when it is a review, drawn above the card.
+    pub review: Option<ReviewRow>,
     /// The queued prompt open for editing: its queue position, and its field.
     pub editing_queued: Option<(usize, Entity<TextField>)>,
     /// The `@` file picker, while the reader is typing a mention.
@@ -600,6 +615,12 @@ pub fn view_with_controls(
                 .pt(px_len(Spacing::SM))
                 .pb(px_len(Spacing::MD))
                 .children(chrome.goal.as_ref().map(goal_row))
+                .children(
+                    chrome
+                        .review
+                        .as_ref()
+                        .map(|row| review_row(row, handler.clone())),
+                )
                 .child(
                     // The picker is anchored to this wrapper's top-left, so
                     // it is placed against the card and not the column.
@@ -862,6 +883,73 @@ fn goal_row(goal: &ConversationGoal) -> AnyElement {
                 .child(SharedString::from(usage))
         }))
         .child(badge(goal.status.label(), goal_tone(goal.status), false))
+        .into_any_element()
+}
+
+/// A review's row: what it reviewed, and the button that sends its findings
+/// there. The button waits for the review's answer; it never sends by itself.
+fn review_row(row: &ReviewRow, handler: Option<ActionHandler>) -> AnyElement {
+    let theme = global::current();
+    let title = if row.source_exists {
+        row.source_title.clone()
+    } else {
+        SharedString::from("a deleted thread")
+    };
+    div()
+        .debug_selector(|| "composer.review".into())
+        .w_full()
+        .min_w_0()
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap(px_len(Spacing::SM))
+        .mb(px_len(Spacing::SM))
+        .pl(px_len(Spacing::SM))
+        .pr(px_len(Spacing::XXS))
+        .py(px_len(Spacing::XXS))
+        .rounded(px_len(Radii::SM))
+        .bg(Colors::bg_surface(&theme))
+        .child(Icon::SPARKLE_MAGNIFYINGGLASS.render(
+            IconSize::Regular,
+            Colors::accent(&theme),
+            &theme,
+        ))
+        .child(
+            div()
+                .flex_shrink_0()
+                .fx_role(TextRole::CaptionMedium)
+                .text_color(Colors::fg_secondary(&theme))
+                .child("Review of"),
+        )
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .truncate()
+                .fx_caption()
+                .text_color(Colors::fg(&theme))
+                .child(title),
+        )
+        .children(row.source_exists.then(|| {
+            fx_design::components::compact_action_toggle(
+                "Send findings",
+                Some(Icon::ARROW_UP_RIGHT_SQUARE),
+                false,
+                row.can_send && handler.is_some(),
+                move |_, window, cx| {
+                    if let Some(handler) = &handler {
+                        handler(ComposerAction::SendReview, window, cx);
+                    }
+                },
+            )
+            .tooltip(|window, cx| {
+                fx_design::components::tooltip(
+                    "Add the findings to the reviewed thread's draft",
+                    window,
+                    cx,
+                )
+            })
+        }))
         .into_any_element()
 }
 

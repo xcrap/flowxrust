@@ -397,6 +397,15 @@ impl TurnRunner {
             },
             agent.configuration.effort.as_deref(),
         );
+        let access = agent.configuration.resolved_access(AgentAccess::default());
+        // Read Only is answered by policy, never by a card: a read goes ahead
+        // and anything else is refused, with the refusal as the call's result.
+        // Questions still reach the reader, under any policy.
+        let approvals = if access == AgentAccess::ReadOnly {
+            ApprovalPolicy::DenyUnlessReadOnly
+        } else {
+            approvals
+        };
         let job = Job {
             conversation: conversation.clone(),
             provider,
@@ -407,7 +416,7 @@ impl TurnRunner {
             control: work.control,
             steers: Mutex::new(Some(steers)),
             approvals,
-            access: agent.configuration.resolved_access(AgentAccess::default()),
+            access,
             model,
             effort,
             system_prompt: agent.configuration.system_prompt.clone(),
@@ -1002,7 +1011,12 @@ impl Job {
                                     (self.access == AgentAccess::FullAccess).then_some(true)
                                 } else { Some(self.approvals.allows_claude_tool(&request.tool_name, &request.input)) };
                                 if let Some(approved) = auto {
-                                    match transport.approve(&request.id, approved).await {
+                                    let answered = if approved {
+                                        transport.approve(&request.id, true).await
+                                    } else {
+                                        transport.deny(&request.id, &self.approvals.message(&request.tool_name)).await
+                                    };
+                                    match answered {
                                         // Claude withdrew it before the policy
                                         // answered: nothing is waiting for a reply.
                                         Ok(()) | Err(ClaudeTransportError::UnknownControl { .. }) => {}
@@ -1888,6 +1902,52 @@ mod tests {
     }
 
     #[test]
+    fn a_read_only_codex_turn_refuses_a_write_without_asking() {
+        // `cargo test` is not a read: under Read Only the policy declines it,
+        // where Supervised would have put a card in front of the reader.
+        let Some(server) = FakeServer::new() else {
+            return;
+        };
+        let Some(provider) = server.provider() else {
+            return;
+        };
+        let conversation = conversation();
+        let mut agent = Agent::new("Reviewer");
+        agent.configuration.agent_access = Some(AgentAccess::ReadOnly);
+        let recorder = Recorder::default();
+        let sink = recorder.clone();
+        let _runner = TurnRunner::launch_with(
+            conversation.clone(),
+            "/tmp/project".to_string(),
+            agent,
+            "write-a-file".to_string(),
+            ApprovalPolicy::Ask,
+            provider,
+            move |update| sink.record(update),
+        );
+        let updates = recorder.wait_for_end(TURN_BUDGET);
+        assert!(
+            matches!(updates.last(), Some(SessionUpdate::Finished { outcome }) if outcome.is_completed()),
+            "{updates:?}"
+        );
+        assert!(
+            !updates
+                .iter()
+                .any(|update| matches!(update, SessionUpdate::Interaction { .. })),
+            "a Read Only turn asked the reader: {updates:?}"
+        );
+        // The fake echoes the reply it was sent.
+        let transcript: String = lock(&conversation)
+            .messages()
+            .map(|message| message.text_content())
+            .collect();
+        assert!(
+            transcript.contains(r#"{"decision": "decline"}"#),
+            "{transcript}"
+        );
+    }
+
+    #[test]
     fn a_prompt_lands_in_the_conversation_and_the_turn_ends() {
         let Some(server) = FakeServer::new() else {
             return;
@@ -2692,6 +2752,13 @@ for line in sys.stdin:
         else: finish(prompt)
     elif message.get("type")=="control_response":
         if message["response"].get("request_id") in WITHDRAWN: continue
+        decision=message["response"].get("response") or {}
+        if decision.get("behavior")=="deny" and not str(decision.get("message") or "").strip():
+            # Claude Code 2.1.325 writes the refusal's message as the call's
+            # error result, and the API refuses an empty one.
+            send({"type":"result","subtype":"success","is_error":True,"session_id":SESSION,
+                  "result":"API Error: 400 messages.3.content.0.tool_result: content cannot be empty if `is_error` is true"})
+            continue
         finish("answered", ANSWER_ORIGIN.pop() if ANSWER_ORIGIN else None)
 # A closed input still waits for running tasks, as Claude's print mode does.
 for worker in workers: worker.join()
@@ -3264,6 +3331,61 @@ for worker in workers: worker.join()
             assert_eq!(
                 response["response"]["response"]["behavior"], behavior,
                 "{prompt}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_read_only_claude_turn_answers_by_policy_and_shows_no_card() {
+        // The app starts every turn with `Ask`; Read Only must still never put
+        // an approval in front of the reader, and must take the edit tools
+        // away before Claude starts.
+        for (prompt, behavior) in [("read", "allow"), ("tool", "deny")] {
+            let Some(server) = ClaudeFixture::new() else {
+                return;
+            };
+            let conversation = conversation();
+            let (_runner, recorder) = server.start_with(
+                &conversation,
+                prompt,
+                AgentAccess::ReadOnly,
+                "fixture-model",
+                ApprovalPolicy::Ask,
+            );
+            let updates = recorder.wait_for_end(TURN_BUDGET);
+            assert!(
+                matches!(updates.last(), Some(SessionUpdate::Finished { outcome }) if outcome.is_completed()),
+                "{prompt}: {updates:?}"
+            );
+            assert!(
+                !updates.iter().any(|update| matches!(
+                    update,
+                    SessionUpdate::Interaction {
+                        event: ProviderEvent::Approval(_)
+                    }
+                )),
+                "{prompt}: a Read Only turn asked the reader: {updates:?}"
+            );
+            let received = server.received();
+            let response = received
+                .iter()
+                .find(|item| item["type"] == "control_response")
+                .unwrap();
+            assert_eq!(
+                response["response"]["response"]["behavior"], behavior,
+                "{prompt}"
+            );
+            let arguments = received
+                .iter()
+                .find_map(|item| item["args"].as_array())
+                .expect("the fake records its arguments");
+            assert!(
+                arguments.iter().any(|argument| argument
+                    == &serde_json::json!(format!(
+                        "--disallowedTools={}",
+                        fx_agent::claude::transport::READ_ONLY_DISALLOWED_TOOLS
+                    ))),
+                "{arguments:?}"
             );
         }
     }
@@ -3853,6 +3975,25 @@ for line in sys.stdin:
             sys.stderr.write("server died mid turn\n")
             sys.stderr.flush()
             sys.exit(4)
+        elif prompt == "write-a-file":
+            # A command that writes, asked about the way codex-cli 0.164 asks,
+            # and the reply it was sent echoed back as the turn's text.
+            send({"jsonrpc": "2.0", "method": "turn/started",
+                  "params": {"threadId": "thread-new", "turn": {"id": "turn-1"}}})
+            send({"jsonrpc": "2.0", "id": "srv-write",
+                  "method": "item/commandExecution/requestApproval",
+                  "params": {"threadId": "thread-new", "turnId": "turn-1", "itemId": "command-1",
+                             "command": "rm -rf build", "cwd": "/tmp"}})
+            while True:
+                reply = json.loads(sys.stdin.readline() or "null")
+                if reply is None:
+                    sys.exit(0)
+                if reply.get("id") == "srv-write" and "method" not in reply:
+                    break
+            send({"jsonrpc": "2.0", "method": "item/agentMessage/delta",
+                  "params": {"delta": json.dumps(reply.get("result"))}})
+            send({"jsonrpc": "2.0", "method": "turn/completed",
+                  "params": {"turn": {"id": "turn-1", "status": "completed"}}})
         elif prompt == "use-a-tool":
             send({"jsonrpc": "2.0", "method": "turn/started",
                   "params": {"turn": {"id": "turn-1"}}})

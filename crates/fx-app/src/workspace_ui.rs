@@ -1380,7 +1380,8 @@ mod tests {
         visual.simulate_mouse_down(picker, MouseButton::Left, Default::default());
         visual.simulate_mouse_up(picker, MouseButton::Left, Default::default());
         test.read(|cx| assert!(state.read(cx).menu_layer.read(cx).is_open()));
-        visual.simulate_keystrokes("down enter");
+        // Past Read Only, which the menu lists first, to Supervised.
+        visual.simulate_keystrokes("down down enter");
         test.read(|cx| {
             assert!(!state.read(cx).menu_layer.read(cx).is_open());
             assert!(ui.read(cx).settings.is_some());

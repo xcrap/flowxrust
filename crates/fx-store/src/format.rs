@@ -1615,7 +1615,7 @@ mod tests {
                         {"id": agent, "title": "Readable",
                          "created_at": "2026-01-01T00:00:00Z",
                          "execution_state": "cancelled",
-                         "configuration": {"agent_access": "readOnly"}},
+                         "configuration": {"agent_access": "planOnly"}},
                         {"id": "not-a-uuid", "title": "From a newer build",
                          "created_at": "2026-01-01T00:00:00Z"}
                     ],
@@ -1625,7 +1625,7 @@ mod tests {
                     ],
                     "native_bindings": [
                         {"agentId": agent, "providerId": "codex", "sessionId": "s1",
-                         "updatedAt": "2026-01-01T00:00:00Z", "agentAccess": "readOnly"},
+                         "updatedAt": "2026-01-01T00:00:00Z", "agentAccess": "planOnly"},
                         {"agentId": agent, "providerId": "codex"}
                     ]
                 },

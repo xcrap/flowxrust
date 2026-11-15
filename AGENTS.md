@@ -722,6 +722,14 @@ Read-only command checks for both providers go through one classifier,
 `fx-agent::shell`, which fails closed on control operators, substitutions and
 the write flags of otherwise read-only tools (`find -delete`, `sort -o`,
 `git diff --output`).
+**A refusal of a Claude tool call always says why.** Its message becomes the
+call's error result, and Claude Code 2.1.325 sends an empty one to the API as
+it is; the API refuses it (`content cannot be empty if is_error is true`) and
+the turn fails at the first refused call. Every Deny the reader clicked, and
+every refusal by policy, ended the turn that way while the denial carried
+`""`. The reader's Deny says the user declined; a policy's refusal carries the
+policy's reason (`ClaudeTransport::deny`). Both fakes now answer an empty
+denial the way the API does.
 Claude's `AskUserQuestion` answers are an object keyed by the original question
 text, with string values. An array of question/answer pairs fails the CLI's
 `updatedInput` validation; the fake CLI validates that wire shape too.
@@ -1184,7 +1192,28 @@ read the store right after a save call `flush_saves()` first.
 `DenyUnlessReadOnly` only bites when the thread is opened at a level that asks:
 `AgentAccess::FullAccess` maps to `("never", "danger-full-access")`, so Codex
 never asks and FlowX never gets to refuse. The access level has to be
-`Supervised` or `AcceptEdits` for the policy to mean anything.
+`ReadOnly`, `Supervised` or `AcceptEdits` for the policy to mean anything.
+
+Read Only is that policy as an access level, and `TurnRunner::launch` applies
+it whatever policy the caller passed: a read goes ahead, anything else is
+refused with the refusal as the call's result, and no approval card is ever
+shown. Questions still reach the reader. Each provider is also held back on
+its own side, because FlowX only hears about what a provider asks:
+
+- **Codex runs `("on-request", "read-only")`**, its own read-only pairing:
+  anything may run inside a sandbox that cannot write, and only a command
+  that asks to leave it reaches FlowX. Paired with `untrusted`, Codex asked
+  about every command off its short safe list and FlowX refused reads such as
+  `nl -ba file`; a live review spent four calls on refusals. A write inside
+  the sandbox fails with `Operation not permitted`, and codex-cli 0.167
+  reports no item for that command at all.
+- **Claude runs `manual` with `--disallowedTools=Edit,Write,MultiEdit,NotebookEdit`.**
+  An allow rule in the user's settings would otherwise let an edit through
+  without asking. Written with `=`, because the flag takes a list.
+
+A Codex thread recorded with a read-only sandbox reads as Read Only. A saved
+level this build cannot read is still Supervised, not Read Only: it may be a
+level that only asked.
 
 ### Scrolling
 
@@ -1342,6 +1371,33 @@ viewer, only when the path itself is a regular file (a `shot.png` symlink to
 `evil.command` is not), and the viewer is named with `open -b`, because a bare
 `open` honours a per-file "Open With" attribute. Everything else goes to the
 registered source-code editor, then `open -t`.
+
+### Reviews
+
+The Review button beside the inspector's change count starts a review of the
+checkout's uncommitted changes by either provider, the one that did not write
+them listed first (`review.rs`; the pure half is `fx_core::policy::review`).
+Four rules:
+
+- **A review is an ordinary thread.** It runs at Read Only in the reviewed
+  thread's project and folder (its worktree binding included), with
+  `review::BRIEF` as its system prompt so it holds for follow-ups, opened with
+  `review::PROMPT`. `Agent::review_of` links it to the thread it reviews; a
+  review started from a review reviews that thread again. It is named after
+  what it reviews and is never auto-titled.
+- **It is a prompt, not Codex's `review/start`.** Run against codex-cli 0.167,
+  a native review streamed nothing of what it wrote: the whole review arrived
+  in one `exitedReviewMode` item and one completed `agentMessage` at the end,
+  with no deltas and no reasoning summary, under a second turn id
+  (`rootTurnId`), and it left a thread of its own behind. A prompt streams like
+  any turn and reads the same on both providers.
+- **The findings are the last reply to the last prompt** (`review::findings`).
+  A turn's earlier prose is the reviewer talking between calls, and while a
+  follow-up runs there is nothing to send.
+- **Nothing is sent for the reader.** The row above a review's composer adds
+  the findings to the reviewed thread's draft (`append_prompt_context`, after
+  whatever the reader had typed), shows that thread and focuses its composer.
+  FlowX never sends a prompt on its own.
 
 ## Porting conventions
 

@@ -17,6 +17,11 @@ pub struct Agent {
     /// Malformed bindings fail decoding rather than falling back to another directory.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace: Option<ChatWorkspace>,
+    /// The thread whose changes this one was started to review, if it is a
+    /// review. Only a link: the review is an ordinary thread, and its findings
+    /// go back to this one when the reader sends them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub review_of: Option<Uuid>,
     #[serde(default)]
     pub configuration: AgentConfiguration,
     #[serde(default)]
@@ -30,6 +35,7 @@ impl Agent {
             id: Uuid::new_v4(),
             title: title.into(),
             workspace: None,
+            review_of: None,
             configuration: AgentConfiguration::default(),
             execution_state: AgentExecutionState::Idle,
             created_at: now(),
@@ -41,6 +47,7 @@ impl Agent {
             id,
             title: title.into(),
             workspace: None,
+            review_of: None,
             configuration: AgentConfiguration::default(),
             execution_state: AgentExecutionState::Idle,
             created_at: now(),
@@ -110,15 +117,16 @@ where
         .unwrap_or_default())
 }
 
-/// A saved access override this build cannot read, read as the narrowest
-/// level it knows.
+/// A saved access override this build cannot read, read as Supervised: the
+/// narrowest level that still lets the thread work, by asking first.
 ///
 /// Deliberately not the enum's own default: that is `FullAccess`, so a level a
 /// newer build added — most likely a narrower one — would come back as the
 /// widest. Nor *inherit*, which looked safer and was not: a thread with no
-/// provider binding inherits the app default, which is `FullAccess` too. A
-/// level that cannot be read fails closed, to asking first. An explicit `null`
-/// is still no override.
+/// provider binding inherits the app default, which is `FullAccess` too. Nor
+/// Read Only, which is narrower still but refuses where a newer level may
+/// only have asked. A level that cannot be read fails closed, to asking
+/// first. An explicit `null` is still no override.
 pub fn access_or_inherit<'de, D: serde::Deserializer<'de>>(
     deserializer: D,
 ) -> Result<Option<AgentAccess>, D::Error> {
@@ -138,6 +146,9 @@ pub fn access_or_inherit<'de, D: serde::Deserializer<'de>>(
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum AgentAccess {
+    /// Reads and searches only. Edits, and commands that write, are refused
+    /// without asking: what a reviewer runs at.
+    ReadOnly,
     Supervised,
     AcceptEdits,
     #[default]
@@ -145,10 +156,17 @@ pub enum AgentAccess {
 }
 
 impl AgentAccess {
-    pub const ALL: [Self; 3] = [Self::Supervised, Self::AcceptEdits, Self::FullAccess];
+    /// Narrowest first, as the access menus list them.
+    pub const ALL: [Self; 4] = [
+        Self::ReadOnly,
+        Self::Supervised,
+        Self::AcceptEdits,
+        Self::FullAccess,
+    ];
 
     pub const fn label(self) -> &'static str {
         match self {
+            Self::ReadOnly => "Read Only",
             Self::Supervised => "Supervised",
             Self::AcceptEdits => "Accept Edits",
             Self::FullAccess => "Full Access",
@@ -157,6 +175,7 @@ impl AgentAccess {
 
     pub const fn explanation(self) -> &'static str {
         match self {
+            Self::ReadOnly => "Read and search; refuse edits and writes",
             Self::Supervised => "Ask before commands and edits",
             Self::AcceptEdits => "Allow edits and review other actions",
             // Questions always require an answer regardless of access level,
@@ -408,7 +427,7 @@ mod tests {
 
     #[test]
     fn a_saved_access_level_this_build_cannot_read_asks_first_instead_of_widening() {
-        for value in [serde_json::json!("readOnly"), serde_json::json!(7)] {
+        for value in [serde_json::json!("planOnly"), serde_json::json!(7)] {
             let c: AgentConfiguration = serde_json::from_value(serde_json::json!({
                 "model_id": "kept-model",
                 "agent_access": value,
@@ -435,8 +454,12 @@ mod tests {
                 serde_json::from_value(serde_json::to_value(&c).unwrap()).unwrap();
             assert_eq!(back, c);
         }
+        // Read Only is a level of its own now, not an unknown one.
+        let read_only: AgentConfiguration =
+            serde_json::from_value(serde_json::json!({ "agent_access": "readOnly" })).unwrap();
+        assert_eq!(read_only.agent_access, Some(AgentAccess::ReadOnly));
         // The enum itself stays strict, so a protocol mismatch is reported.
-        assert!(serde_json::from_str::<AgentAccess>(r#""readOnly""#).is_err());
+        assert!(serde_json::from_str::<AgentAccess>(r#""planOnly""#).is_err());
     }
 
     #[test]

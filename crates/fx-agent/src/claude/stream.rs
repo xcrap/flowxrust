@@ -1145,8 +1145,18 @@ impl ClaudeStreamParser {
     /// Answer a control request, returning the message to write back.
     ///
     /// Returns `None` for an id this parser does not hold, which happens when a
-    /// second answer arrives for the same question.
+    /// second answer arrives for the same question. A refusal says the reader
+    /// declined it; [`Self::deny`] says why when something else did.
     pub fn approve(&mut self, id: &str, approved: bool) -> Option<Value> {
+        self.decide(id, approved, DECLINED_BY_READER)
+    }
+
+    /// Refuse a tool call, telling the model why.
+    pub fn deny(&mut self, id: &str, reason: &str) -> Option<Value> {
+        self.decide(id, false, reason)
+    }
+
+    fn decide(&mut self, id: &str, approved: bool, reason: &str) -> Option<Value> {
         // The kind is checked *before* anything is removed. Removing first would
         // consume a question when handed its id, and Claude would then wait
         // forever on a reply that can never be given.
@@ -1177,7 +1187,7 @@ impl ClaudeStreamParser {
         };
         Some(control_response(
             &request_id,
-            &permission_decision(approved, &tool_use_id, None, ""),
+            &permission_decision(approved, &tool_use_id, None, reason),
         ))
     }
 
@@ -1540,7 +1550,16 @@ fn is_ambient(envelope: &Value) -> bool {
     envelope.get("ambient").and_then(Value::as_bool) == Some(true)
 }
 
+/// What a refusal the reader made tells the model.
+pub const DECLINED_BY_READER: &str = "The user declined this tool call.";
+
 /// The decision object Claude expects back for a tool call.
+///
+/// A refusal's message becomes the call's error result, so it is never
+/// empty: Claude Code 2.1.325 sends an empty one to the API as it is, the API
+/// refuses `content cannot be empty if is_error is true`, and the whole turn
+/// fails at the first refused call. Every Deny, and every refusal by policy,
+/// ended a Claude turn that way.
 pub fn permission_decision(
     approved: bool,
     tool_use_id: &str,
@@ -1558,9 +1577,14 @@ pub fn permission_decision(
         }
         return decision;
     }
+    let message = if denial_message.trim().is_empty() {
+        DECLINED_BY_READER
+    } else {
+        denial_message
+    };
     json!({
         "behavior": "deny",
-        "message": denial_message,
+        "message": message,
         "toolUseID": tool_use_id,
         "decisionClassification": "user_reject",
     })
@@ -2568,6 +2592,30 @@ mod tests {
         let decision = &response["response"]["response"];
         assert_eq!(decision["behavior"], "deny");
         assert_eq!(decision["decisionClassification"], "user_reject");
+        // Empty, it became an error result the API refuses, failing the turn.
+        assert_eq!(decision["message"], DECLINED_BY_READER);
+    }
+
+    #[test]
+    fn a_refusal_by_policy_tells_the_model_why() {
+        let mut parser = ClaudeStreamParser::new();
+        parser.events(&line(json!({
+            "type": "control_request", "request_id": "r1",
+            "request": { "subtype": "can_use_tool", "tool_name": "Bash", "tool_use_id": "t1",
+                         "input": {"command": "touch probe.txt"} }
+        })));
+        let id = parser.pending_ids()[0].clone();
+        let response = parser.deny(&id, "Read only here.").expect("a response");
+        assert_eq!(
+            response["response"]["response"]["message"],
+            "Read only here."
+        );
+        assert!(parser.pending_ids().is_empty());
+        // No reason is still a reason: never an empty message.
+        assert_eq!(
+            permission_decision(false, "t1", None, " ")["message"],
+            DECLINED_BY_READER
+        );
     }
 
     #[test]

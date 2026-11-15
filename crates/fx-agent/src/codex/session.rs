@@ -18,10 +18,19 @@ use crate::provider::{
 
 /// Codex's `approvalPolicy` and `sandbox` for a FlowX access level.
 ///
-/// These three pairings are the whole point of the access control. They are
-/// worth pinning: a change here silently alters what the agent may do.
+/// These pairings are the whole point of the access control. They are worth
+/// pinning: a change here silently alters what the agent may do.
+///
+/// Read Only is Codex's own read-only pairing: anything may run inside a
+/// sandbox that cannot write, and only a command that asks to leave it comes
+/// to FlowX, whose policy for the level refuses what is not a read. Paired
+/// with `untrusted` instead, Codex asked about every command off its short
+/// list of safe ones, and FlowX refused reads such as `nl -ba stats.py`: a
+/// live review spent four calls on refusals and could not run the code it
+/// was checking.
 pub fn access_params(access: AgentAccess) -> (&'static str, &'static str) {
     match access {
+        AgentAccess::ReadOnly => ("on-request", "read-only"),
         AgentAccess::Supervised => ("untrusted", "workspace-write"),
         AgentAccess::AcceptEdits => ("on-request", "workspace-write"),
         AgentAccess::FullAccess => ("never", "danger-full-access"),
@@ -35,6 +44,7 @@ pub fn access_params(access: AgentAccess) -> (&'static str, &'static str) {
 pub fn sandbox_policy(access: AgentAccess, working_directory: &str) -> Value {
     match access {
         AgentAccess::FullAccess => json!({ "type": "dangerFullAccess" }),
+        AgentAccess::ReadOnly => json!({ "type": "readOnly", "networkAccess": false }),
         _ => json!({
             "type": "workspaceWrite",
             "networkAccess": false,
@@ -1415,10 +1425,12 @@ mod tests {
 
     #[test]
     fn each_access_level_maps_to_a_distinct_policy_pair() {
+        let read_only = access_params(AgentAccess::ReadOnly);
         let supervised = access_params(AgentAccess::Supervised);
         let accept = access_params(AgentAccess::AcceptEdits);
         let full = access_params(AgentAccess::FullAccess);
 
+        assert_eq!(read_only, ("on-request", "read-only"));
         assert_eq!(supervised, ("untrusted", "workspace-write"));
         assert_eq!(accept, ("on-request", "workspace-write"));
         assert_eq!(full, ("never", "danger-full-access"));
@@ -1610,6 +1622,7 @@ mod tests {
     #[test]
     fn turns_preserve_access_without_injecting_workflow_instructions() {
         for (access, approval, sandbox) in [
+            (AgentAccess::ReadOnly, "on-request", "readOnly"),
             (AgentAccess::Supervised, "untrusted", "workspaceWrite"),
             (AgentAccess::AcceptEdits, "on-request", "workspaceWrite"),
             (AgentAccess::FullAccess, "never", "dangerFullAccess"),

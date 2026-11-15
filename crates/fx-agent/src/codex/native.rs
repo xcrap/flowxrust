@@ -666,7 +666,8 @@ fn native_defaults(raw: &Value) -> NativeDefaults {
     let access = match (approval.as_deref(), sandbox.as_str()) {
         (Some("never"), "dangerfullaccess") => Some(AgentAccess::FullAccess),
         (Some("on-request"), "workspacewrite") => Some(AgentAccess::AcceptEdits),
-        (Some("untrusted"), "workspacewrite") | (_, "readonly") => Some(AgentAccess::Supervised),
+        (Some("untrusted"), "workspacewrite") => Some(AgentAccess::Supervised),
+        (_, "readonly") => Some(AgentAccess::ReadOnly),
         _ => None,
     };
     NativeDefaults {

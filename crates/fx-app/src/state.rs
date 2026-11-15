@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 pub type GuardedConversation = Mutex<Conversation>;
 
 use fx_agent::conversation::Conversation;
-use fx_core::{Agent, AgentConfiguration, Project};
+use fx_core::{Agent, AgentAccess, AgentConfiguration, Project};
 use fx_design::components::{ContextRegistry, MenuLayer};
 use fx_design::theme::{
     AccentColor, AppearanceMode, BaseTone, Layout, TextSizePreset, Theme, global,
@@ -365,9 +365,87 @@ impl AppState {
         configuration: AgentConfiguration,
         workspace: Option<fx_core::models::agent::ChatWorkspace>,
     ) -> Result<Uuid, String> {
+        let mut agent = Agent::with_id(id, "Untitled thread");
+        agent.configuration = configuration;
+        agent.workspace = workspace;
+        self.insert_thread(project_id, agent, true)
+    }
+
+    /// Start a review of the active thread's checkout by `provider`: a new
+    /// Read Only thread in its project and folder, with the review brief as
+    /// its system prompt, selected. The caller sends its first turn.
+    ///
+    /// The thread under review is the active one; a review's own review is of
+    /// what it reviewed, so the findings still go back to the author.
+    pub(crate) fn create_review_thread(&mut self, provider: &str) -> Result<Uuid, String> {
+        use fx_core::policy::review;
+        let project_id = self
+            .snapshot
+            .active_project_id
+            .ok_or("Open a project to review its changes.")?;
+        let source = self.snapshot.active_agent_id.and_then(|id| {
+            let agent = self.thread(id)?;
+            Some(
+                agent
+                    .review_of
+                    .and_then(|source| self.thread(source))
+                    .unwrap_or(agent),
+            )
+        });
+        let mut agent = Agent::new(review::title(
+            source.map(|source| source.title.as_str()).unwrap_or(""),
+        ));
+        agent.review_of = source.map(|source| source.id);
+        agent.workspace = source.and_then(|source| source.workspace.clone());
+        agent.configuration = self.default_configuration(provider);
+        agent.configuration.agent_access = Some(AgentAccess::ReadOnly);
+        agent.configuration.system_prompt = Some(review::BRIEF.into());
+        self.insert_thread(project_id, agent, false)
+    }
+
+    /// What a review sends back, and to which thread: its findings, framed for
+    /// the reviewed thread's agent. An error says why there is nothing to send.
+    pub(crate) fn review_handoff(&self, review_id: Uuid) -> Result<(Uuid, String), String> {
+        use fx_core::policy::review;
+        let review = self
+            .thread(review_id)
+            .ok_or("This review no longer exists.")?;
+        let source = review.review_of.ok_or("This thread is not a review.")?;
+        if self.thread(source).is_none() {
+            return Err("The reviewed thread no longer exists.".into());
+        }
+        let findings = self
+            .conversations
+            .get(&review_id)
+            .and_then(|conversation| {
+                let conversation = conversation.lock().unwrap_or_else(|e| e.into_inner());
+                if conversation.is_busy() {
+                    return None;
+                }
+                review::findings(conversation.messages())
+            })
+            .ok_or("The review has not answered yet.")?;
+        let provider = review
+            .configuration
+            .provider_id
+            .clone()
+            .or_else(|| self.native_defaults(review_id).provider_id)
+            .unwrap_or_else(|| "codex".into());
+        Ok((source, review::handoff(&provider, &findings)))
+    }
+
+    /// Add a thread to a project, saved before it exists in memory, and
+    /// select it. `auto_title` queues it for naming after its first prompt.
+    fn insert_thread(
+        &mut self,
+        project_id: Uuid,
+        agent: Agent,
+        auto_title: bool,
+    ) -> Result<Uuid, String> {
         if !self.snapshot_writable {
             return Err("Restore the saved workspace before creating a chat.".into());
         }
+        let id = agent.id;
         if self.thread(id).is_some() {
             return Err("This chat has already been created.".into());
         }
@@ -377,7 +455,7 @@ impl AppState {
             .iter_mut()
             .find(|record| record.project.as_ref().is_some_and(|p| p.id == project_id))
             .ok_or("This project is no longer open.")?;
-        if let Some(workspace) = &workspace
+        if let Some(workspace) = &agent.workspace
             && !crate::native_sync::same_project(
                 &workspace.repository,
                 &record.project.as_ref().unwrap().root_path,
@@ -385,12 +463,11 @@ impl AppState {
         {
             return Err("This worktree belongs to a different project.".into());
         }
-        let mut agent = Agent::with_id(id, "Untitled thread");
-        agent.configuration = configuration;
-        agent.workspace = workspace;
         record.project.as_mut().unwrap().agent_order.push(id);
         record.agents.push(agent);
-        record.auto_title_pending.push(id);
+        if auto_title {
+            record.auto_title_pending.push(id);
+        }
         record.is_expanded = true;
         record.last_selected_agent_id = Some(id);
         next.active_project_id = Some(project_id);

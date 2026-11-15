@@ -329,6 +329,12 @@ for line in sys.stdin:
         decision = (message.get("response") or {}).get("response") or {}
         if request_id in withdrawn:
             continue
+        if decision.get("behavior") == "deny" and not str(decision.get("message") or "").strip():
+            # Claude Code 2.1.325 writes the refusal's message as the call's
+            # error result, and the API refuses an empty one.
+            send({"type": "result", "is_error": True,
+                  "result": "API Error: 400 messages.3.content.0.tool_result: content cannot be empty if `is_error` is true"})
+            continue
         if request_id == "req-2" and decision.get("behavior") == "allow":
             # Claude 2.1.283 validates updatedInput before calling the tool.
             # AskUserQuestion accepts a question-text -> answer-string record,

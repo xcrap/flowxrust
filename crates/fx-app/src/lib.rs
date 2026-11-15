@@ -33,6 +33,7 @@ pub mod project_picker;
 mod prompt_context;
 pub mod provider_catalog;
 mod provider_settings;
+mod review;
 mod selection;
 pub mod session;
 pub mod settings;
@@ -1241,6 +1242,7 @@ fn composer_row(
         chrome.steering = state.is_steering(agent.id);
         chrome.follow_up = state.follow_up_mode();
         chrome.goal = state.goal(agent.id).cloned();
+        chrome.review = review::row(state, &agent);
         chrome.mention = state.mention_popup(agent.id);
     }
     let mut chrome = chrome.on_action(move |action, window, cx| match action {
@@ -1319,6 +1321,9 @@ fn composer_row(
             for_actions.update(cx, |state, cx| {
                 state.mention_dismiss(cx);
             });
+        }
+        composer::ComposerAction::SendReview => {
+            review::send_back(&for_actions, agent.id, window, cx);
         }
         composer::ComposerAction::Select(..) => {}
     });
@@ -1912,6 +1917,10 @@ pub fn dispatch_menu_choice(owner: &str, chosen: &str, window: &mut Window, cx: 
     }
     if owner.starts_with("configuration:") {
         configuration::apply(&handle.0, owner, chosen, cx);
+        return;
+    }
+    if owner == review::MENU_OWNER {
+        review::start(&handle.0, chosen, cx);
         return;
     }
     if let Some(agent_id) = owner
