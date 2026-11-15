@@ -1315,6 +1315,11 @@ impl AppState {
             .find(|p| p.project.as_ref().is_some_and(|inner| inner.id == id))
         {
             record.is_expanded = !record.is_expanded;
+            // Opened, its rows are on screen again: read them now rather
+            // than show what they were when the project was last polled.
+            if record.is_expanded {
+                self.request_native_refresh(id);
+            }
         }
     }
 
@@ -2859,6 +2864,21 @@ impl AppState {
         loading
     }
 
+    /// Make every project due for a pass: the window was just brought back,
+    /// most often from Codex or Claude, where a thread may have been archived,
+    /// renamed or started while FlowX was behind them.
+    pub fn refresh_native_projects(&mut self) {
+        let projects: Vec<Uuid> = self
+            .snapshot
+            .projects
+            .iter()
+            .filter_map(|record| record.project.as_ref().map(|project| project.id))
+            .collect();
+        for project in projects {
+            self.request_native_refresh(project);
+        }
+    }
+
     pub fn request_native_refresh(&mut self, project_id: Uuid) {
         for provider in crate::native_sync::PROVIDERS {
             self.native_sync
@@ -2916,28 +2936,37 @@ impl AppState {
                 continue;
             }
             let active = self.snapshot.active_project_id;
-            // Every saved project is discovered once. After that only the
-            // active project polls; activation/explicit refresh makes others due.
+            // Every saved project is discovered once. After that the active
+            // project polls, and an expanded one, whose rows are on screen,
+            // polls more slowly; a collapsed one waits to be opened. Only the
+            // active project polling left a thread archived in Codex or Claude
+            // listed under every other project until it was clicked.
+            // Activation, expanding and an explicit refresh make any due.
             let mut projects: Vec<_> = self
                 .snapshot
                 .projects
                 .iter()
-                .filter_map(|record| record.project.as_ref())
+                .filter_map(|record| {
+                    record
+                        .project
+                        .as_ref()
+                        .map(|project| (project, record.is_expanded))
+                })
                 .collect();
-            projects.sort_by_key(|project| Some(project.id) != active);
+            projects.sort_by_key(|(project, _)| Some(project.id) != active);
             let due_project = projects
                 .into_iter()
-                .find(|project| {
+                .find(|(project, expanded)| {
                     match self
                         .native_sync
                         .index_due
                         .get(&(project.id, provider.into()))
                     {
                         None => true,
-                        Some(due) => Some(project.id) == active && now >= *due,
+                        Some(due) => (Some(project.id) == active || *expanded) && now >= *due,
                     }
                 })
-                .map(|project| (project.id, project.root_path.clone()));
+                .map(|(project, _)| (project.id, project.root_path.clone()));
             let history_ticket = selected.and_then(|(project, agent)| {
                 if self.is_thread_busy(agent)
                     || self
@@ -3032,10 +3061,14 @@ impl AppState {
                     })
                     .map(|binding| (binding.agent_id, binding.session_id.clone()))
                     .collect();
-                self.native_sync.index_due.insert(
-                    (project, provider.into()),
-                    now + crate::native_sync::INDEX_INTERVAL,
-                );
+                let interval = if self.snapshot.active_project_id == Some(project) {
+                    crate::native_sync::INDEX_INTERVAL
+                } else {
+                    crate::native_sync::BACKGROUND_INDEX_INTERVAL
+                };
+                self.native_sync
+                    .index_due
+                    .insert((project, provider.into()), now + interval);
                 Some(crate::native_sync::Ticket {
                     project,
                     root,
@@ -8586,6 +8619,81 @@ mod native_sync_tests {
                 current_context_tokens: Some(123),
                 history_truncated: false,
             }))),
+        });
+    }
+
+    #[test]
+    fn projects_that_are_not_active_are_read_again_while_their_rows_show() {
+        // Only the active project polled, so a thread archived in Codex or
+        // Claude stayed listed under every other project until it was clicked.
+        let temp = tempfile::tempdir().unwrap();
+        let first = temp.path().join("first");
+        let second = temp.path().join("second");
+        std::fs::create_dir_all(&first).unwrap();
+        std::fs::create_dir_all(&second).unwrap();
+        let (first, second) = (
+            first.to_string_lossy().to_string(),
+            second.to_string_lossy().to_string(),
+        );
+        let test = gpui::TestAppContext::single();
+        let (state, active) =
+            test.update(|cx| setup(cx, AppPaths::at(temp.path().join("store")), &first));
+        test.update(|cx| {
+            state.update(cx, |state, cx| {
+                let other = state.add_project(&second);
+                state.select_project(active);
+                let (codex_jobs, codex_results) = state.native_sync.test_worker("codex");
+                let (_claude_jobs, _claude_results) = state.native_sync.test_worker("claude");
+                // Answer every index pass the scheduler starts, and say which
+                // projects they were for.
+                let passes = |state: &mut AppState, cx: &mut Context<AppState>| {
+                    let mut read = Vec::new();
+                    for _ in 0..4 {
+                        state.poll_native_sync(cx);
+                        while let Ok(ticket) = codex_jobs.try_recv() {
+                            read.push(ticket.project);
+                            codex_results
+                                .send(Completion {
+                                    ticket,
+                                    result: Ok(Payload::Index {
+                                        index: NativeThreadIndex::default(),
+                                        sessions: Vec::new(),
+                                        protected: Vec::new(),
+                                    }),
+                                })
+                                .unwrap();
+                        }
+                    }
+                    read
+                };
+                let overdue = |state: &mut AppState| {
+                    for project in [active, other] {
+                        state.native_sync.index_due.insert(
+                            (project, "codex".into()),
+                            Instant::now() - Duration::from_secs(1),
+                        );
+                    }
+                };
+                let discovered = passes(state, cx);
+                assert!(discovered.contains(&active) && discovered.contains(&other));
+                overdue(state);
+                let read = passes(state, cx);
+                assert!(read.contains(&other), "an expanded project went unread");
+                // Collapsed, it waits to be opened.
+                state.toggle_project_expansion(other);
+                overdue(state);
+                assert!(!passes(state, cx).contains(&other));
+                // Coming back to the window reads it anyway.
+                state.refresh_native_projects();
+                assert!(passes(state, cx).contains(&other));
+                // And opening it reads it at once.
+                state.native_sync.index_due.insert(
+                    (other, "codex".into()),
+                    Instant::now() + Duration::from_secs(60),
+                );
+                state.toggle_project_expansion(other);
+                assert!(passes(state, cx).contains(&other));
+            })
         });
     }
 

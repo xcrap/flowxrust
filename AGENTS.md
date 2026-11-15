@@ -815,8 +815,12 @@ the thread is waiting and does not offer buttons that reach nobody:
   than guessing.
 
 The mark is live state, never saved. Each index pass replaces it for its
-provider and project, a failed pass clears it, and it is reported only for the
-active project, the only one that keeps polling. A turn FlowX runs on the thread
+provider and project, a failed pass clears it, and it is reported for the
+projects that keep polling: the active one every five seconds and every
+expanded one every 30 (`BACKGROUND_INDEX_INTERVAL`). Polling only the active
+project left a thread archived in Codex or Claude listed under every other
+project until it was clicked. Coming back to the window
+(`refresh_native_projects`) and expanding a project read it at once. A turn FlowX runs on the thread
 answers for itself. The sidebar row shows Waiting, the title bar's dot turns to
 Waiting for the active thread, and the transcript says where to answer.
 

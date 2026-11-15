@@ -14,6 +14,10 @@ use uuid::Uuid;
 
 pub(crate) const PROVIDERS: [&str; 2] = ["codex", "claude"];
 pub(crate) const INDEX_INTERVAL: Duration = Duration::from_secs(5);
+/// How often an expanded project that is not the active one is read: its rows
+/// are on screen, so a thread archived elsewhere must not linger, but a pass
+/// per project every five seconds is more than a glance needs.
+pub(crate) const BACKGROUND_INDEX_INTERVAL: Duration = Duration::from_secs(30);
 pub(crate) const HISTORY_INTERVAL: Duration = Duration::from_secs(2);
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]

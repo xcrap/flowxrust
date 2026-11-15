@@ -204,6 +204,18 @@ impl FlowX {
                 .push(cx.observe_window_bounds(window, |this, window, cx| {
                     this.record_window_frame(window, cx);
                 }));
+            // Coming back to FlowX, most often from Codex or Claude, where a
+            // thread may just have been archived: every project is read again
+            // rather than shown as it was when it was last polled.
+            self.subscriptions
+                .push(cx.observe_window_activation(window, |this, window, cx| {
+                    if window.is_window_active() {
+                        this.state.update(cx, |state, cx| {
+                            state.refresh_native_projects();
+                            cx.notify();
+                        });
+                    }
+                }));
             let focus = cx.focus_handle();
             focus.focus(window);
             self.focus = Some(focus);
