@@ -46,16 +46,51 @@
 //! is live; this module deliberately does not guess which.
 
 use std::cell::RefCell;
+use std::time::Instant;
 
+use fx_design::components::motion::{Approach, Entering, entering, entering_since, now};
 use fx_design::components::{BadgeTone, ButtonStyle, badge, button, panel};
 use fx_design::icon::Icon;
 use fx_design::styled::{FxStyled, px_len};
-use fx_design::theme::{Colors, IconSize, Layout, Radii, Spacing, TextRole, Theme, global};
+use fx_design::theme::{
+    BorderWidth, Colors, Entrance, IconSize, Layout, Radii, Spacing, TextRole, Theme, global,
+};
 use gpui::prelude::*;
 use gpui::{
-    AnyElement, App, Context, Entity, FocusHandle, KeyDownEvent, Render, SharedString, Window, div,
-    px,
+    AnyElement, App, Context, ElementId, Entity, FocusHandle, KeyDownEvent, Render, SharedString,
+    Window, div, px,
 };
+
+// ── The card ───────────────────────────────────────────────────────────────
+
+/// The card every approval is drawn on: the tray here, and the transcript's
+/// pending tray, which answers the provider straight from the card.
+///
+/// One surface for both, so a request reads the same wherever it is asked:
+/// the floating panel's fill and hairline edge, and the default padding. The
+/// transcript's copy once drew its own on `warning_muted` with a 1pt edge at
+/// a hand-written alpha; what says the turn stopped is the tray's heading and
+/// the request's own badge, not a tint that has to clear contrast twice.
+pub fn approval_card(content: impl IntoElement) -> impl IntoElement {
+    panel(
+        div()
+            .flex()
+            .flex_col()
+            .gap(px_len(Spacing::SM))
+            .p(px_len(Spacing::LG))
+            .child(content),
+    )
+}
+
+/// A card arriving: a request the turn stopped on comes unasked, so it fades
+/// in over `BASE` while rising into its place, once per request.
+///
+/// `id` names the request; the entrance is measured from the first frame a
+/// card under it is drawn in, and runs again only if the card goes away and
+/// comes back.
+pub fn arriving_card(id: impl Into<ElementId>, card: impl IntoElement) -> Entering {
+    entering(id, Entrance::CARD, Approach::FromBelow, card)
+}
 
 // ── The decision ───────────────────────────────────────────────────────────
 
@@ -466,6 +501,9 @@ pub struct ApprovalTray {
     focus: FocusHandle,
     on_decide: DecideHandler,
     on_cancel: CancelHandler,
+    /// When the tray was built, on the executor's clock, which its entrance
+    /// is measured from.
+    opened_at: Instant,
 }
 
 impl ApprovalTray {
@@ -496,6 +534,7 @@ impl ApprovalTray {
                 focus,
                 on_decide,
                 on_cancel,
+                opened_at: now(cx),
             }
         })
     }
@@ -688,7 +727,6 @@ impl Render for ApprovalTray {
             .flex()
             .flex_col()
             .gap(px_len(Spacing::SM))
-            .p(px_len(Spacing::LG))
             .child(header(&theme, &self.request));
 
         let body = match command_block(&self.request) {
@@ -735,11 +773,16 @@ impl Render for ApprovalTray {
                             this.update(cx, |tray, cx| tray.on_key_down(event, window, cx));
                         }
                     })
-                    .child(panel(body.child(control_strip(
-                        &self.request,
-                        self.decision,
-                        &this,
-                    ))))
+                    .child(entering_since(
+                        self.opened_at,
+                        Entrance::CARD,
+                        Approach::FromBelow,
+                        approval_card(body.child(control_strip(
+                            &self.request,
+                            self.decision,
+                            &this,
+                        ))),
+                    ))
                     .child(shortcut_hint(&theme)),
             )
             .into_any_element()
@@ -813,12 +856,16 @@ fn command_panel(theme: &Theme, command: &str, cwd: Option<&str>) -> AnyElement 
         .bg(Colors::bg_surface(theme))
         .child(
             div()
+                .debug_selector(|| "approval-command-header".into())
                 .flex()
                 .flex_row()
                 .items_center()
                 .gap(px_len(Spacing::SM))
                 .px(px_len(Spacing::MD))
                 .py(px_len(Spacing::XS))
+                // Its own top corners, inside the edge: a square fill drawn
+                // over a rounded card pokes out at both of them.
+                .rounded_t(px_len(Radii::MD - BorderWidth::REGULAR))
                 .bg(Colors::bg_elevated(theme))
                 .child(
                     div()
@@ -1477,6 +1524,43 @@ mod tests {
     /// Mount one tray for one request.
     fn mount(request: ApprovalRequest) -> Mounted {
         mount_all(vec![request])
+    }
+
+    #[test]
+    fn a_tray_fades_in_rising_over_the_base_duration_then_holds_still() {
+        use fx_design::theme::FxAnimation;
+        let mut mounted = mount(command());
+        let mut visual = gpui::VisualTestContext::from_window(mounted.window.into(), &mounted.test);
+        let header = |visual: &mut gpui::VisualTestContext| {
+            visual
+                .debug_bounds("approval-command-header")
+                .expect("the command's header")
+                .top()
+        };
+        let redraw = |mounted: &mut Mounted| {
+            mounted
+                .window
+                .update(&mut mounted.test, |_, window, _| window.refresh())
+                .unwrap();
+        };
+        // Every frame so far was drawn the moment it was built.
+        let first = header(&mut visual);
+        mounted.test.executor().advance_clock(FxAnimation::BASE / 2);
+        redraw(&mut mounted);
+        let halfway = header(&mut visual);
+        mounted.test.executor().advance_clock(FxAnimation::BASE);
+        redraw(&mut mounted);
+        let settled = header(&mut visual);
+        assert!((f32::from(first - settled) - FxAnimation::RISE).abs() < 0.01);
+        let rise = Entrance::CARD.at(FxAnimation::BASE / 2, false).rise;
+        assert!((f32::from(halfway - settled) - rise).abs() < 0.01);
+        let frames = fx_design::components::entrance_frames_requested();
+        redraw(&mut mounted);
+        assert_eq!(
+            fx_design::components::entrance_frames_requested(),
+            frames,
+            "a settled tray asked for frames"
+        );
     }
 
     /// Mount a tray for each request in turn, in one window.

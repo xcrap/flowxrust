@@ -722,17 +722,30 @@ pub(crate) fn mention_row_selector(index: usize) -> &'static str {
 /// upward over the transcript rather than pushing the card down as rows come
 /// and go; drawn deferred, so it paints over the rows above it; and kept
 /// inside the window with the menus' margin.
+///
+/// It enters as a menu does, fading in over `QUICK` while it settles the
+/// last rise down onto the card it is anchored to, each time it opens.
 fn mention_overlay(popup: &MentionPopup, handler: Option<ActionHandler>) -> AnyElement {
+    use fx_design::components::motion::{Approach, entering};
     gpui::deferred(
         gpui::anchored()
             .anchor(gpui::Corner::BottomLeft)
             .offset(gpui::point(px(0.0), px(-Layout::MENU_ANCHOR_GAP)))
             .snap_to_window_with_margin(gpui::Edges::all(px(Layout::MENU_EDGE_MARGIN)))
-            .child(mention_panel(popup, handler)),
+            .child(entering(
+                MENTION_ENTRANCE_ID,
+                fx_design::theme::Entrance::POPOVER,
+                Approach::FromAbove,
+                mention_panel(popup, handler),
+            )),
     )
     .with_priority(1)
     .into_any_element()
 }
+
+/// The element id the picker's entrance is measured under. Its state lives
+/// while the picker is drawn, so closing it and typing `@` again enters anew.
+const MENTION_ENTRANCE_ID: &str = "composer-mention-entrance";
 
 /// The picker's panel: a menu's surface and rows, a file's name beside the
 /// directory it is in, and a line under them saying what the rows cannot.
@@ -806,30 +819,30 @@ fn mention_panel(popup: &MentionPopup, handler: Option<ActionHandler>) -> AnyEle
 
     let status = mention_status(popup);
 
-    div()
-        .id("composer-mention")
-        .debug_selector(|| MENTION_SELECTOR.into())
-        .flex()
-        .flex_col()
-        .w(px_len(Layout::MENTION_PANEL_WIDTH))
-        .bg(Colors::bg_surface(&theme))
-        .rounded(px_len(Radii::MD))
-        .border_1()
-        .border_color(Colors::border_medium(&theme))
-        .occlude()
-        .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| cx.stop_propagation())
-        .child(rows)
-        .child(
-            div()
-                .px(px_len(Spacing::SM))
-                .py(px_len(Spacing::XS))
-                .border_t_1()
-                .border_color(Colors::border_subtle(&theme))
-                .fx_caption()
-                .text_color(Colors::fg_tertiary(&theme))
-                .child(status),
-        )
-        .into_any_element()
+    // A menu's floating surface — fill, hairline edge, corner and the
+    // popover shadow — so the picker reads as the menus do, with a hairline
+    // rule over its status line rather than a full point.
+    fx_design::components::floating(
+        div()
+            .flex()
+            .flex_col()
+            .child(rows)
+            .child(fx_design::components::divider())
+            .child(
+                div()
+                    .px(px_len(Spacing::SM))
+                    .py(px_len(Spacing::XS))
+                    .fx_caption()
+                    .text_color(Colors::fg_tertiary(&theme))
+                    .child(status),
+            ),
+    )
+    .id("composer-mention")
+    .debug_selector(|| MENTION_SELECTOR.into())
+    .w(px_len(Layout::MENTION_PANEL_WIDTH))
+    .occlude()
+    .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| cx.stop_propagation())
+    .into_any_element()
 }
 
 // ── The goal ───────────────────────────────────────────────────────────────
@@ -2681,6 +2694,32 @@ mod tests {
             ))),
             "all actions: {:?}",
             actions.borrow()
+        );
+    }
+
+    #[test]
+    fn the_picker_settles_down_onto_the_card_as_it_opens() {
+        use fx_design::theme::FxAnimation;
+        let (mut test, window, field, _actions) = recording_with_headroom(
+            ComposerChrome {
+                mention: Some(picker()),
+                ..live()
+            },
+            "Fix @comp",
+            Some(px(400.0)),
+        );
+        focus(&mut test, &window, &field);
+        let mut visual = VisualTestContext::from_window(*window.deref(), &test);
+        let first = visual.debug_bounds(MENTION_SELECTOR).unwrap().top();
+        test.executor().advance_clock(FxAnimation::QUICK);
+        window
+            .update(&mut test, |_, window, _| window.refresh())
+            .unwrap();
+        let settled = visual.debug_bounds(MENTION_SELECTOR).unwrap().top();
+        // Anchored above the card, it travels down toward it.
+        assert!(
+            (f32::from(settled - first) - FxAnimation::RISE).abs() < 0.01,
+            "it moved from {first:?} to {settled:?}"
         );
     }
 

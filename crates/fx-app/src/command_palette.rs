@@ -21,13 +21,14 @@
 use std::cmp::Reverse;
 use std::collections::HashMap;
 
+use fx_design::components::motion::{Approach, entering_since};
 use fx_design::components::{
     MenuItem, MenuModel, MenuSection, PaletteRow, empty_state, palette_panel, palette_row,
     shortcut_chip,
 };
 use fx_design::icon::Icon;
 use fx_design::styled::{FxStyled, px_len};
-use fx_design::theme::{Colors, IconSize, Layout, Spacing, global};
+use fx_design::theme::{Colors, Entrance, IconSize, Layout, Spacing, global};
 use gpui::prelude::*;
 use gpui::{
     Action, AnyElement, App, Context, Entity, FocusHandle, ListSizingBehavior, MouseButton, Render,
@@ -416,6 +417,9 @@ pub struct CommandPalette {
     scroll: UniformListScrollHandle,
     /// Where focus was before the palette took it, to give it back on Escape.
     previous_focus: Option<FocusHandle>,
+    /// When it opened, on the executor's clock: the panel fades in over
+    /// `QUICK`, rising into place, from here. Closing is instant.
+    opened_at: std::time::Instant,
     _query_changed: Subscription,
 }
 
@@ -462,6 +466,7 @@ pub fn toggle(state: Entity<AppState>, window: &mut Window, cx: &mut App) {
             ranked_query: String::new(),
             scroll: UniformListScrollHandle::new(),
             previous_focus,
+            opened_at: fx_design::components::motion::now(cx),
             _query_changed: query_changed,
         };
         palette.rank_against(String::new());
@@ -855,7 +860,10 @@ impl Render for CommandPalette {
                     _ => palette.dismiss(window, cx),
                 });
             })
-            .child(
+            .child(entering_since(
+                self.opened_at,
+                Entrance::POPOVER,
+                Approach::FromBelow,
                 div()
                     .max_w_full()
                     // A press on the panel is not a press on the backdrop. The
@@ -870,7 +878,7 @@ impl Render for CommandPalette {
                             .child(fx_design::components::divider())
                             .child(self.results_list(cx)),
                     )),
-            )
+            ))
     }
 }
 
@@ -1332,6 +1340,41 @@ mod tests {
         shell.keys("down down up");
         let titles = shell.titles();
         assert_eq!(shell.highlighted(), Some(titles[1].clone()));
+    }
+
+    #[test]
+    fn the_palette_rises_into_place_as_it_opens_and_closes_at_once() {
+        use fx_design::theme::FxAnimation;
+        let mut shell = shell();
+        let mut visual = gpui::VisualTestContext::from_window(shell.window.into(), &shell.test);
+        shell.keys("cmd-k");
+        assert!(shell.palette().is_some());
+        let frames = fx_design::components::entrance_frames_requested();
+        let first = visual.debug_bounds("command-palette-close").unwrap().top();
+        shell.test.executor().advance_clock(FxAnimation::QUICK);
+        shell
+            .window
+            .update(&mut shell.test, |_, window, _| window.refresh())
+            .unwrap();
+        let settled = visual.debug_bounds("command-palette-close").unwrap().top();
+        assert!(
+            (f32::from(first - settled) - FxAnimation::RISE).abs() < 0.01,
+            "it rose from {first:?} to {settled:?}"
+        );
+        // Settled, it asks for no frame of its own.
+        let requested = fx_design::components::entrance_frames_requested();
+        assert!(requested > frames);
+        shell
+            .window
+            .update(&mut shell.test, |_, window, _| window.refresh())
+            .unwrap();
+        assert_eq!(
+            fx_design::components::entrance_frames_requested(),
+            requested
+        );
+        // Leaving is instant: no frame of it is drawn after Escape.
+        shell.keys("escape");
+        assert!(shell.palette().is_none());
     }
 
     #[test]

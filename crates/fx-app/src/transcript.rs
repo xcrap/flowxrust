@@ -5493,56 +5493,59 @@ fn approval_card(approval: &PendingApproval, agent: Uuid, answerable: bool) -> A
         RiskLevelSerde::Dangerous => BadgeTone::Error,
     };
 
-    div()
-        .flex()
-        .flex_col()
-        .gap(px_len(Spacing::SM))
-        .p(px_len(Spacing::LG))
-        .rounded(px_len(Radii::XL))
-        // Warning-muted rather than a plain surface: the turn is stopped on this,
-        // and a tray that looks like the rest of the surface does not say so.
-        .bg(Colors::warning_muted(&theme))
-        .border_1()
-        .border_color(Colors::warning(&theme).with_alpha(0.18))
-        .child(
-            div()
-                .flex()
-                .flex_row()
-                .items_center()
-                .gap(px_len(Spacing::SM))
-                .child(
-                    div()
-                        .flex_1()
-                        .min_w_0()
-                        .fx_body_medium()
-                        .text_color(Colors::fg(&theme))
-                        .truncate()
-                        .child(SharedString::from(approval.tool_name.clone())),
-                )
-                .child(badge(risk_label(approval.risk), tone, false)),
-        )
-        .child(
-            div()
-                .fx_caption()
-                .text_color(Colors::fg_secondary(&theme))
-                .child(SharedString::from(describe_arguments(&approval.input))),
-        )
-        .child(mono_panel(
-            "Arguments",
-            &pretty_arguments(&approval.input),
-            BlockTone::Standard,
-            SharedString::from(format!("approval:{}", approval.id)),
-            false,
-        ))
-        .child(approval_actions(approval, agent, answerable))
-        .into_any_element()
+    // The tray's card, so a request reads the same here as there, arriving
+    // as a request the turn stopped on does.
+    let card = crate::approvals::approval_card(
+        div()
+            .flex()
+            .flex_col()
+            .gap(px_len(Spacing::SM))
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px_len(Spacing::SM))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .fx_body_medium()
+                            .text_color(Colors::fg(&theme))
+                            .truncate()
+                            .child(SharedString::from(approval.tool_name.clone())),
+                    )
+                    .child(badge(risk_label(approval.risk), tone, false)),
+            )
+            .child(
+                div()
+                    .fx_caption()
+                    .text_color(Colors::fg_secondary(&theme))
+                    .child(SharedString::from(describe_arguments(&approval.input))),
+            )
+            .child(mono_panel(
+                "Arguments",
+                &pretty_arguments(&approval.input),
+                BlockTone::Standard,
+                SharedString::from(format!("approval:{}", approval.id)),
+                false,
+            ))
+            .child(approval_actions(approval, agent, answerable)),
+    );
+    crate::approvals::arriving_card(
+        SharedString::from(format!("approval-entrance:{}", approval.id)),
+        card,
+    )
+    .into_any_element()
 }
 
-/// Deny and Allow once, answered straight to the provider.
+/// Deny and Allow once, answered straight to the provider, styled as the
+/// tray styles the same two decisions: a refusal is drawn as one.
 ///
 /// Disabled once an answer is on its way, and for a request whose turn is
 /// gone: a button that cannot reach the provider looks live and does nothing.
 fn approval_actions(approval: &PendingApproval, agent: Uuid, answerable: bool) -> AnyElement {
+    use crate::approvals::Decision;
     let action = |label: &'static str, style: ButtonStyle, approved: bool| {
         let id = approval.id.clone();
         let selector = format!("{APPROVAL_ACTION_PREFIX}{id}:{label}");
@@ -5564,8 +5567,8 @@ fn approval_actions(approval: &PendingApproval, agent: Uuid, answerable: bool) -
         .flex_row()
         .justify_end()
         .gap(px_len(Spacing::SM))
-        .child(action("Deny", ButtonStyle::Secondary, false))
-        .child(action("Allow once", ButtonStyle::Primary, true))
+        .child(action("Deny", Decision::Deny.button_style(), false))
+        .child(action("Allow once", Decision::Approve.button_style(), true))
         .into_any_element()
 }
 
@@ -5613,7 +5616,11 @@ fn pending_question_card(question: &PendingQuestion) -> AnyElement {
         body = body.child(question_option(index, option));
     }
 
-    panel(body).into_any_element()
+    crate::approvals::arriving_card(
+        SharedString::from(format!("question-entrance:{}", question.id)),
+        panel(body),
+    )
+    .into_any_element()
 }
 
 /// What the approval is about, in one line.
@@ -8401,6 +8408,43 @@ mod tests {
         assert!(drew(&mut visual, &live("label", "Waiting for approval…")));
         assert!(!drew(&mut visual, &live("label", "Running command")));
         assert!(!drew(&mut visual, &live("elapsed", "0s")), "a clock ticked");
+    }
+
+    #[test]
+    fn an_approval_card_arrives_rising_once_and_then_holds_still() {
+        let mut conversation = running_the_tests();
+        conversation.apply(ProviderEvent::Approval(
+            fx_agent::provider::ApprovalRequest {
+                id: "approve-test".into(),
+                tool_name: "Bash".into(),
+                input: serde_json::json!({ "command": "cargo test --workspace" }),
+                risk: fx_agent::provider::RiskLevel::Moderate,
+            },
+        ));
+        let (mut test, mut visual) = open(conversation, 900.0, 700.0);
+        redraw(&mut test);
+        let deny = |visual: &mut VisualTestContext| {
+            visual
+                // `APPROVAL_ACTION_PREFIX`, the request and the label.
+                .debug_bounds("transcript.approval:approve-test:Deny")
+                .expect("the card's Deny")
+                .top()
+        };
+        let first = deny(&mut visual);
+        test.executor().advance_clock(FxAnimation::BASE);
+        redraw(&mut test);
+        let settled = deny(&mut visual);
+        assert!(
+            (f32::from(first - settled) - FxAnimation::RISE).abs() < 0.01,
+            "it rose from {first:?} to {settled:?}"
+        );
+        let frames = fx_design::components::entrance_frames_requested();
+        redraw(&mut test);
+        assert_eq!(
+            fx_design::components::entrance_frames_requested(),
+            frames,
+            "a card that arrived kept asking for frames"
+        );
     }
 
     #[test]
