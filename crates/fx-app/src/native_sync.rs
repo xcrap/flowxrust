@@ -4,7 +4,7 @@
 //! and one in-flight request, so an offline provider cannot block the other or
 //! accumulate a backlog while a project is switched repeatedly.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 use std::time::{Duration, Instant};
 
@@ -59,6 +59,9 @@ pub(crate) enum Payload {
     /// Boxed: a thread is several times the size of the other payloads.
     History(Box<NativeThread>),
     Unchanged,
+    /// The provider's CLI is not installed: nothing to list, nothing wrong,
+    /// and no proof that any of its threads is gone.
+    NotInstalled,
 }
 
 #[derive(Debug)]
@@ -203,18 +206,20 @@ impl Worker {
             let codex = fx_agent::codex::native::CodexNativeStore::new(fx_core::services::runtime::RuntimeDiscovery::default());
             let claude = fx_agent::claude::native::ClaudeNativeStore::default();
             let store = fx_store::Store::new(paths);
+            let mut drafts = DraftChecks::default();
             for ticket in jobs {
                 let result = match &ticket.kind {
                     RequestKind::Index { candidates, missing_candidates } => {
                         let result = if provider == "codex" {
                             match &runtime {
-                                Ok(runtime) => runtime.block_on(codex.list(&ticket.root)).map_err(|error| error.to_string()),
+                                Ok(runtime) => runtime.block_on(codex.list_if_installed(&ticket.root)).map_err(|error| error.to_string()),
                                 Err(error) => Err(error.to_string()),
                             }
                         } else {
-                            claude.list(&ticket.root).map_err(|error| error.to_string())
+                            claude.list(&ticket.root).map(Some).map_err(|error| error.to_string())
                         };
-                        result.map(|mut index| {
+                        result.map(|index| {
+                            let Some(mut index) = index else { return Payload::NotInstalled };
                             let sessions = candidates.iter().filter_map(|&agent| {
                                 match store.load_conversation(ticket.project, agent) {
                                     Ok(Some(conversation)) if conversation.agent_id == agent => conversation.session_id.map(|session| (agent, session)),
@@ -225,11 +230,12 @@ impl Worker {
                                     }
                                 }
                             }).collect();
-                            let protected = missing_candidates.iter().filter_map(|(agent, session)| {
-                                if index.threads.iter().any(|entry| entry.summary.identity.session_id == *session) { return None; }
-                                protect_missing_thread(&store, ticket.project, *agent, &mut index.warnings)
-                                    .then_some(*agent)
+                            let listed: HashSet<&str> = index.threads.iter().map(|entry| entry.summary.identity.session_id.as_str()).collect();
+                            let missing: Vec<Uuid> = missing_candidates.iter().filter(|(_, session)| !listed.contains(session.as_str())).map(|(agent, _)| *agent).collect();
+                            let protected = missing.iter().copied().filter(|agent| {
+                                drafts.protect(&store, ticket.project, *agent, &mut index.warnings)
                             }).collect();
+                            drafts.retain(ticket.project, &missing.into_iter().collect());
                             Payload::Index { index, sessions, protected }
                         })
                     }
@@ -253,6 +259,86 @@ impl Worker {
             receiver,
             pending: None,
         })
+    }
+}
+
+/// What each missing thread's saved transcript says about unsent input, by
+/// the stamp of the files it was read from.
+///
+/// Every index pass asked it of every missing thread, hidden ones included,
+/// and with Claude deleting transcripts after 30 days that is most of an old
+/// project: each answer read and parsed a saved transcript of up to 32 MiB.
+/// Every save renames a new file into place, so a changed file has a new
+/// stamp; an unreadable one is not remembered, and is asked again.
+#[derive(Default)]
+pub(crate) struct DraftChecks {
+    known: HashMap<(Uuid, Uuid), (DraftStamp, bool)>,
+    #[cfg(test)]
+    reads: usize,
+}
+
+/// A transcript's primary and recovery copy, as `load_conversation` reads
+/// one or the other.
+type DraftStamp = [Option<FileStamp>; 2];
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FileStamp {
+    len: u64,
+    modified: Option<std::time::SystemTime>,
+    inode: (u64, u64),
+    changed: (i64, i64),
+}
+
+fn file_stamp(path: &std::path::Path) -> Option<FileStamp> {
+    use std::os::unix::fs::MetadataExt;
+    let metadata = std::fs::metadata(path).ok()?;
+    Some(FileStamp {
+        len: metadata.len(),
+        modified: metadata.modified().ok(),
+        inode: (metadata.dev(), metadata.ino()),
+        changed: (metadata.ctime(), metadata.ctime_nsec()),
+    })
+}
+
+impl DraftChecks {
+    /// [`protect_missing_thread`], read again only once its file changed.
+    pub fn protect(
+        &mut self,
+        store: &fx_store::Store,
+        project: Uuid,
+        agent: Uuid,
+        warnings: &mut Vec<String>,
+    ) -> bool {
+        let path = store.paths().conversation_file(project, agent);
+        // Taken before the read, so a save that lands during it leaves a
+        // stamp that no longer matches.
+        let stamp = [
+            file_stamp(&path),
+            file_stamp(&fx_store::write::backup_path(&path)),
+        ];
+        if let Some((known, protected)) = self.known.get(&(project, agent))
+            && *known == stamp
+        {
+            return *protected;
+        }
+        #[cfg(test)]
+        {
+            self.reads += 1;
+        }
+        let before = warnings.len();
+        let protected = protect_missing_thread(store, project, agent, warnings);
+        if warnings.len() == before {
+            self.known.insert((project, agent), (stamp, protected));
+        } else {
+            self.known.remove(&(project, agent));
+        }
+        protected
+    }
+
+    /// Forget the threads of `project` that are no longer checked.
+    pub fn retain(&mut self, project: Uuid, checked: &HashSet<Uuid>) {
+        self.known
+            .retain(|(id, agent), _| *id != project || checked.contains(agent));
     }
 }
 
@@ -285,4 +371,37 @@ pub(crate) fn same_project(left: &str, right: &str) -> bool {
     // anyway was two `realpath` calls per thread at each of four checks, on
     // every index pass, on the UI thread.
     left == right || canonical(left) == canonical(right)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_missing_threads_draft_is_read_again_only_once_its_file_changes() {
+        // Every pass read and parsed each missing thread's saved transcript,
+        // hidden ones included, to see whether it held a draft.
+        let temp = tempfile::tempdir().unwrap();
+        let store = fx_store::Store::new(AppPaths::at(temp.path()));
+        let (project, agent) = (Uuid::new_v4(), Uuid::new_v4());
+        let mut checks = DraftChecks::default();
+        let mut warnings = Vec::new();
+        assert!(!checks.protect(&store, project, agent, &mut warnings));
+        assert!(!checks.protect(&store, project, agent, &mut warnings));
+        assert_eq!(checks.reads, 1);
+        let mut saved = fx_store::PersistedConversation::from_messages(agent, Vec::new());
+        saved.draft_text = "Unsent".into();
+        store.save_conversation(project, agent, &saved).unwrap();
+        assert!(checks.protect(&store, project, agent, &mut warnings));
+        assert!(checks.protect(&store, project, agent, &mut warnings));
+        assert_eq!(checks.reads, 2);
+        saved.draft_text.clear();
+        store.save_conversation(project, agent, &saved).unwrap();
+        assert!(!checks.protect(&store, project, agent, &mut warnings));
+        assert_eq!(checks.reads, 3);
+        assert!(warnings.is_empty());
+        // A thread that is no longer missing is forgotten.
+        checks.retain(project, &HashSet::new());
+        assert!(checks.known.is_empty());
+    }
 }

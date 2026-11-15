@@ -3476,6 +3476,21 @@ impl AppState {
                     self.native_sync.history_warnings.remove(&agent);
                 }
             }
+            // A provider that is not installed, as Codex is for a Claude-only
+            // user: nothing to fix, so no warning, and no listing to hide a
+            // thread by. Shown as an error, it was "Thread sync needs
+            // attention" under every project, for good.
+            Ok(Payload::NotInstalled) => {
+                self.forget_waiting_elsewhere(
+                    ticket.project,
+                    &ticket.provider,
+                    &ticket.root,
+                    Vec::new(),
+                );
+                self.native_sync
+                    .warnings
+                    .remove(&(ticket.project, ticket.provider));
+            }
             Ok(Payload::History(history)) => {
                 let history = *history;
                 let RequestKind::History {
@@ -9216,6 +9231,50 @@ mod native_sync_tests {
                     order(state),
                     vec![d_id, c_id, worktree, created, b_id, a_id]
                 );
+            })
+        });
+    }
+
+    #[test]
+    fn a_provider_that_is_not_installed_needs_no_attention_and_hides_nothing() {
+        // A Claude-only user has no Codex. Its listing failing was "Thread
+        // sync needs attention" under every project, for good.
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().to_string_lossy().to_string();
+        let test = gpui::TestAppContext::single();
+        let (state, project) =
+            test.update(|cx| setup(cx, AppPaths::at(temp.path().join("store")), &root));
+        test.update(|cx| {
+            state.update(cx, |state, _| {
+                index(
+                    state,
+                    project,
+                    "codex",
+                    vec![entry(&root, "codex", "kept", "Kept")],
+                    Vec::new(),
+                );
+                let kept = state.snapshot.active_agent_id.unwrap();
+                state.snapshot.active_agent_id = None;
+                state.native_sync.warnings.insert(
+                    (project, "codex".into()),
+                    vec!["Codex was not found".into()],
+                );
+                state.apply_native_completion(Completion {
+                    ticket: Ticket {
+                        project,
+                        root: root.clone(),
+                        provider: "codex".into(),
+                        generation: state.native_sync.generation(project),
+                        kind: RequestKind::Index {
+                            candidates: Vec::new(),
+                            missing_candidates: Vec::new(),
+                        },
+                    },
+                    result: Ok(Payload::NotInstalled),
+                });
+                assert!(state.native_status(project).warnings.is_empty());
+                // Not installed is not proof that a thread is gone.
+                assert!(state.visible_active_agents().any(|agent| agent.id == kept));
             })
         });
     }

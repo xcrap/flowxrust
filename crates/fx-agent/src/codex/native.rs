@@ -7,10 +7,10 @@ use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex as StdMutex};
-use std::time::{Duration, UNIX_EPOCH};
+use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use base64::Engine;
-use fx_core::services::runtime::RuntimeDiscovery;
+use fx_core::services::runtime::{BinarySpec, RuntimeDiscovery, Validation};
 use fx_core::{AgentAccess, ConversationMessage, MessageContent, MessageRole, NativeDefaults};
 use serde_json::{Value, json};
 use tokio::sync::Mutex;
@@ -30,6 +30,10 @@ const MAX_CACHED_HISTORIES: usize = 4;
 const MAX_CONTEXT_SEARCH: u64 = 32 * 1024 * 1024;
 const CONTEXT_CHUNK: u64 = 256 * 1024;
 const MAIN_SOURCES: &[&str] = &["cli", "vscode", "exec", "appServer", "unknown"];
+/// How long a Codex found missing is taken to stay missing. A search that
+/// finds nothing ends in a login shell, which is no thing to run on every
+/// pass of every project.
+const MISSING_RECHECK: Duration = Duration::from_secs(60);
 
 struct Connection {
     transport: Arc<Transport>,
@@ -45,6 +49,9 @@ impl Drop for Connection {
 /// the read-only app-server is restarted after exit or a failed timed-out request.
 pub struct CodexNativeStore {
     provider: CodexProvider,
+    discovery: RuntimeDiscovery,
+    /// When Codex was last looked for and not found.
+    missing: StdMutex<Option<Instant>>,
     connection: Mutex<Option<Connection>>,
     operation: Mutex<()>,
     archived: StdMutex<HashSet<String>>,
@@ -59,12 +66,14 @@ struct CachedHistory {
 
 impl CodexNativeStore {
     pub fn new(discovery: RuntimeDiscovery) -> Self {
-        Self::from_provider(CodexProvider::new(discovery))
+        Self::with_spec(discovery, fx_core::services::runtime::codex_spec())
     }
 
-    fn from_provider(provider: CodexProvider) -> Self {
+    fn with_spec(discovery: RuntimeDiscovery, spec: BinarySpec) -> Self {
         Self {
-            provider,
+            provider: CodexProvider::with_spec(discovery.clone(), spec),
+            discovery,
+            missing: StdMutex::new(None),
             connection: Mutex::new(None),
             operation: Mutex::new(()),
             archived: StdMutex::new(HashSet::new()),
@@ -111,6 +120,46 @@ impl CodexNativeStore {
         if let Some(connection) = self.connection.lock().await.take() {
             connection.transport.close().await;
         }
+    }
+
+    /// [`Self::list`], or `None` when Codex is not installed.
+    ///
+    /// A Claude-only user has no Codex, and that is nothing to fix: reported
+    /// as an error, it was "Thread sync needs attention" under every project,
+    /// for good. Nor does it say that any thread is gone, so the caller lists
+    /// nothing and hides nothing. Codex found missing is looked for again
+    /// only after `MISSING_RECHECK`; a quarantined one is installed, and its
+    /// listing says why it cannot run.
+    pub async fn list_if_installed(
+        &self,
+        working_directory: &str,
+    ) -> Result<Option<NativeThreadIndex>, ProviderError> {
+        if !self.installed().await {
+            return Ok(None);
+        }
+        self.list(working_directory).await.map(Some)
+    }
+
+    async fn installed(&self) -> bool {
+        if let Some(existing) = self.connection.lock().await.as_ref()
+            && existing.transport.exit_reason().await.is_none()
+        {
+            return true;
+        }
+        let recent = self
+            .missing
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_some_and(|since| since.elapsed() < MISSING_RECHECK);
+        if recent {
+            return false;
+        }
+        let found = !matches!(
+            self.discovery.find(self.provider.spec()).await,
+            Validation::Missing
+        );
+        *self.missing.lock().unwrap_or_else(|e| e.into_inner()) = (!found).then(Instant::now);
+        found
     }
 
     pub async fn list(&self, working_directory: &str) -> Result<NativeThreadIndex, ProviderError> {
@@ -1098,7 +1147,6 @@ fn append_unnamed_mentions(content: &mut Vec<MessageContent>, mentions: &[(Strin
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fx_core::services::runtime::BinarySpec;
 
     const SERVER: &str = r#"
 import json, os, sys
@@ -1165,10 +1213,10 @@ for line in sys.stdin:
                 root.to_string_lossy().into_owned(),
                 log.to_string_lossy().into_owned(),
             ]);
-            let store = CodexNativeStore::from_provider(CodexProvider::with_spec(
+            let store = CodexNativeStore::with_spec(
                 RuntimeDiscovery::default().without_extra_directories(),
                 spec,
-            ));
+            );
             Self {
                 _temp: temp,
                 root,
@@ -1204,6 +1252,41 @@ for line in sys.stdin:
                 .filter(|q| q["method"] == "thread/turns/list")
                 .count()
         }
+    }
+
+    #[tokio::test]
+    async fn codex_that_is_not_installed_lists_nothing_and_is_not_an_error() {
+        // A Claude-only user has no Codex. Reported as an error, every
+        // project said "Thread sync needs attention", for good.
+        let temp = tempfile::tempdir().unwrap();
+        let spec = BinarySpec::new(
+            "codex",
+            "Codex",
+            vec![temp.path().join("absent/codex").to_string_lossy().into()],
+        );
+        let store = CodexNativeStore::with_spec(
+            RuntimeDiscovery::default().without_extra_directories(),
+            spec,
+        );
+        let cwd = temp.path().to_str().unwrap();
+        assert!(store.list_if_installed(cwd).await.unwrap().is_none());
+        // Not looked for again on every pass, and still an error to a caller
+        // that has to have Codex.
+        assert!(store.missing.lock().unwrap().is_some());
+        assert!(store.list_if_installed(cwd).await.unwrap().is_none());
+        assert!(store.list(cwd).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn an_installed_codex_is_listed_through_the_same_call() {
+        let fixture = Fixture::new();
+        let index = fixture
+            .store
+            .list_if_installed(fixture.cwd())
+            .await
+            .unwrap();
+        assert!(index.is_some_and(|index| !index.threads.is_empty()));
+        assert!(fixture.store.missing.lock().unwrap().is_none());
     }
 
     #[tokio::test]
