@@ -8,7 +8,7 @@ use fx_core::{Agent, Project};
 use fx_design::components::{
     ButtonStyle, DividerAxis, IconButtonProps, MenuItem, MenuItemTone, MenuModel, MenuSection,
     button_with_icon, collapsible, context_region, divider_with_axis, empty_state, icon_button,
-    provider_status,
+    provider_status, revealed_on_hover,
 };
 use fx_design::icon::Icon;
 use fx_design::styled::{FxRefinement, FxStyled, px_len};
@@ -39,6 +39,15 @@ const PROJECT_ROW_HEIGHT: f32 = Layout::SIDEBAR_ROW_HEIGHT;
 const THREAD_ROW_HEIGHT: f32 = Layout::SIDEBAR_ROW_HEIGHT;
 /// Height of the sidebar's own header.
 const SIDEBAR_HEADER_HEIGHT: f32 = Layout::PANE_HEADER_HEIGHT;
+/// The role of a thread's title, and of every row under a project that is
+/// not a thread, so "Show more" reads as one of the list.
+const THREAD_TITLE_ROLE: TextRole = TextRole::Caption;
+/// The width of a thread row's provider tile. Every row under a project
+/// reserves it, so a label starts where thread titles do.
+const LEADING_SLOT: f32 = Spacing::XL;
+/// What a project or thread row names itself for its trailing controls,
+/// which show only while it is hovered or selected.
+const ROW_GROUP: &str = "sidebar-row";
 
 /// A thread row's fill.
 ///
@@ -46,6 +55,42 @@ const SIDEBAR_HEADER_HEIGHT: f32 = Layout::PANE_HEADER_HEIGHT;
 /// half as strong, so replacing it read as the selection dropping away.
 fn thread_row_fill(selected: bool, hovered: bool, theme: &fx_design::theme::Theme) -> Rgba {
     fx_design::components::list_row_fill(selected, hovered, theme)
+}
+
+/// A row under a project that is not a thread, laid out as a thread row is:
+/// the same leading inset, then a slot the width of the provider tile, so
+/// its label starts where a thread's title does.
+///
+/// "Show more", the archive and the sync status were inset by hand, one
+/// 12pt left of the titles and two of them 24pt in, in a heavier weight.
+fn utility_row(leading: Option<AnyElement>) -> gpui::Div {
+    div()
+        .flex()
+        .items_center()
+        .gap(px_len(Spacing::SM))
+        .pl(px_len(Spacing::SM))
+        .pr(px_len(Spacing::XXS))
+        .child(
+            div()
+                .w(px_len(LEADING_SLOT))
+                .flex_shrink_0()
+                .flex()
+                .justify_center()
+                .children(leading),
+        )
+}
+
+/// A utility row's label, in the thread title's role.
+fn utility_label(text: impl Into<SharedString>, ink: Rgba) -> gpui::Div {
+    div()
+        .flex_1()
+        .min_w_0()
+        .overflow_hidden()
+        .whitespace_nowrap()
+        .text_ellipsis()
+        .fx_role(THREAD_TITLE_ROLE)
+        .text_color(ink)
+        .child(text.into())
 }
 
 /// Render the sidebar column, or collapse it to nothing when hidden.
@@ -181,6 +226,7 @@ fn body(state: Entity<AppState>, cx: &mut App) -> AnyElement {
     let matches = query
         .is_active()
         .then(|| search_matches(app, &index, &query));
+    let open_menu = app.menu_layer.read(cx).owner();
     for (position, record) in app.snapshot.projects.iter().enumerate() {
         let (Some(project), Some(listed)) = (record.project.as_ref(), index.records.get(position))
         else {
@@ -203,6 +249,7 @@ fn body(state: Entity<AppState>, cx: &mut App) -> AnyElement {
                 project_busy(app, listed),
                 selected,
                 expanded,
+                open_menu,
             ));
         let mut content = div()
             .flex()
@@ -224,30 +271,25 @@ fn body(state: Entity<AppState>, cx: &mut App) -> AnyElement {
                 };
                 let retry_state = state.clone();
                 let failed = !detail.is_empty();
+                let leading = failed.then(|| {
+                    Icon::EXCLAMATIONMARK_TRIANGLE_FILL.render(
+                        IconSize::Small,
+                        Colors::warning_ink(&theme),
+                        &theme,
+                    )
+                });
                 content = content.child(
-                    div()
+                    utility_row(leading)
                         .debug_selector(move || format!("native-sync-status:{id}"))
-                        .flex()
-                        .items_center()
-                        .gap(px_len(Spacing::XXS))
-                        .pl(px_len(Spacing::XXL))
-                        .pr(px_len(Spacing::XXS))
-                        .py(px_len(Spacing::XXS))
-                        .fx_caption()
-                        .text_color(Colors::fg_secondary(&theme))
+                        .min_h(px(THREAD_ROW_HEIGHT))
                         .child(
                             // The warnings are the label's tooltip, not the
                             // row's: the row holds Retry, which has a tooltip
                             // of its own, and a tooltip stays where it opened
                             // for as long as the pointer is over its owner.
-                            div()
+                            utility_label(label, Colors::fg_secondary(&theme))
+                                .debug_selector(move || format!("native-sync-label:{id}"))
                                 .id(SharedString::from(format!("native-sync-status:{id}")))
-                                .flex_1()
-                                .min_w_0()
-                                .overflow_hidden()
-                                .whitespace_nowrap()
-                                .text_ellipsis()
-                                .child(label)
                                 .when(failed, |label| {
                                     label.tooltip(move |window, cx| {
                                         fx_design::components::tooltip(detail.clone(), window, cx)
@@ -282,7 +324,7 @@ fn body(state: Entity<AppState>, cx: &mut App) -> AnyElement {
                     .and_then(|matches| matches.get(position))
                     .map_or(&listed.visible[..], |matching| &matching[..]);
                 content = content.child(threads(
-                    &state, app, record, listed, matching, &query, expanded,
+                    &state, app, record, listed, matching, &query, expanded, open_menu,
                 ));
             }
         }
@@ -315,6 +357,7 @@ fn project_row(
     busy: bool,
     selected: bool,
     expanded: bool,
+    open_menu: Option<&str>,
 ) -> AnyElement {
     let theme = global::current();
     let id = project.id;
@@ -327,9 +370,13 @@ fn project_row(
     let context_menu = menu.clone();
     let registry = app.context_registry.clone();
     let state = state.clone();
+    // Shown on hover, and kept while the project is selected or its menu is
+    // open, so the menu's own button does not vanish under it.
+    let pinned = selected || open_menu == Some(format!("project:{id}").as_str());
 
     let row = div()
         .id(SharedString::from(format!("project:{id}")))
+        .group(ROW_GROUP)
         .h(px(PROJECT_ROW_HEIGHT))
         .flex_shrink_0()
         .flex()
@@ -407,37 +454,45 @@ fn project_row(
                 })
                 .child(SharedString::from(label)),
         )
-        .child(icon_button(
-            IconButtonProps::new(Icon::PLUS, "New thread")
-                .small()
-                .ghost(),
-            {
-                let state = state.clone();
-                move |_, window, cx| {
-                    cx.stop_propagation();
-                    crate::new_chat::open(state.clone(), Some(id), window, cx);
-                }
-            },
-        ))
-        .child(icon_button(
-            IconButtonProps::new(Icon::ELLIPSIS, "Project actions")
-                .small()
-                .ghost(),
-            move |event, _window, cx| {
-                // The menu button is inside the selectable project row.
-                cx.stop_propagation();
-                let model = menu.clone();
-                let layer = state.read(cx).menu_layer.clone();
-                layer.update(cx, |layer, cx| {
-                    let owner = format!("project:{id}");
-                    if layer.is_owner(&owner) {
-                        layer.dismiss();
-                    } else {
-                        layer.open_at(model, owner, event.position());
+        .child(revealed_on_hover(
+            icon_button(
+                IconButtonProps::new(Icon::PLUS, "New thread")
+                    .small()
+                    .ghost(),
+                {
+                    let state = state.clone();
+                    move |_, window, cx| {
+                        cx.stop_propagation();
+                        crate::new_chat::open(state.clone(), Some(id), window, cx);
                     }
-                    cx.notify();
-                });
-            },
+                },
+            ),
+            ROW_GROUP,
+            pinned,
+        ))
+        .child(revealed_on_hover(
+            icon_button(
+                IconButtonProps::new(Icon::ELLIPSIS, "Project actions")
+                    .small()
+                    .ghost(),
+                move |event, _window, cx| {
+                    // The menu button is inside the selectable project row.
+                    cx.stop_propagation();
+                    let model = menu.clone();
+                    let layer = state.read(cx).menu_layer.clone();
+                    layer.update(cx, |layer, cx| {
+                        let owner = format!("project:{id}");
+                        if layer.is_owner(&owner) {
+                            layer.dismiss();
+                        } else {
+                            layer.open_at(model, owner, event.position());
+                        }
+                        cx.notify();
+                    });
+                },
+            ),
+            ROW_GROUP,
+            pinned,
         ));
     context_region(&registry, format!("project:{id}"), Some(context_menu), row).into_any_element()
 }
@@ -449,6 +504,7 @@ fn project_row(
 /// listed thread, or the search's matches among them. Only the page shown is
 /// built, so the work here follows the rows on screen, not the threads the
 /// project has.
+#[allow(clippy::too_many_arguments)]
 fn threads(
     state: &Entity<AppState>,
     app: &AppState,
@@ -457,6 +513,7 @@ fn threads(
     matching: &[usize],
     query: &ThreadQuery,
     interactive: bool,
+    open_menu: Option<&str>,
 ) -> AnyElement {
     let theme = global::current();
     let project_id = record.project.as_ref().map_or_else(Uuid::nil, |p| p.id);
@@ -473,17 +530,17 @@ fn threads(
         // to say where its history was.
         let archived = listed.archived.len();
         let column = column.child(
-            div()
+            utility_row(None)
                 .debug_selector(move || format!("sidebar-no-threads:{project_id}"))
-                .pl(px_len(Spacing::XXL))
-                .py(px_len(Spacing::SM))
-                .fx_caption()
-                .text_color(Colors::fg_tertiary(&theme))
-                .child(if archived == 0 {
-                    "No threads yet"
-                } else {
-                    "No open threads"
-                }),
+                .h(px(THREAD_ROW_HEIGHT))
+                .child(utility_label(
+                    if archived == 0 {
+                        "No threads yet"
+                    } else {
+                        "No open threads"
+                    },
+                    Colors::fg_tertiary(&theme),
+                )),
         );
         if archived == 0 {
             return column.into_any_element();
@@ -495,24 +552,24 @@ fn threads(
     if matching.is_empty() {
         return column
             .child(
-                div()
+                utility_row(None)
                     .debug_selector(move || format!("sidebar-no-matches:{project_id}"))
-                    .flex()
-                    .flex_col()
-                    .gap(px_len(Spacing::XXXS))
-                    .pl(px_len(Spacing::XXL))
-                    .py(px_len(Spacing::SM))
+                    .py(px_len(Spacing::XS))
                     .child(
                         div()
-                            .fx_role(TextRole::CaptionMedium)
-                            .text_color(Colors::fg_secondary(&theme))
-                            .child("No matching threads"),
-                    )
-                    .child(
-                        div()
-                            .fx_caption()
-                            .text_color(Colors::fg_tertiary(&theme))
-                            .child("Try a title, prompt, or provider."),
+                            .flex_1()
+                            .min_w_0()
+                            .flex()
+                            .flex_col()
+                            .gap(px_len(Spacing::XXXS))
+                            .child(utility_label(
+                                "No matching threads",
+                                Colors::fg_secondary(&theme),
+                            ))
+                            .child(utility_label(
+                                "Try a title, prompt, or provider.",
+                                Colors::fg_tertiary(&theme),
+                            )),
                     ),
             )
             .into_any_element();
@@ -534,6 +591,7 @@ fn threads(
             Some(agent.id) == active_agent,
             listed.unseen.contains(&agent.id),
             interactive,
+            open_menu,
         ));
     }
     if remaining > 0 {
@@ -579,41 +637,34 @@ pub(crate) fn sync_detail(warnings: &[String]) -> String {
 /// The row under "No open threads" that opens the archive.
 fn archived_row(project_id: Uuid, archived: usize, interactive: bool) -> AnyElement {
     let theme = global::current();
-    div()
-        .id(SharedString::from(format!(
-            "show-archived-threads:{project_id}"
-        )))
-        .debug_selector(move || format!("sidebar-show-archived:{project_id}"))
-        .h(px(THREAD_ROW_HEIGHT))
-        .flex_shrink_0()
-        .flex()
-        .items_center()
-        .pl(px_len(Spacing::XXL))
-        .pr(px_len(Spacing::SM))
-        .cursor_pointer()
-        .rounded(px_len(Radii::SM))
-        .hover(|s| s.fx_background(Colors::bg_hover(&theme)))
-        .on_click(move |_, window, cx| {
-            if interactive {
-                window.dispatch_action(Box::new(crate::commands::ShowArchivedChats), cx);
-            }
-        })
-        .child(
-            div()
-                .flex_1()
-                .min_w_0()
-                .overflow_hidden()
-                .whitespace_nowrap()
-                .text_ellipsis()
-                .fx_role(TextRole::CaptionMedium)
-                .text_color(Colors::fg_secondary(&theme))
-                .child(SharedString::from(if archived == 1 {
-                    "Show 1 archived thread…".to_owned()
-                } else {
-                    format!("Show {archived} archived threads…")
-                })),
-        )
-        .into_any_element()
+    utility_row(Some(Icon::ARCHIVEBOX.render(
+        IconSize::Small,
+        Colors::fg_tertiary(&theme),
+        &theme,
+    )))
+    .id(SharedString::from(format!(
+        "show-archived-threads:{project_id}"
+    )))
+    .debug_selector(move || format!("sidebar-show-archived:{project_id}"))
+    .h(px(THREAD_ROW_HEIGHT))
+    .flex_shrink_0()
+    .cursor_pointer()
+    .rounded(px_len(Radii::SM))
+    .hover(|s| s.fx_background(Colors::bg_hover(&theme)))
+    .on_click(move |_, window, cx| {
+        if interactive {
+            window.dispatch_action(Box::new(crate::commands::ShowArchivedChats), cx);
+        }
+    })
+    .child(utility_label(
+        if archived == 1 {
+            "Show 1 archived thread…".to_owned()
+        } else {
+            format!("Show {archived} archived threads…")
+        },
+        Colors::fg_secondary(&theme),
+    ))
+    .into_any_element()
 }
 
 /// The listed threads matching `query`, per project record, as positions in
@@ -833,67 +884,49 @@ fn show_more_row(
     interactive: bool,
 ) -> AnyElement {
     let theme = global::current();
-    div()
-        .id(SharedString::from(format!(
-            "show-more-threads:{project_id}"
-        )))
-        .debug_selector(move || format!("sidebar-show-more:{project_id}"))
-        .h(px(THREAD_ROW_HEIGHT))
-        .flex_shrink_0()
-        .flex()
-        .items_center()
-        .gap(px_len(Spacing::SM))
-        // A thread row's insets, so the label starts where titles do.
-        .pl(px_len(Spacing::SM))
-        .pr(px_len(Spacing::SM))
-        .cursor_pointer()
-        .rounded(px_len(Radii::SM))
-        .hover(|s| s.fx_background(Colors::bg_hover(&theme)))
-        .on_click(move |_, _, cx| {
-            if !interactive {
-                return;
-            }
-            state.update(cx, |state, cx| {
-                state.sidebar.show_more(project_id, &query);
-                cx.notify();
-            });
-        })
-        .child(
-            // As wide as a row's status tile.
-            div()
-                .w(px_len(Spacing::XL))
-                .flex_shrink_0()
-                .flex()
-                .justify_center()
-                .child(Icon::CHEVRON_DOWN.render(
-                    IconSize::Micro,
-                    Colors::fg_tertiary(&theme),
-                    &theme,
-                )),
+    utility_row(Some(Icon::CHEVRON_DOWN.render(
+        IconSize::Micro,
+        Colors::fg_tertiary(&theme),
+        &theme,
+    )))
+    .id(SharedString::from(format!(
+        "show-more-threads:{project_id}"
+    )))
+    .debug_selector(move || format!("sidebar-show-more:{project_id}"))
+    .h(px(THREAD_ROW_HEIGHT))
+    .flex_shrink_0()
+    .pr(px_len(Spacing::SM))
+    .cursor_pointer()
+    .rounded(px_len(Radii::SM))
+    .hover(|s| s.fx_background(Colors::bg_hover(&theme)))
+    .on_click(move |_, _, cx| {
+        if !interactive {
+            return;
+        }
+        state.update(cx, |state, cx| {
+            state.sidebar.show_more(project_id, &query);
+            cx.notify();
+        });
+    })
+    .child(
+        utility_label(
+            format!("Show {} more", remaining.min(THREAD_PAGE)),
+            Colors::fg_secondary(&theme),
         )
-        .child(
-            div()
-                .flex_1()
-                .min_w_0()
-                .whitespace_nowrap()
-                .fx_role(TextRole::CaptionMedium)
-                .text_color(Colors::fg_secondary(&theme))
-                .child(SharedString::from(format!(
-                    "Show {} more",
-                    remaining.min(THREAD_PAGE)
-                ))),
-        )
-        .child(
-            div()
-                .flex_shrink_0()
-                .whitespace_nowrap()
-                .fx_role(TextRole::MonoSmall)
-                .text_color(Colors::fg_tertiary(&theme))
-                .child(SharedString::from(format!("{remaining} remaining"))),
-        )
-        .into_any_element()
+        .debug_selector(|| "sidebar-show-more-label".into()),
+    )
+    .child(
+        div()
+            .flex_shrink_0()
+            .whitespace_nowrap()
+            .fx_role(TextRole::MonoSmall)
+            .text_color(Colors::fg_tertiary(&theme))
+            .child(SharedString::from(format!("{remaining} remaining"))),
+    )
+    .into_any_element()
 }
 
+#[allow(clippy::too_many_arguments)]
 fn thread_row(
     state: &Entity<AppState>,
     app: &AppState,
@@ -902,6 +935,7 @@ fn thread_row(
     selected: bool,
     unseen: bool,
     interactive: bool,
+    open_menu: Option<&str>,
 ) -> AnyElement {
     let theme = global::current();
     let agent_id = agent.id;
@@ -933,9 +967,11 @@ fn thread_row(
     let context_menu = menu.clone();
     let registry = app.context_registry.clone();
     let state = state.clone();
+    let pinned = selected || open_menu == Some(format!("thread:{agent_id}").as_str());
 
     let row = div()
         .id(SharedString::from(format!("thread:{agent_id}")))
+        .group(ROW_GROUP)
         .debug_selector(move || format!("sidebar-thread:{agent_id}"))
         .h(px(THREAD_ROW_HEIGHT))
         .flex_shrink_0()
@@ -981,7 +1017,7 @@ fn thread_row(
                 .overflow_hidden()
                 .whitespace_nowrap()
                 .text_ellipsis()
-                .fx_caption()
+                .fx_role(THREAD_TITLE_ROLE)
                 .text_color(if selected || unseen {
                     Colors::fg(&theme)
                 } else {
@@ -1001,24 +1037,28 @@ fn thread_row(
                     .bg(Colors::accent(&theme)),
             )
         })
-        .child(icon_button(
-            IconButtonProps::new(Icon::ELLIPSIS, "Thread actions")
-                .small()
-                .ghost()
-                .enabled(interactive),
-            move |event, _, cx| {
-                cx.stop_propagation();
-                let layer = state.read(cx).menu_layer.clone();
-                layer.update(cx, |layer, cx| {
-                    let owner = format!("thread:{agent_id}");
-                    if layer.is_owner(&owner) {
-                        layer.dismiss();
-                    } else {
-                        layer.open_at(menu.clone(), owner, event.position());
-                    }
-                    cx.notify();
-                });
-            },
+        .child(revealed_on_hover(
+            icon_button(
+                IconButtonProps::new(Icon::ELLIPSIS, "Thread actions")
+                    .small()
+                    .ghost()
+                    .enabled(interactive),
+                move |event, _, cx| {
+                    cx.stop_propagation();
+                    let layer = state.read(cx).menu_layer.clone();
+                    layer.update(cx, |layer, cx| {
+                        let owner = format!("thread:{agent_id}");
+                        if layer.is_owner(&owner) {
+                            layer.dismiss();
+                        } else {
+                            layer.open_at(menu.clone(), owner, event.position());
+                        }
+                        cx.notify();
+                    });
+                },
+            ),
+            ROW_GROUP,
+            pinned,
         ));
     if !interactive {
         return row.into_any_element();
@@ -1558,6 +1598,23 @@ mod tests {
         assert!(toggle.left() >= px(crate::TRAFFIC_LIGHT_GUTTER));
         let title = visual.debug_bounds("workspace-title").unwrap();
         assert!(title.left() < px(Layout::SIDEBAR_WIDTH));
+    }
+
+    #[test]
+    fn utility_rows_start_where_thread_titles_do_in_the_same_role() {
+        // "Show more" sat 12pt left of the titles and the archive row 24pt
+        // in, both a weight heavier than the titles they sit among.
+        let temp = tempfile::tempdir().unwrap();
+        let mut test = TestAppContext::single();
+        let (state, _) = seeded(&mut test, AppPaths::at(temp.path()), THREAD_PAGE + 3, false);
+        let for_view = state.clone();
+        let window = test.add_window(move |_, _| SidebarProbe(for_view));
+        test.refresh().unwrap();
+        let mut visual = VisualTestContext::from_window(window.into(), &test);
+        let title = visual.debug_bounds("sidebar-thread-title").unwrap();
+        let more = visual.debug_bounds("sidebar-show-more-label").unwrap();
+        assert_eq!(more.left(), title.left());
+        assert_eq!(more.size.height, title.size.height, "one role, one line");
     }
 
     #[test]

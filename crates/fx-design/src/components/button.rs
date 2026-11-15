@@ -902,10 +902,49 @@ pub fn choice_row(
         .child(labels)
 }
 
+/// A row's trailing control that shows only while the row is hovered, or
+/// always while `pinned`: the row is selected, or the control's menu is open.
+///
+/// Drawn transparent rather than hidden. GPUI registers no hitbox for a
+/// hidden element, and the control has to stay where it is: the pointer
+/// reaches it by hovering the row, which is what shows it, and a menu or
+/// shortcut that names it still finds it. The row names itself with
+/// `.group(group)`.
+pub fn revealed_on_hover(
+    control: gpui::Stateful<gpui::Div>,
+    group: impl Into<SharedString>,
+    pinned: bool,
+) -> gpui::Stateful<gpui::Div> {
+    if pinned {
+        return control;
+    }
+    control
+        .opacity(0.0)
+        .group_hover(group, |s: StyleRefinement| s.fx_opacity(1.0))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::theme::{AccentColor, AppearanceMode, BaseTone, Theme};
+
+    #[test]
+    fn a_row_control_shows_on_hover_and_stays_while_pinned() {
+        let control = || {
+            icon_button(
+                IconButtonProps::new(Icon::ELLIPSIS, "Actions"),
+                |_, _, _| {},
+            )
+        };
+        let mut resting = revealed_on_hover(control(), "row", false);
+        assert_eq!(resting.style().opacity, Some(0.0), "unseen at rest");
+        assert!(
+            resting.style().visibility.is_none(),
+            "transparent, never hidden, so the hit target stays"
+        );
+        let mut pinned = revealed_on_hover(control(), "row", true);
+        assert_ne!(pinned.style().opacity, Some(0.0), "a pinned control shows");
+    }
 
     fn themes() -> Vec<Theme> {
         let mut out = Vec::new();

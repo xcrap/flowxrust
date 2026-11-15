@@ -60,7 +60,7 @@ pub use button::{
     ButtonPalette, ButtonStyle, ICON_BUTTON_SIZE, IconButtonProps, IconButtonVariant, button,
     button_palette, button_with_icon, choice_row, choice_row_fill, choice_row_focus_ring,
     compact_action_button, compact_action_palette, compact_action_toggle, glyph_button,
-    icon_button, icon_button_palette, navigation_button, navigation_palette,
+    icon_button, icon_button_palette, navigation_button, navigation_palette, revealed_on_hover,
 };
 pub use checkbox::{CheckboxPalette, checkbox, checkbox_palette};
 pub use checklist::{
