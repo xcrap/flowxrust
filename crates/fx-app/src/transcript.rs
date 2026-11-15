@@ -72,8 +72,8 @@ use fx_design::components::surface::banner;
 use fx_design::components::{
     BadgeTone, ButtonStyle, ChecklistMark, DividerAxis, MenuItem, MenuModel, MenuSection,
     StatusGlyph, badge, button, card, checklist, checklist_row, compact_action_button,
-    context_region, divider_with_axis, empty_state, panel, spinner_arc, status_glyph,
-    typing_indicator,
+    context_region, divider_with_axis, empty_state, empty_state_glyph, panel, spinner_arc,
+    status_glyph, typing_indicator,
 };
 use fx_design::icon::Icon;
 use fx_design::styled::{FxRefinement, FxStyled, px_len};
@@ -3602,18 +3602,13 @@ fn failure_key(group: &ActivityGroup<'_>, position: usize) -> SharedString {
 ///
 /// A blank column is indistinguishable from a transcript that failed to load.
 fn empty_transcript_notice() -> AnyElement {
-    let theme = global::current();
     div()
         .debug_selector(|| EMPTY_SELECTOR.to_string())
         .w_full()
         .min_w_0()
         .text_center()
         .child(empty_state(
-            Icon::BUBBLE_LEFT_AND_BUBBLE_RIGHT.render(
-                IconSize::Illustration,
-                Colors::fg_tertiary(&theme),
-                &theme,
-            ),
+            empty_state_glyph(Icon::BUBBLE_LEFT_AND_BUBBLE_RIGHT),
             "Start a conversation",
             "Ask a question, explore an idea, or start building.",
         ))

@@ -24,14 +24,12 @@
 
 use std::path::{Path, PathBuf};
 
-use fx_design::components::surface::banner;
 use fx_design::components::{
-    BadgeTone, ButtonStyle, DialogAction, DialogClose, DialogHeader, DialogWidth, badge,
-    cycle_focus, dialog, dialog_body, dialog_button, dialog_footer, dialog_scrim,
+    BadgeTone, ButtonStyle, DialogAction, DialogClose, DialogHeader, DialogWidth, NoticeTone,
+    badge, cycle_focus, dialog, dialog_body, dialog_button, dialog_footer, dialog_scrim, notice,
 };
-use fx_design::icon::Icon;
 use fx_design::styled::{FxStyled, px_len};
-use fx_design::theme::{Colors, IconSize, Spacing, TextRole, Theme, global};
+use fx_design::theme::{Colors, Spacing, TextRole, Theme, global};
 use gpui::prelude::*;
 use gpui::{
     AnyElement, App, Context, Entity, FocusHandle, KeyDownEvent, MouseButton, Render, SharedString,
@@ -571,11 +569,7 @@ impl ProjectPicker {
                             .child("Browse for a folder or enter its full path. Git repositories are detected automatically."),
                     )
                     .when_some(self.browse_error.as_ref(), |body, error| {
-                        body.child(banner(
-                            Colors::error_muted(theme),
-                            Colors::fg(theme),
-                            div().fx_caption().child(SharedString::from(error.clone())),
-                        ))
+                        body.child(notice(NoticeTone::Error, error.clone()))
                     })
                     .child(self.verdict_row(theme)),
             )
@@ -590,31 +584,7 @@ impl ProjectPicker {
     fn verdict_row(&self, theme: &Theme) -> AnyElement {
         match &self.verdict {
             Some(Ok(candidate)) => candidate_row(candidate, self.is_already_open(), theme),
-            Some(Err(error)) => banner(
-                Colors::error_muted(theme),
-                // `fg` rather than `error`: the invariant is that `fg` clears
-                // 4.5:1 on every `*_muted` fill, and the tint already carries
-                // the tone.
-                Colors::fg(theme),
-                div()
-                    .flex()
-                    .flex_row()
-                    .items_start()
-                    .gap(px_len(Spacing::SM))
-                    .child(Icon::EXCLAMATIONMARK_TRIANGLE_FILL.render(
-                        IconSize::Small,
-                        Colors::error(theme),
-                        theme,
-                    ))
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .fx_caption()
-                            .child(SharedString::from(error.to_string())),
-                    ),
-            )
-            .into_any_element(),
+            Some(Err(error)) => notice(NoticeTone::Error, error.to_string()).into_any_element(),
             // Nothing typed, so nothing to say. The space is not reserved: a
             // sheet that grows a line the moment it opens moves the field out
             // from under the caret.

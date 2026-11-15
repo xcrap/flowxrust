@@ -53,7 +53,7 @@ pub use fx_design::icon::IconAssets;
 use fx_core::Agent;
 use fx_design::components::{MenuItem, MenuLayer, MenuModel, MenuSection};
 use fx_design::icon::Icon;
-use fx_design::styled::{FxStyled, px_len};
+use fx_design::styled::px_len;
 use fx_design::theme::animation::PanelTransition;
 use fx_design::theme::{Colors, Layout, Spacing, global};
 use gpui::AnyView;
@@ -1051,11 +1051,23 @@ fn center_column(
             }),
         )
         .children(state.read(cx).last_error.clone().map(|error| {
-            fx_design::components::surface::banner(
-                Colors::error_muted(&theme),
-                Colors::fg(&theme),
-                div().fx_caption().child(SharedString::from(error)),
-            )
+            let for_dismiss = state.clone();
+            div()
+                .debug_selector(|| "workspace-error".into())
+                .flex_shrink_0()
+                .px(px_len(Spacing::MD))
+                .pt(px_len(Spacing::SM))
+                .child(fx_design::components::dismissible_notice(
+                    fx_design::components::NoticeTone::Error,
+                    error,
+                    "Dismiss error",
+                    move |_, cx| {
+                        for_dismiss.update(cx, |state, cx| {
+                            state.last_error = None;
+                            cx.notify();
+                        });
+                    },
+                ))
         }))
         .child(if loading_history {
             div()
@@ -1066,10 +1078,8 @@ fn center_column(
                 .justify_center()
                 .p(px_len(Spacing::XXL))
                 .child(fx_design::components::empty_state(
-                    Icon::ARROW_CLOCKWISE.render(
-                        fx_design::theme::IconSize::Large,
-                        Colors::fg_tertiary(&theme),
-                        &theme,
+                    fx_design::components::empty_state_slot(
+                        fx_design::components::loading_spinner("loading-history"),
                     ),
                     "Loading conversation history…",
                     "Reading the saved conversation from its provider.",
@@ -1092,10 +1102,8 @@ fn center_column(
                     .justify_center()
                     .p(px_len(Spacing::XXL))
                     .child(fx_design::components::empty_state(
-                        Icon::BUBBLE_LEFT_AND_BUBBLE_RIGHT.render(
-                            fx_design::theme::IconSize::Large,
-                            Colors::fg_tertiary(&theme),
-                            &theme,
+                        fx_design::components::empty_state_slot(
+                            fx_design::components::loading_spinner("loading-thread"),
                         ),
                         "Loading this thread…",
                         "Its history is read the first time it is shown.",
@@ -1115,11 +1123,7 @@ fn center_column(
                 .gap(px_len(Spacing::LG))
                 .p(px_len(Spacing::XXL))
                 .child(fx_design::components::empty_state(
-                    Icon::FOLDER.render(
-                        fx_design::theme::IconSize::Hero,
-                        Colors::fg_tertiary(&theme),
-                        &theme,
-                    ),
+                    fx_design::components::empty_state_glyph(Icon::FOLDER),
                     if has_project {
                         "Start a conversation"
                     } else {
@@ -2116,6 +2120,26 @@ mod tests {
         window
             .update(&mut test, |_window, _entity, _cx| {})
             .expect("the window is still alive");
+    }
+
+    #[test]
+    fn the_workspace_error_carries_its_glyph_and_a_dismiss_button() {
+        let mut test = gpui::TestAppContext::single();
+        let (_dir, state) = test.update(seeded);
+        test.update(|cx| {
+            state.update(cx, |state, _| {
+                state.last_error = Some("The workspace could not be saved.".into());
+            })
+        });
+        let for_window = state.clone();
+        let window = test.add_window(move |_, _| FlowX::new(for_window));
+        let mut visual = gpui::VisualTestContext::from_window(window.into(), &test);
+        test.refresh().unwrap();
+        let banner = visual.debug_bounds("workspace-error").unwrap();
+        let dismiss = visual.debug_bounds("icon-button:Dismiss error").unwrap();
+        assert!(banner.contains(&dismiss.center()));
+        visual.simulate_click(dismiss.center(), Default::default());
+        test.read(|cx| assert_eq!(state.read(cx).last_error, None));
     }
 
     #[test]
@@ -3248,6 +3272,10 @@ mod tests {
         // GPUI 0.2.2 never clears a frame's debug bounds, so a selector seen
         // once stays found; only a first appearance proves a repaint.
         assert!(visual.debug_bounds("transcript-loading").is_some());
+        assert!(
+            visual.debug_bounds("loading-spinner").is_some(),
+            "a load in progress turns a spinner, not a still arrow"
+        );
         assert!(visual.debug_bounds("transcript.user").is_none());
 
         test.run_until_parked();

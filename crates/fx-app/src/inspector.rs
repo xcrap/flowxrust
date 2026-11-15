@@ -373,7 +373,6 @@ fn split_file_path(path: &str) -> (&str, &str) {
 }
 
 fn inspector_empty(icon: Icon, title: &str, hint: &str) -> AnyElement {
-    let theme = global::current();
     div()
         .flex_1()
         .min_h_0()
@@ -382,7 +381,7 @@ fn inspector_empty(icon: Icon, title: &str, hint: &str) -> AnyElement {
         .justify_center()
         .p(px_len(Spacing::MD))
         .child(fx_design::components::empty_state(
-            icon.render(IconSize::Illustration, Colors::fg_tertiary(&theme), &theme),
+            fx_design::components::empty_state_glyph(icon),
             SharedString::from(title.to_string()),
             SharedString::from(hint.to_string()),
         ))
@@ -397,6 +396,24 @@ fn note_ink(error: bool, theme: &fx_design::theme::Theme) -> gpui::Rgba {
     } else {
         Colors::fg_secondary(theme)
     }
+}
+
+/// A note for work under way, with the spinner before it.
+fn loading_note(text: &str) -> AnyElement {
+    let theme = global::current();
+    div()
+        .debug_selector(|| "inspector-loading".into())
+        .flex_shrink_0()
+        .flex()
+        .items_center()
+        .gap(px_len(Spacing::SM))
+        .px(px_len(Spacing::MD))
+        .py(px_len(Spacing::SM))
+        .fx_caption()
+        .text_color(Colors::fg_secondary(&theme))
+        .child(fx_design::components::loading_spinner("inspector-loading"))
+        .child(SharedString::from(text.to_string()))
+        .into_any_element()
 }
 
 fn note(text: &str, error: bool) -> AnyElement {

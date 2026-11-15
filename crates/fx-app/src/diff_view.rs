@@ -34,7 +34,7 @@ use gpui::{
 };
 
 use super::repository::{self, ComparisonMode, DiffDocument};
-use super::{Inspector, inspector_empty, note, split_file_path};
+use super::{Inspector, inspector_empty, loading_note, note, split_file_path};
 
 /// SF Mono's advance is 0.6 em; the extra hundredth absorbs rounding so a
 /// line number never clips.
@@ -930,14 +930,11 @@ impl Inspector {
         }
         let Some(document) = &self.diff.document else {
             return body
-                .child(note(
-                    if self.diff.loading.is_some() {
-                        "Loading diff…"
-                    } else {
-                        "Diff unavailable. Use Refresh to retry."
-                    },
-                    false,
-                ))
+                .child(if self.diff.loading.is_some() {
+                    loading_note("Loading diff…")
+                } else {
+                    note("Diff unavailable. Use Refresh to retry.", false)
+                })
                 .into_any_element();
         };
         if let Some(notice) = &document.notice {

@@ -190,11 +190,7 @@ fn body(state: Entity<AppState>, cx: &mut App) -> AnyElement {
             .items_center()
             .p(px_len(Spacing::LG))
             .child(empty_state(
-                Icon::FOLDER.render(
-                    fx_design::theme::IconSize::Large,
-                    Colors::fg_tertiary(&theme),
-                    &theme,
-                ),
+                fx_design::components::empty_state_glyph(Icon::FOLDER),
                 "No projects yet",
                 "Add a folder to keep its threads together.",
             ))
@@ -271,15 +267,19 @@ fn body(state: Entity<AppState>, cx: &mut App) -> AnyElement {
                 };
                 let retry_state = state.clone();
                 let failed = !detail.is_empty();
-                let leading = failed.then(|| {
+                // A wait has the spinner, a failure its warning.
+                let leading = if failed {
                     Icon::EXCLAMATIONMARK_TRIANGLE_FILL.render(
                         IconSize::Small,
                         Colors::warning_ink(&theme),
                         &theme,
                     )
-                });
+                } else {
+                    fx_design::components::loading_spinner(format!("native-sync-spinner:{id}"))
+                        .into_any_element()
+                };
                 content = content.child(
-                    utility_row(leading)
+                    utility_row(Some(leading))
                         .debug_selector(move || format!("native-sync-status:{id}"))
                         .min_h(px(THREAD_ROW_HEIGHT))
                         .child(

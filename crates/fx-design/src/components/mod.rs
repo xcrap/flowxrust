@@ -13,6 +13,7 @@ pub mod collapsible;
 pub mod context_menu;
 pub mod context_meter;
 pub mod dialog;
+pub mod loading;
 pub mod menu;
 pub mod menu_model;
 pub mod palette;
@@ -66,6 +67,7 @@ pub use checkbox::{CheckboxPalette, checkbox, checkbox_palette};
 pub use checklist::{
     ChecklistInk, ChecklistMark, checklist, checklist_ink, checklist_row, checklist_surface,
 };
+pub use loading::{loading_spinner, spin_angle};
 pub use segmented::{
     SegmentPalette, SegmentedOption, segment_palette, segmented_control, segmented_track,
 };
@@ -80,8 +82,10 @@ pub use status::{
     status_glyph_ink, typing_indicator,
 };
 pub use surface::{
-    DividerAxis, FloatingPalette, card, card_default, divider, divider_with_axis, empty_state,
-    floating, floating_palette, floating_scroll, inline_notice, list_row_fill, panel, path_label,
-    section_divider, section_header, split_path, titlebar_control, window_title,
+    DividerAxis, EMPTY_STATE_ICON, FloatingPalette, NoticePalette, NoticeTone, card, card_default,
+    dismissible_notice, divider, divider_with_axis, empty_state, empty_state_glyph,
+    empty_state_slot, floating, floating_palette, floating_scroll, inline_notice, list_row_fill,
+    notice, notice_palette, panel, path_label, section_divider, section_header, split_path,
+    titlebar_control, window_title,
 };
 pub use tooltip::tooltip;

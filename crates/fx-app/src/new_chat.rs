@@ -3,8 +3,8 @@
 use crate::{AppState, text_field::TextField, workspace_ui};
 use fx_core::AgentConfiguration;
 use fx_design::components::{
-    ButtonStyle, DialogAction, DialogClose, DialogHeader, DialogWidth, choice_row, cycle_focus,
-    dialog, dialog_body, dialog_footer, dialog_scrim,
+    ButtonStyle, DialogAction, DialogClose, DialogHeader, DialogWidth, NoticeTone, choice_row,
+    cycle_focus, dialog, dialog_body, dialog_footer, dialog_scrim, notice,
 };
 use fx_design::styled::{FxStyled, px_len};
 use fx_design::theme::{Colors, Spacing, global};
@@ -220,9 +220,11 @@ impl Render for NewChat {
                     .child(div().fx_caption().text_color(Colors::fg_secondary(&theme))
                         .child("Archiving or deleting a chat keeps its worktree and branch."))
             }))
-            .children(self.error.clone().map(|error| {
-                div().fx_caption().text_color(Colors::fg(&theme)).child(error)
-            }));
+            .children(
+                self.error
+                    .clone()
+                    .map(|error| notice(NoticeTone::Error, error)),
+            );
         let can_confirm =
             !self.creating && (!self.worktree || !self.branch.read(cx).value().trim().is_empty());
         let this = cx.entity();

@@ -1,8 +1,8 @@
 //! Thread-scoped rename and deletion dialogs.
 
 use fx_design::components::{
-    ButtonStyle, DialogAction, DialogClose, DialogHeader, DialogWidth, cycle_focus, dialog,
-    dialog_body, dialog_footer, dialog_scrim,
+    ButtonStyle, DialogAction, DialogClose, DialogHeader, DialogWidth, NoticeTone, cycle_focus,
+    dialog, dialog_body, dialog_footer, dialog_scrim, notice,
 };
 use fx_design::styled::FxStyled;
 use fx_design::theme::{Colors, global};
@@ -162,12 +162,7 @@ impl Render for ThreadDialog {
             body = body.child(self.field.clone());
         }
         if let Some(error) = &self.error {
-            body = body.child(
-                div()
-                    .fx_caption()
-                    .text_color(Colors::fg(&theme))
-                    .child(error.clone()),
-            );
+            body = body.child(notice(NoticeTone::Error, error.clone()));
         }
         let (cancel, confirm, close) = (this.clone(), this.clone(), this.clone());
         let header = DialogHeader::new(if deleting {

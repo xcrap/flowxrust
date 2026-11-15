@@ -1,13 +1,18 @@
 //! Surfaces and separators: cards, dividers, and the flat panel look.
 
 use gpui::{
-    InteractiveElement, IntoElement, MouseButton, ParentElement, StatefulInteractiveElement,
-    Styled, StyledText, div,
+    App, InteractiveElement, IntoElement, MouseButton, ParentElement, StatefulInteractiveElement,
+    Styled, StyledText, Window, div,
 };
 
+use super::button::{IconButtonProps, icon_button};
 use super::rich_text::{InlineSpan, InlineStyle, inline_run};
+use crate::icon::Icon;
 use crate::styled::{FxStyled, px_len};
-use crate::theme::{BorderWidth, Colors, Radii, Shadow, Spacing, TextRole, Theme, global};
+use crate::theme::{
+    BorderWidth, Colors, IconSize, NON_TEXT_FLOOR, Radii, Shadow, Spacing, TextRole, Theme,
+    Typography, composite, global, legible_or,
+};
 
 /// Which way a divider runs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -123,6 +128,31 @@ pub fn floating_palette(theme: &crate::theme::Theme) -> FloatingPalette {
     }
 }
 
+/// The one size an empty state's glyph is drawn at, whatever is empty: the
+/// window, the sidebar, a transcript or the inspector. They were drawn at
+/// 18, 22 and 44pt.
+pub const EMPTY_STATE_ICON: IconSize = IconSize::Illustration;
+
+/// An empty state's leading slot, a square of [`EMPTY_STATE_ICON`]'s size,
+/// so a spinner in place of a glyph leaves the title where it was.
+pub fn empty_state_slot(content: impl IntoElement) -> gpui::Div {
+    let edge = Typography::icon(EMPTY_STATE_ICON, &global::current()).size;
+    div()
+        .debug_selector(|| "empty-state-glyph".into())
+        .size(px_len(edge))
+        .flex_shrink_0()
+        .flex()
+        .items_center()
+        .justify_center()
+        .child(content)
+}
+
+/// An empty state's glyph, muted, at [`EMPTY_STATE_ICON`].
+pub fn empty_state_glyph(icon: Icon) -> gpui::Div {
+    let theme = global::current();
+    empty_state_slot(icon.render(EMPTY_STATE_ICON, Colors::fg_tertiary(&theme), &theme))
+}
+
 /// An empty-state block: a large muted glyph, a title, and a hint.
 pub fn empty_state(
     icon: impl IntoElement,
@@ -172,6 +202,147 @@ pub fn banner(tint: gpui::Rgba, ink: gpui::Rgba, content: impl IntoElement) -> i
         // pass the hue once.
         .text_color(ink)
         .child(content)
+}
+
+/// What a notice is about.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NoticeTone {
+    Error,
+    Warning,
+    Info,
+}
+
+impl NoticeTone {
+    pub const ALL: [Self; 3] = [Self::Error, Self::Warning, Self::Info];
+
+    fn icon(self) -> Icon {
+        match self {
+            Self::Error | Self::Warning => Icon::EXCLAMATIONMARK_TRIANGLE_FILL,
+            Self::Info => Icon::EXCLAMATIONMARK_CIRCLE_FILL,
+        }
+    }
+}
+
+/// How a notice is painted.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct NoticePalette {
+    /// The tone's tint.
+    pub fill: gpui::Rgba,
+    /// The message: `fg`, which clears AA on every tint.
+    pub text: gpui::Rgba,
+    /// The glyph that carries the tone.
+    pub glyph: gpui::Rgba,
+}
+
+/// A notice's colours.
+///
+/// The glyph is the tone's hue where it clears 3:1 on its own tint over
+/// every surface a notice sits on, the deeper ink where that does, and `fg`
+/// where neither does: light-mode `warning` is 2.3:1 on its tint.
+pub fn notice_palette(tone: NoticeTone, theme: &Theme) -> NoticePalette {
+    let (fill, hue, ink) = match tone {
+        NoticeTone::Error => (
+            Colors::error_muted(theme),
+            Colors::error(theme),
+            Colors::error_ink(theme),
+        ),
+        NoticeTone::Warning => (
+            Colors::warning_muted(theme),
+            Colors::warning(theme),
+            Colors::warning_ink(theme),
+        ),
+        NoticeTone::Info => (
+            Colors::info_muted(theme),
+            Colors::info(theme),
+            Colors::info(theme),
+        ),
+    };
+    let fills = [
+        Colors::bg(theme),
+        Colors::bg_elevated(theme),
+        Colors::bg_surface(theme),
+    ]
+    .map(|surface| composite(fill, surface));
+    let fg = Colors::fg(theme);
+    NoticePalette {
+        fill,
+        text: fg,
+        glyph: legible_or(
+            hue,
+            legible_or(ink, fg, &fills, NON_TEXT_FLOOR),
+            &fills,
+            NON_TEXT_FLOOR,
+        ),
+    }
+}
+
+/// A banner that says what happened: the tone's glyph, then the message.
+pub fn notice(tone: NoticeTone, message: impl Into<gpui::SharedString>) -> gpui::Div {
+    notice_body(tone, message.into(), None)
+}
+
+/// A notice the reader can clear, with a ghost button labelled `label` at
+/// its trailing edge.
+pub fn dismissible_notice(
+    tone: NoticeTone,
+    message: impl Into<gpui::SharedString>,
+    label: impl Into<gpui::SharedString>,
+    on_dismiss: impl Fn(&mut Window, &mut App) + 'static,
+) -> gpui::Div {
+    notice_body(
+        tone,
+        message.into(),
+        Some((label.into(), Box::new(on_dismiss))),
+    )
+}
+
+type Dismiss = (gpui::SharedString, Box<dyn Fn(&mut Window, &mut App)>);
+
+fn notice_body(
+    tone: NoticeTone,
+    message: gpui::SharedString,
+    dismiss: Option<Dismiss>,
+) -> gpui::Div {
+    let theme = global::current();
+    let palette = notice_palette(tone, &theme);
+    div()
+        .debug_selector(|| "notice".into())
+        .w_full()
+        .min_w_0()
+        .flex()
+        .flex_row()
+        .items_start()
+        .gap(px_len(Spacing::SM))
+        .px(px_len(Spacing::MD))
+        .py(px_len(Spacing::SM))
+        .rounded(px_len(Radii::MD))
+        .bg(palette.fill)
+        .text_color(palette.text)
+        .child(
+            // On the message's first line, whatever its length.
+            div()
+                .flex_shrink_0()
+                .h(px_len(
+                    Typography::style(TextRole::Caption, &theme).size
+                        * TextRole::Caption.line_height_multiplier(),
+                ))
+                .flex()
+                .items_center()
+                .child(tone.icon().render(IconSize::Small, palette.glyph, &theme)),
+        )
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .fx_role(TextRole::Caption)
+                .child(message),
+        )
+        .children(dismiss.map(|(label, on_dismiss)| {
+            div().flex_shrink_0().child(icon_button(
+                IconButtonProps::new(Icon::XMARK, label).tiny().ghost(),
+                move |_, window, cx| on_dismiss(window, cx),
+            ))
+        }))
 }
 
 /// A single-line notice used above a panel or inside a header.
@@ -347,6 +518,54 @@ mod tests {
             style.overflow.y.is_none_or(|o| o == Overflow::Visible),
             "the panel itself scrolls"
         );
+    }
+
+    #[test]
+    fn every_notice_glyph_clears_three_to_one_on_its_own_tint() {
+        // Light-mode `warning` is 2.3:1 on its tint, under the 3:1 a glyph
+        // that carries the tone needs.
+        for tone in crate::theme::BaseTone::ALL {
+            for appearance_mode in [
+                crate::theme::AppearanceMode::Light,
+                crate::theme::AppearanceMode::Dark,
+            ] {
+                let theme = Theme {
+                    base_tone: tone,
+                    appearance_mode,
+                    ..Default::default()
+                };
+                for notice in NoticeTone::ALL {
+                    let palette = notice_palette(notice, &theme);
+                    for surface in [
+                        Colors::bg(&theme),
+                        Colors::bg_elevated(&theme),
+                        Colors::bg_surface(&theme),
+                    ] {
+                        let fill = composite(palette.fill, surface);
+                        let glyph = crate::theme::contrast(palette.glyph, fill);
+                        let text = crate::theme::contrast(palette.text, fill);
+                        assert!(
+                            glyph >= 3.0,
+                            "{tone:?} {appearance_mode:?} {notice:?}: {glyph}"
+                        );
+                        assert!(
+                            text >= 4.5,
+                            "{tone:?} {appearance_mode:?} {notice:?}: {text}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn every_empty_state_glyph_sits_in_one_slot_size() {
+        let edge = Typography::icon(EMPTY_STATE_ICON, &global::current()).size;
+        let mut glyph = empty_state_glyph(Icon::FOLDER);
+        let size = glyph.style().size.clone();
+        assert_eq!(size.width, Some(px_len(edge).into()));
+        assert_eq!(size.height, Some(px_len(edge).into()));
+        assert_eq!(EMPTY_STATE_ICON, IconSize::Illustration);
     }
 
     #[test]
