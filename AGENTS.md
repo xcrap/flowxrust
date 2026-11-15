@@ -134,7 +134,15 @@ touching any foreground, background, or accent token.
 
 All four "hue where legible, `fg` where not" rules go through
 `theme::legible_or`, given every fill the element can be drawn on — its color
-does not change when the pointer or the surface under it does.
+does not change when the pointer or the surface under it does. So do
+`error_ink`, `accent_secondary_ink` and `success_ink`, which are what text in
+those hues uses on any surface: plain `error` on `bg_surface` was 3.7:1.
+
+Keyboard focus is drawn with `Colors::focus_ring` (≥3:1 on every fill, an
+invariant) through `fx_focus_ring()`, and shows once a view calls
+`track_focus`. A hover never sets an edge colour: hover is applied after
+focus and would hide the ring. A Danger button's label is `fg` on its tint,
+as a badge's is; even `error_ink` misses 4.5:1 there.
 
 One documented shortfall, recorded rather than hidden: where a status hue is
 used as an *icon on its own tint*, light-mode `warning` bottoms out at 2.29:1
@@ -172,8 +180,8 @@ before styling a screen ad hoc.
 | `button` | Labelled button (primary/secondary/ghost/danger), icon button, compact action button (with an on/disabled variant, `compact_action_toggle`), and `glyph_button` for rows too dense for an icon button's 28 pt hit target. Hover and press are declarative `.hover`/`.active` refinements, so a button repaints without re-rendering. |
 | `checkbox` | A labelled checkbox whose whole row toggles. |
 | `checklist` | A read-only checklist: done, active (spinning while live) and pending rows on one surface. |
-| `surface` | Card, panel, divider, banner, empty state, section header. |
-| `status` | Badge, activity dot, typing indicator, pulsing dot, context-usage ring. |
+| `surface` | Card, panel, divider, banner, empty state, section header, and `floating`/`floating_scroll`: a popover's shadow, hairline edge and corner around content that may scroll. |
+| `status` | Badge, activity dot, typing indicator, context-usage ring, and `status_glyph` (running, done, failed, stopped) at one size. |
 | `segmented` | Segmented control for exclusive choices. |
 | `settings` | The preferences vocabulary: a section heading over a group card whose rows (title, description, trailing control) are split by hairlines, the navigation's group label and search field, a breadcrumb, and an on/off `switch`. |
 | `tooltip` | Hover tooltip body. |
@@ -207,8 +215,10 @@ closes on mouse-down; the panel is stacked above it.
 
 Two things are deliberately preserved from the original:
 
-- The panel is sized to its content and gets an edge rather than a shadow, since
-  a styled element shadow is clipped to the element's own bounds.
+- The panel is sized to its content, with a hairline edge and the popover
+  shadow (`floating`). GPUI 0.2.2 paints an element's shadow before its own
+  overflow mask, so a panel that scrolls keeps it; the shadow is clipped only
+  by an ancestor's mask.
 - Pointer and keyboard share one highlight, so pressing a row and then pressing
   an arrow key continues from the pointer rather than from the top of the menu.
 
@@ -449,6 +459,17 @@ first:
   before writing to it, so a zero-byte one is not a thread and not a warning.
   Any warning stops the project's deleted threads being hidden, so a
   permanent one is never free.
+
+A provider that is not installed is nothing to sync: no warning, and its
+empty listing is never proof that a thread is gone. A project root is
+resolved once a pass and compared as written and resolved, never with a
+`realpath` per thread. Claude keeps a folder beside each session, so only
+`.jsonl` files count toward the folder limit, and the summary cache, shared by
+every project, never evicts the folders being listed. A transcript over the
+history limit is still listed, from what fits under it; only importing its
+history is refused, when the thread is opened. New threads, made here or found
+by a pass, are listed first: appended, they fell below "Show more". A FlowX
+archive or restore gives way once the provider's own flag changes.
 
 Claude desktop's archive flag is mirrored, so a project worked on there can
 have every thread archived. The sidebar then says "No open threads" over a row
@@ -718,6 +739,24 @@ what "completion" means, and each rule here was a lost result first:
   when the steer went in during a tool call. Read only as user records, a
   steered thread's history never caught up with FlowX's copy.
 
+How a turn ends, around its input closing and Stop:
+
+- **The input can close at a line that is not a `result`** (a task ending
+  with nothing owed), so the exit path asks the transport whether it closed,
+  not only `BackgroundWait`. Read only from `result()`, an answered turn
+  ended as "exited before finishing" and its tree was killed.
+- **Once the input has closed, an answer that cannot be written is Claude's
+  to fail, not the turn's.**
+- **Stop interrupts first and settles steers after**; a Codex steer sent
+  before `turn/start` is acknowledged waits for the turn id rather than being
+  refused. The account's limits are read beside the turn, never before it.
+- **A stopped or failed turn ends its unanswered calls** with an error result
+  (`end_unanswered_calls`), or a settled group drew them with a green check.
+  Native sync compares prose only, so these rows never stop a history
+  matching.
+- **A `<synthetic>` reply's usage is not context**: an API error's zero usage
+  emptied the meter, live and restored.
+
 Read-only command checks for both providers go through one classifier,
 `fx-agent::shell`, which fails closed on control operators, substitutions and
 the write flags of otherwise read-only tools (`find -delete`, `sort -o`,
@@ -927,6 +966,21 @@ Three more, for what a turn shows of itself while it works:
   is not text: `as_text()` does not read it, so search, sync, previews and
   copy never see it, and `message_paragraphs` reads the caption and the open
   summary so an off-screen selection copies what the row shows.
+
+Four more, for what stays put while a turn runs:
+
+- **A disclosure key nests under its group's** (`{group}:{pos}:call`), so
+  pruning keeps any key a live group's key prefixes at a colon; keeping group
+  keys only closed an opened call row on the next message.
+- **A landed steer splits the transcript like a prompt but does not end the
+  turn**: the plan looks past `landed_steers`, so it stays live and is
+  updated in place rather than duplicated.
+- **What an open row derives is cached by its call's arguments** (the edit
+  preview), never rebuilt per frame; folding is one sweep, and a `Write`
+  builds only the lines it shows.
+- **Live output reads like a terminal**: each line is what follows its last
+  `\r`. `carry_message_ids` keys thoughts by their text and compactions by
+  their counts, so a group a thought heads keeps its key through a sync.
 
 Tool output is read from `aggregatedOutput` first, then `output`, `result`,
 `error`, `contentItems`, `changes`, `results`, `agentsStates` — that order is the
@@ -1154,7 +1208,16 @@ soon as there is no row to take, and ⌘↩ still sends. Escape closes the
 picker for that token — the state remembers the dismissed token, because the
 next repaint would otherwise reopen it — and typing on opens it again.
 
-One GPUI detail that bit the tests: an observer registered in the same
+The ranking lowercases each path once, when the listing is built, and sorts
+only the rows it shows (`MentionPaths::rank`); sorting every match per
+keystroke cost 30–58 ms at 50,000 paths. A completion that would cross the
+composer's cap is refused whole, never cut. A slash command's text comes back
+to an empty composer when the command fails, and a queued prompt that cannot
+start joins the draft after a blank line while the queue moves on.
+
+One GPUI detail that bit the tests: blur events fire only in an active
+window, so a focus test calls `activate_window()` and `run_until_parked()`.
+Another: an observer registered in the same
 update as the first `notify` it should see misses it. `cx.observe` activates
 through a deferred effect, and `notify` is deduplicated while one is pending,
 so a field created and typed into in one update merges both notifies ahead
@@ -1351,6 +1414,17 @@ Seven rules, each of which is a bug that was written first:
 A successful commit clears only the exact draft submitted. The field remains
 editable while Git runs, so edits made during a hook, including ones saved by a
 project switch, must remain available after the older commit completes.
+
+A chosen-files commit removes before it adds, because with macOS's
+`core.ignorecase` the add kept HEAD's entry for a case-only rename and the
+removal then deleted it. It adds with `--force`, so a force-added ignored file
+still commits; a plain folder now at a chosen path is a deletion, not its new
+files; and a chosen `D ` row is committed untracked, never re-added. A path
+can be listed twice (`D ` and `??` after `git rm --cached`), so counts and
+labels are per row and per side, never by path. Rename detection is per side:
+Base pairs only the renames status reported. A changed submodule's HEAD is
+part of the revision, and Refresh reads again at the same revision. Push is
+offered only when git's own `%(push)` resolves.
 
 Every Git job runs on one shared multi-thread runtime whose workers have an
 8 MiB stack. Jobs are *built* there (`spawn_git` takes a closure), because
