@@ -26,6 +26,11 @@ pulldown-cmark.workspace = true
 url.workspace = true
 unicode-segmentation.workspace = true
 
+# Only to read the Reduce Motion accessibility setting. Already in the tree
+# through GPUI's renderer; these are the two features the one call needs.
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2-app-kit = { version = "0.3.2", default-features = false, features = ["std", "NSAccessibility", "NSWorkspace"] }
+
 [dev-dependencies]
 tempfile.workspace = true
 chrono.workspace = true

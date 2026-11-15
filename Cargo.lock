@@ -2142,6 +2142,7 @@ dependencies = [
  "gpui",
  "image",
  "libc",
+ "objc2-app-kit",
  "pulldown-cmark",
  "serde_json",
  "tempfile",

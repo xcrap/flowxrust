@@ -59,6 +59,12 @@ struct Inspector {
 /// directly, so results repaint even when no conversation is busy.
 pub fn view(state: Entity<AppState>, cx: &mut App) -> AnyElement {
     let visible = state.read(cx).snapshot.right_panel_visible;
+    view_shown(state, visible, cx)
+}
+
+/// The inspector while the shell shows it, which outlasts the setting by the
+/// closing slide: a panel emptied the moment it was hidden slid shut blank.
+pub fn view_shown(state: Entity<AppState>, visible: bool, cx: &mut App) -> AnyElement {
     if !visible {
         if let Some(handle) = cx.try_global::<InspectorHandle>().cloned() {
             handle.0.update(cx, |inspector, _| inspector.active = false);

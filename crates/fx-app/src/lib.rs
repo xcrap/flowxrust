@@ -26,6 +26,7 @@ mod follow_up_settings;
 mod frame_profile;
 pub mod inspector;
 mod markdown;
+mod motion_preference;
 mod native_sync;
 mod new_chat;
 mod project_changes;
@@ -124,6 +125,10 @@ pub struct FlowX {
     resizing_sidebar: bool,
     sidebar_resize_offset: f32,
     sidebar_transition: Option<PanelTransition>,
+    inspector_transition: Option<PanelTransition>,
+    /// Where the platform's reduced-motion setting is read from: the system
+    /// in the app, and nothing a test machine happens to have set in a test.
+    reduce_motion_source: fn() -> bool,
     /// How many times the root has rendered, for tests that count rebuilds.
     #[cfg(test)]
     renders: usize,
@@ -152,6 +157,12 @@ impl FlowX {
             resizing_sidebar: false,
             sidebar_resize_offset: 0.0,
             sidebar_transition: None,
+            inspector_transition: None,
+            reduce_motion_source: if cfg!(test) {
+                || false
+            } else {
+                motion_preference::system_prefers_reduced_motion
+            },
             #[cfg(test)]
             renders: 0,
             menu_context: None,
@@ -185,6 +196,7 @@ impl FlowX {
         }
         let ui = workspace_ui::handle(cx);
         if self.subscriptions.is_empty() {
+            self.refresh_reduce_motion();
             self.subscriptions
                 .push(cx.observe(&self.state, |_, _, cx| cx.notify()));
             let menu = self.state.read(cx).menu_layer.clone();
@@ -210,6 +222,12 @@ impl FlowX {
             self.subscriptions
                 .push(cx.observe_window_activation(window, |this, window, cx| {
                     if window.is_window_active() {
+                        // Reduced motion is a System Settings switch, and the
+                        // reader is most likely to have flipped it while
+                        // FlowX was in the background.
+                        if this.refresh_reduce_motion() {
+                            cx.notify();
+                        }
                         this.state.update(cx, |state, cx| {
                             state.refresh_native_projects();
                             cx.notify();
@@ -385,6 +403,17 @@ impl FlowX {
         busy
     }
 
+    /// Read the platform's reduced-motion setting onto the theme, where every
+    /// component that moves reads it. Returns whether it changed.
+    fn refresh_reduce_motion(&self) -> bool {
+        let reduce = (self.reduce_motion_source)();
+        if global::current().reduce_motion == reduce {
+            return false;
+        }
+        global::update(|theme| theme.reduce_motion = reduce);
+        true
+    }
+
     /// Note where the window now is, and write it once it settles.
     ///
     /// A full-screen window is not recorded: it keeps the frame it had before,
@@ -426,23 +455,39 @@ impl Render for FlowX {
         self.observe_workspace(window, cx);
 
         let now = std::time::Instant::now();
+        let reduce_motion = global::current().reduce_motion;
         let sidebar_visible = self.state.read(cx).sidebar_visible;
-        let transition = self
-            .sidebar_transition
-            .get_or_insert_with(|| PanelTransition::new(sidebar_visible));
-        transition.set_expanded(sidebar_visible, now);
-        let sidebar_progress = transition.progress(now);
-        if transition.is_animating(now) {
+        let inspector_visible = self.state.read(cx).snapshot.right_panel_visible;
+        let sidebar = advance_panel(
+            &mut self.sidebar_transition,
+            sidebar_visible,
+            now,
+            reduce_motion,
+        );
+        let inspector = advance_panel(
+            &mut self.inspector_transition,
+            inspector_visible,
+            now,
+            reduce_motion,
+        );
+        let sliding = sidebar.is_animating(now) || inspector.is_animating(now);
+        if sliding {
             let view = cx.entity().downgrade();
             window.on_next_frame(move |_, cx| {
                 let _ = view.update(cx, |_, cx| cx.notify());
             });
         }
-        let sidebar_content_width = visible_sidebar_width(
+        let columns = Columns::resolve(
             window.viewport_size().width.into(),
             self.state.read(cx).sidebar_width(),
+            self.state.read(cx).right_panel_width(),
+            PanelFrame::of(&sidebar, now),
+            PanelFrame::of(&inspector, now),
+            sliding,
         );
-        let sidebar_width = sidebar_content_width * sidebar_progress;
+        let sidebar_progress = sidebar.progress(now);
+        let sidebar_content_width = columns.sidebar_content;
+        let sidebar_width = columns.sidebar;
 
         let layer = self.state.read(cx).menu_layer.clone();
         let registry = self.state.read(cx).context_registry.clone();
@@ -637,11 +682,15 @@ impl Render for FlowX {
                                 sidebar_progress == 1.0,
                                 cx,
                             ))
-                            .child(center_column(self.state.clone(), window, cx))
+                            .child(centre_slot(
+                                center_column(self.state.clone(), window, cx),
+                                columns.centre,
+                            ))
                             .child(inspector_column(
                                 self.state.clone(),
-                                sidebar_width,
-                                window,
+                                &columns,
+                                inspector.progress(now) == 1.0,
+                                inspector_visible || inspector.is_animating(now),
                                 cx,
                             )),
                     ),
@@ -930,7 +979,7 @@ fn sidebar_column(
                 .right_0()
                 .top_0()
                 .h_full()
-                .w(px(Spacing::SM))
+                .w(px(RESIZE_HANDLE_WIDTH))
                 .cursor(gpui::CursorStyle::ResizeLeftRight)
                 .hover(|style| style.bg(Colors::bg_selected(&theme)))
                 .on_mouse_down(
@@ -955,37 +1004,48 @@ fn sidebar_column(
         .into_any_element()
 }
 
+/// The inspector's column: `columns.inspector` of it shown, laid out at its
+/// full width and revealed by the moving edge, as the sidebar is, so the diff
+/// is never re-wrapped while the panel slides. `shown` outlasts the setting
+/// by the closing slide, so the panel slides shut with its content.
 fn inspector_column(
     state: Entity<AppState>,
-    sidebar_width: f32,
-    window: &mut Window,
+    columns: &Columns,
+    settled_open: bool,
+    shown: bool,
     cx: &mut Context<FlowX>,
 ) -> AnyElement {
-    let width = if state.read(cx).snapshot.right_panel_visible {
-        visible_inspector_width(
-            window.viewport_size().width.into(),
-            sidebar_width,
-            state.read(cx).right_panel_width(),
-        )
-    } else {
-        0.0
-    };
+    let theme = global::current();
     div()
+        .debug_selector(|| "inspector-column".into())
         .relative()
-        .w(px(width))
+        .w(px(columns.inspector))
         .h_full()
         .min_w_0()
         .flex_shrink_0()
         .overflow_hidden()
-        .child(inspector::view(state, cx))
-        .children((width > 0.0).then(|| {
+        .child(
             div()
+                .absolute()
+                .top_0()
+                .right_0()
+                .h_full()
+                .w(px(columns.inspector_content))
+                .child(inspector::view_shown(state, shown, cx)),
+        )
+        .children(settled_open.then(|| {
+            div()
+                .id("inspector.resize")
+                .debug_selector(|| "inspector-resize-handle".into())
                 .absolute()
                 .left_0()
                 .top_0()
                 .h_full()
-                .w(px(Spacing::XS))
+                // The sidebar's grip, mirrored: the same width, and the same
+                // wash under the pointer to say it can be dragged.
+                .w(px(RESIZE_HANDLE_WIDTH))
                 .cursor(gpui::CursorStyle::ResizeLeftRight)
+                .hover(|style| style.bg(Colors::bg_selected(&theme)))
                 .on_mouse_down(
                     MouseButton::Left,
                     cx.listener(|this, _, _, cx| {
@@ -994,6 +1054,158 @@ fn inspector_column(
                     }),
                 )
         }))
+        .into_any_element()
+}
+
+/// How wide a column's resize grip is, sidebar and inspector alike.
+const RESIZE_HANDLE_WIDTH: f32 = Spacing::SM;
+
+/// Where one panel is on this frame, and the span its slide covers.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct PanelFrame {
+    progress: f32,
+    /// The least and most of the panel the slide shows, at rest both the
+    /// progress.
+    range: (f32, f32),
+}
+
+impl PanelFrame {
+    fn of(transition: &PanelTransition, now: std::time::Instant) -> Self {
+        Self {
+            progress: transition.progress(now),
+            range: transition.range(),
+        }
+    }
+
+    #[cfg(test)]
+    fn at_rest(open: bool) -> Self {
+        let value = if open { 1.0 } else { 0.0 };
+        Self {
+            progress: value,
+            range: (value, value),
+        }
+    }
+}
+
+/// How the centre column is laid out while a panel slides beside it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct CentreSlide {
+    /// The width its content is laid out at: the widest the column is
+    /// anywhere in the slide, so no frame of it exposes an edge.
+    width: f32,
+    /// Where that content sits in what is visible: centred, so the reading
+    /// column moves half as far as the panel does and lands where a reflow
+    /// at the end puts it.
+    offset: f32,
+}
+
+/// The three columns on one frame.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Columns {
+    /// The sidebar's visible width, and the width its content is laid out at.
+    sidebar: f32,
+    sidebar_content: f32,
+    /// The same for the inspector.
+    inspector: f32,
+    inspector_content: f32,
+    /// The centre's slide layout, or `None` at rest, where it simply fills
+    /// what the panels leave.
+    centre: Option<CentreSlide>,
+}
+
+impl Columns {
+    /// Lay out the columns for one frame.
+    ///
+    /// Every width a slide passes through is fixed by where the slide starts
+    /// and ends, never by the frame. The panels' content is laid out at its
+    /// full width and clipped, as it always was for the sidebar; the
+    /// inspector's is clamped against the widest the sidebar gets in its
+    /// slide, so it never changes width while the sidebar moves; and the
+    /// centre is laid out once at the widest it will be. Resizing the centre
+    /// on every frame re-wrapped the whole transcript on every frame: GPUI's
+    /// list drops every row's measured height when its width changes, which
+    /// was about 36 reflows per toggle.
+    fn resolve(
+        window_width: f32,
+        sidebar_requested: f32,
+        inspector_requested: f32,
+        sidebar: PanelFrame,
+        inspector: PanelFrame,
+        sliding: bool,
+    ) -> Self {
+        let sidebar_content = visible_sidebar_width(window_width, sidebar_requested);
+        let inspector_content = visible_inspector_width(
+            window_width,
+            sidebar_content * sidebar.range.1,
+            inspector_requested,
+        );
+        let sidebar_width = sidebar_content * sidebar.progress;
+        let inspector_width = inspector_content * inspector.progress;
+        let centre = sliding.then(|| {
+            let visible = (window_width - sidebar_width - inspector_width).max(0.0);
+            let widest = (window_width
+                - sidebar_content * sidebar.range.0
+                - inspector_content * inspector.range.0)
+                .max(visible);
+            CentreSlide {
+                width: widest,
+                offset: (visible - widest) / 2.0,
+            }
+        });
+        Self {
+            sidebar: sidebar_width,
+            sidebar_content,
+            inspector: inspector_width,
+            inspector_content,
+            centre,
+        }
+    }
+}
+
+/// Move a panel's transition to where the setting says, and read it.
+/// Reduced motion turns the slide into an instant change of width.
+fn advance_panel(
+    slot: &mut Option<PanelTransition>,
+    expanded: bool,
+    now: std::time::Instant,
+    reduce_motion: bool,
+) -> PanelTransition {
+    let transition = slot.get_or_insert_with(|| PanelTransition::new(expanded));
+    transition.set_expanded(expanded, now);
+    if reduce_motion {
+        transition.settle();
+    }
+    transition.clone()
+}
+
+/// The centre column's place between the panels.
+///
+/// At rest the column fills it. During a slide the column is laid out at the
+/// slide's widest and clipped to what is visible, so the transcript is
+/// measured once for the whole slide and again, at most, when it ends. The
+/// element tree is the same either way, so nothing inside loses its state.
+fn centre_slot(column: AnyElement, slide: Option<CentreSlide>) -> AnyElement {
+    let content = div()
+        .debug_selector(|| "centre-content".into())
+        .h_full()
+        .flex()
+        .flex_row();
+    let content = match slide {
+        Some(slide) => content
+            .absolute()
+            .top_0()
+            .left(px(slide.offset))
+            .w(px(slide.width)),
+        None => content.size_full(),
+    };
+    div()
+        .debug_selector(|| "centre-column".into())
+        .flex_1()
+        .min_w_0()
+        .h_full()
+        .flex()
+        .when(slide.is_some(), |slot| slot.relative().overflow_hidden())
+        .child(content.child(column))
         .into_any_element()
 }
 
@@ -2573,6 +2785,255 @@ mod tests {
             px(0.0)
         );
         test.read(|cx| assert!(state.read(cx).context_registry.read(cx).is_empty()));
+    }
+
+    /// A slide `progress` of the way from `from` to `to`.
+    fn sliding(from: f32, to: f32, progress: f32) -> PanelFrame {
+        PanelFrame {
+            progress: from + (to - from) * progress,
+            range: (from.min(to), from.max(to)),
+        }
+    }
+
+    #[test]
+    fn the_centre_is_laid_out_once_for_a_whole_slide_at_its_widest() {
+        let (window, sidebar, inspector) = (1280.0, Layout::SIDEBAR_WIDTH, 360.0);
+        let open = PanelFrame::at_rest(true);
+        let rest = Columns::resolve(window, sidebar, inspector, open, open, false);
+        assert_eq!(rest.centre, None, "a centre at rest fills its place");
+        assert_eq!((rest.sidebar, rest.inspector), (sidebar, inspector));
+
+        // The sidebar opening, closing, and the inspector doing either: at
+        // every frame of each, the centre's layout width is the same, and is
+        // the widest the column gets, so the transcript is measured once.
+        type Slide = Option<(f32, f32)>;
+        let (opening, closing): (Slide, Slide) = (Some((0.0, 1.0)), Some((1.0, 0.0)));
+        let cases = [
+            (opening, None, window - inspector),
+            (closing, None, window - inspector),
+            (None, opening, window - sidebar),
+            (None, closing, window - sidebar),
+            (closing, opening, window),
+        ];
+        for (index, (sidebar_slide, inspector_slide, widest)) in cases.into_iter().enumerate() {
+            for progress in [0.0, 0.25, 0.5, 0.75, 1.0] {
+                let at =
+                    |slide: Slide| slide.map_or(open, |(from, to)| sliding(from, to, progress));
+                let columns = Columns::resolve(
+                    window,
+                    sidebar,
+                    inspector,
+                    at(sidebar_slide),
+                    at(inspector_slide),
+                    true,
+                );
+                let centre = columns.centre.expect("a sliding centre");
+                assert_eq!(centre.width, widest, "case {index} at {progress}");
+                // Centred in what is visible, and never narrower than it.
+                let visible = window - columns.sidebar - columns.inspector;
+                assert!(centre.width >= visible);
+                assert!((centre.offset - (visible - widest) / 2.0).abs() < 1e-3);
+                // Neither panel's content changes width while either moves.
+                assert_eq!(
+                    (columns.sidebar_content, columns.inspector_content),
+                    (sidebar, inspector),
+                    "case {index} at {progress}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn an_inspector_clamped_by_the_sidebar_holds_its_width_through_the_sidebars_slide() {
+        // A narrow window clamps the inspector to leave the conversation its
+        // minimum. Clamped against the sidebar's moving width, the inspector
+        // grew and re-wrapped its diff on every frame of the sidebar closing.
+        let window = 1000.0;
+        let open = PanelFrame::at_rest(true);
+        let widths: Vec<f32> = [0.0, 0.5, 1.0]
+            .into_iter()
+            .map(|progress| {
+                Columns::resolve(
+                    window,
+                    Layout::SIDEBAR_WIDTH,
+                    Layout::RIGHT_PANEL_MAX_WIDTH,
+                    sliding(1.0, 0.0, progress),
+                    open,
+                    progress < 1.0,
+                )
+                .inspector_content
+            })
+            .collect();
+        let clamped = window - Layout::SIDEBAR_WIDTH - Layout::MINIMUM_CONVERSATION_WIDTH;
+        assert_eq!(widths[..2], [clamped, clamped]);
+    }
+
+    #[test]
+    fn a_sliding_sidebar_lays_the_transcript_out_at_one_width_until_it_settles() {
+        use fx_design::theme::animation::FxAnimation;
+        use gpui::VisualTestContext;
+        let mut test = gpui::TestAppContext::single();
+        let (_dir, state) = test.update(seeded);
+        let for_view = state.clone();
+        let window = test.add_window(move |_, _| FlowX::new(for_view));
+        let mut visual = VisualTestContext::from_window(window.into(), &test);
+        visual.simulate_resize(size(px(1280.0), px(800.0)));
+        test.refresh().unwrap();
+        let resting = visual.debug_bounds("centre-content").unwrap().size.width;
+        assert_eq!(
+            resting,
+            visual.debug_bounds("centre-column").unwrap().size.width
+        );
+
+        window
+            .update(&mut test, |view, _, cx| {
+                view.state.update(cx, |state, _| state.toggle_sidebar());
+                cx.notify();
+            })
+            .unwrap();
+        let mut laid_out = Vec::new();
+        for elapsed in [0.25, 0.5, 0.75] {
+            window
+                .update(&mut test, |view, _, cx| {
+                    let mut transition = PanelTransition::new(true);
+                    transition.set_expanded(
+                        false,
+                        std::time::Instant::now() - FxAnimation::PANEL.mul_f32(elapsed),
+                    );
+                    view.sidebar_transition = Some(transition);
+                    cx.notify();
+                })
+                .unwrap();
+            test.refresh().unwrap();
+            let slot = visual.debug_bounds("centre-column").unwrap().size.width;
+            let content = visual.debug_bounds("centre-content").unwrap().size.width;
+            assert!(slot > resting, "the centre did not grow at {elapsed}");
+            assert!(content >= slot);
+            laid_out.push(content);
+        }
+        assert!(
+            laid_out.windows(2).all(|pair| pair[0] == pair[1]),
+            "the transcript was laid out at {laid_out:?}"
+        );
+        // Closing, the widest is the end: no second reflow once it settles.
+        window
+            .update(&mut test, |view, _, cx| {
+                let mut transition = PanelTransition::new(true);
+                transition.set_expanded(false, std::time::Instant::now() - FxAnimation::PANEL);
+                view.sidebar_transition = Some(transition);
+                cx.notify();
+            })
+            .unwrap();
+        test.refresh().unwrap();
+        assert_eq!(
+            visual.debug_bounds("centre-content").unwrap().size.width,
+            laid_out[0]
+        );
+    }
+
+    #[test]
+    fn the_inspector_slides_and_its_grip_matches_the_sidebars() {
+        use fx_design::theme::animation::FxAnimation;
+        use gpui::VisualTestContext;
+        let mut test = gpui::TestAppContext::single();
+        let (_dir, state) = test.update(seeded);
+        let for_view = state.clone();
+        let window = test.add_window(move |_, _| FlowX::new(for_view));
+        let mut visual = VisualTestContext::from_window(window.into(), &test);
+        visual.simulate_resize(size(px(1280.0), px(800.0)));
+        test.refresh().unwrap();
+        let open = test.read(|cx| state.read(cx).snapshot.right_panel_visible);
+        if !open {
+            test.update(|cx| state.update(cx, |state, _| state.toggle_inspector()));
+            window
+                .update(&mut test, |view, _, cx| {
+                    view.inspector_transition = None;
+                    cx.notify();
+                })
+                .unwrap();
+            test.refresh().unwrap();
+        }
+        let full = visual.debug_bounds("inspector-column").unwrap().size.width;
+        assert!(full > px(0.0));
+        let grip = visual.debug_bounds("inspector-resize-handle").unwrap();
+        let sidebar_grip = visual.debug_bounds("sidebar-resize-handle").unwrap();
+        assert_eq!(grip.size.width, px(RESIZE_HANDLE_WIDTH));
+        assert_eq!(grip.size.width, sidebar_grip.size.width);
+
+        // Halfway through closing: part of the panel, and the centre laid out
+        // at the width it is growing to.
+        window
+            .update(&mut test, |view, _, cx| {
+                view.state.update(cx, |state, _| state.toggle_inspector());
+                let mut transition = PanelTransition::new(true);
+                transition.set_expanded(false, std::time::Instant::now() - FxAnimation::PANEL / 2);
+                view.inspector_transition = Some(transition);
+                cx.notify();
+            })
+            .unwrap();
+        test.refresh().unwrap();
+        // Read off one frame: the update and the refresh each drew one, and a
+        // selector's bounds are whichever frame last painted it.
+        let slot = visual.debug_bounds("centre-column").unwrap();
+        let content = visual.debug_bounds("centre-content").unwrap();
+        let shown = px(1280.0) - slot.right();
+        assert!(shown > px(0.0) && shown < full, "{shown:?} of {full:?}");
+        assert_eq!(
+            content.size.width,
+            px(1280.0) - slot.left(),
+            "the centre was not laid out at the width it is growing to"
+        );
+        assert!(content.size.width > slot.size.width);
+    }
+
+    #[test]
+    fn reduced_motion_is_read_on_activation_and_turns_a_slide_into_a_jump() {
+        use gpui::VisualTestContext;
+        let _theme = fx_design::theme::ThemeGuard::install(global::current());
+        let mut test = gpui::TestAppContext::single();
+        let (_dir, state) = test.update(seeded);
+        let for_view = state.clone();
+        let window = test.add_window(move |_, _| FlowX::new(for_view));
+        let mut visual = VisualTestContext::from_window(window.into(), &test);
+        visual.simulate_resize(size(px(1280.0), px(800.0)));
+        test.refresh().unwrap();
+        assert!(!global::current().reduce_motion);
+
+        // The reader turns Reduce Motion on in System Settings and comes back.
+        window
+            .update(&mut test, |view, window, _| {
+                view.reduce_motion_source = || true;
+                window.activate_window();
+            })
+            .unwrap();
+        test.run_until_parked();
+        assert!(global::current().reduce_motion, "not read on activation");
+
+        let full = visual.debug_bounds("sidebar-column").unwrap().size.width;
+        assert!(full > px(0.0));
+        window
+            .update(&mut test, |view, _, cx| {
+                view.state.update(cx, |state, _| state.toggle_sidebar());
+                cx.notify();
+            })
+            .unwrap();
+        test.refresh().unwrap();
+        assert_eq!(
+            visual.debug_bounds("sidebar-column").unwrap().size.width,
+            px(0.0),
+            "the sidebar slid under reduced motion"
+        );
+        window
+            .update(&mut test, |view, _, _| {
+                assert!(
+                    !view
+                        .sidebar_transition
+                        .as_ref()
+                        .unwrap()
+                        .is_animating(std::time::Instant::now())
+                );
+            })
+            .unwrap();
     }
 
     /// Paints a transcript through the real render path.
