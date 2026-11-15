@@ -142,7 +142,7 @@ pub(crate) fn row(state: &AppState, agent: &Agent) -> Option<crate::composer::Re
                 .map(|source| source.title.clone())
                 .unwrap_or_else(|| "a deleted thread".into()),
         ),
-        can_send: reviewed.is_some() && state.review_handoff(agent.id).is_ok(),
+        can_send: state.review_ready(agent.id).is_ok(),
         source_exists: reviewed.is_some(),
     })
 }
@@ -192,6 +192,8 @@ mod tests {
         (temp, cx.new(|cx| AppState::restore(paths, cx)))
     }
 
+    /// The review's turn as it lands: the prompt, the reviewer talking
+    /// between calls, then its answer.
     fn answer(state: &AppState, review: Uuid, reply: &str) {
         let conversation = state.conversation_by_agent(review).unwrap();
         let mut conversation = conversation.lock().unwrap();
@@ -201,6 +203,23 @@ mod tests {
             "Let me read the diff.",
         ));
         conversation.append(ConversationMessage::text(MessageRole::Assistant, reply));
+    }
+
+    /// How the review's last turn ended, as the app records it.
+    fn ended(state: &mut AppState, review: Uuid, outcome: fx_core::AgentExecutionState) {
+        for record in &mut state.snapshot.projects {
+            for agent in &mut record.agents {
+                if agent.id == review {
+                    agent.execution_state = outcome;
+                }
+            }
+        }
+    }
+
+    /// Read the reviewed thread's transcript, as opening it does.
+    fn load_author(state: &mut AppState) {
+        let project = state.snapshot.active_project_id.unwrap();
+        state.conversation(project, AUTHOR);
     }
 
     #[test]
@@ -266,6 +285,8 @@ mod tests {
         test.update(|cx| {
             state.update(cx, |state, _| {
                 let id = state.create_review_thread("claude").unwrap();
+                load_author(state);
+                ended(state, id, fx_core::AgentExecutionState::Success);
                 assert_eq!(
                     state.review_handoff(id).unwrap_err(),
                     "The review has not answered yet."
@@ -290,6 +311,70 @@ mod tests {
                 );
                 let row = row(state, state.thread(id).unwrap()).unwrap();
                 assert!(!row.source_exists && !row.can_send);
+            })
+        });
+    }
+
+    #[test]
+    fn a_stopped_or_failed_review_sends_nothing() {
+        // Its last words are the reviewer talking between calls, not findings.
+        let test = gpui::TestAppContext::single();
+        let (_dir, state) = test.update(seeded);
+        test.update(|cx| {
+            state.update(cx, |state, _| {
+                let id = state.create_review_thread("claude").unwrap();
+                load_author(state);
+                answer(state, id, "Now let me look at the callers.");
+                for outcome in [
+                    fx_core::AgentExecutionState::Idle,
+                    fx_core::AgentExecutionState::Failure,
+                    fx_core::AgentExecutionState::Running,
+                ] {
+                    ended(state, id, outcome);
+                    assert!(state.review_ready(id).is_err(), "{outcome:?}");
+                    assert!(!row(state, state.thread(id).unwrap()).unwrap().can_send);
+                }
+                ended(state, id, fx_core::AgentExecutionState::Success);
+                assert_eq!(state.review_ready(id), Ok(AUTHOR));
+            })
+        });
+    }
+
+    #[test]
+    fn the_findings_wait_for_the_reviewed_thread_to_load() {
+        // After a relaunch the review is often shown first. Sent then, the
+        // findings were refused while the thread's saved draft loaded.
+        let test = gpui::TestAppContext::single();
+        let (_dir, state) = test.update(seeded);
+        test.update(|cx| {
+            state.update(cx, |state, _| {
+                let id = state.create_review_thread("claude").unwrap();
+                answer(state, id, "- [P1] Off by one — stats.py:3");
+                ended(state, id, fx_core::AgentExecutionState::Success);
+                assert_eq!(
+                    state.review_ready(id),
+                    Err("The reviewed thread is still loading.")
+                );
+                load_author(state);
+                assert_eq!(state.review_ready(id), Ok(AUTHOR));
+            })
+        });
+    }
+
+    #[test]
+    fn a_review_of_an_orphaned_review_reports_to_nobody() {
+        // Its source deleted, a review must not become the next one's source:
+        // the findings would land in a Read Only reviewer.
+        let test = gpui::TestAppContext::single();
+        let (_dir, state) = test.update(seeded);
+        test.update(|cx| {
+            state.update(cx, |state, _| {
+                let first = state.create_review_thread("claude").unwrap();
+                assert!(state.delete_thread(AUTHOR));
+                state.select_agent(first);
+                let second = state.create_review_thread("codex").unwrap();
+                assert_eq!(state.thread(second).unwrap().review_of, None);
+                assert!(row(state, state.thread(second).unwrap()).is_none());
             })
         });
     }
@@ -343,6 +428,7 @@ mod tests {
                 let draft = state.draft(AUTHOR, cx);
                 draft.update(cx, |field, cx| field.restore_value("My note", cx));
                 answer(state, id, "- [P2] Leak — a.rs:9");
+                ended(state, id, fx_core::AgentExecutionState::Success);
                 id
             })
         });

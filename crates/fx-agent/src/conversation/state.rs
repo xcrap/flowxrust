@@ -422,7 +422,9 @@ impl Conversation {
 
     // ── Messages ───────────────────────────────────────────────────────────
 
-    pub fn messages(&self) -> impl ExactSizeIterator<Item = &ConversationMessage> {
+    pub fn messages(
+        &self,
+    ) -> impl ExactSizeIterator<Item = &ConversationMessage> + DoubleEndedIterator {
         self.messages.iter().map(|message| &**message)
     }
 

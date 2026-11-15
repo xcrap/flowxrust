@@ -295,15 +295,21 @@ impl TurnRunner {
         approvals: ApprovalPolicy,
         on_update: impl Fn(SessionUpdate) + Send + 'static,
     ) -> Self {
+        let discovery = || {
+            RuntimeDiscovery::new(launch_environment(
+                agent.configuration.resolved_access(AgentAccess::default()),
+                std::env::vars().collect(),
+            ))
+        };
         let provider = match agent
             .configuration
             .provider_id
             .as_deref()
             .unwrap_or("codex")
         {
-            "codex" => RuntimeProvider::Codex(CodexProvider::new(RuntimeDiscovery::default())),
+            "codex" => RuntimeProvider::Codex(CodexProvider::new(discovery())),
             "claude" => RuntimeProvider::Claude {
-                discovery: RuntimeDiscovery::default(),
+                discovery: discovery(),
                 spec: claude_spec(),
             },
             other => RuntimeProvider::Unsupported(other.to_owned()),
@@ -524,6 +530,22 @@ impl TurnRunner {
             on_update,
         )
     }
+}
+
+/// The environment a provider is launched with: FlowX's own, and for a Read
+/// Only turn `GIT_OPTIONAL_LOCKS=0`, so the `git status` a reviewer runs
+/// refreshes the index in memory instead of writing it. Written, it holds
+/// `index.lock` and can fail the author's own `git add` beside it with "File
+/// exists". Porcelain `git diff` does not honour the variable; Codex's
+/// read-only sandbox stops that write, and Claude has no sandbox.
+fn launch_environment(
+    access: AgentAccess,
+    mut environment: std::collections::BTreeMap<String, String>,
+) -> std::collections::BTreeMap<String, String> {
+    if access == AgentAccess::ReadOnly {
+        environment.insert("GIT_OPTIONAL_LOCKS".into(), "0".into());
+    }
+    environment
 }
 
 enum RuntimeProvider {
@@ -1899,6 +1921,24 @@ mod tests {
                 _ => "other".to_string(),
             })
             .collect()
+    }
+
+    #[test]
+    fn only_a_read_only_turn_keeps_git_from_writing_the_index() {
+        let base: std::collections::BTreeMap<String, String> =
+            [("PATH".to_string(), "/usr/bin".to_string())].into();
+        for access in AgentAccess::ALL {
+            let environment = launch_environment(access, base.clone());
+            assert_eq!(
+                environment.get("GIT_OPTIONAL_LOCKS").map(String::as_str),
+                (access == AgentAccess::ReadOnly).then_some("0"),
+                "{access:?}"
+            );
+            assert_eq!(
+                environment.get("PATH").map(String::as_str),
+                Some("/usr/bin")
+            );
+        }
     }
 
     #[test]
@@ -3379,14 +3419,18 @@ for worker in workers: worker.join()
                 .iter()
                 .find_map(|item| item["args"].as_array())
                 .expect("the fake records its arguments");
-            assert!(
-                arguments.iter().any(|argument| argument
-                    == &serde_json::json!(format!(
-                        "--disallowedTools={}",
-                        fx_agent::claude::transport::READ_ONLY_DISALLOWED_TOOLS
-                    ))),
-                "{arguments:?}"
-            );
+            for flag in [
+                "--restricted".to_string(),
+                format!(
+                    "--disallowedTools={}",
+                    fx_agent::claude::transport::READ_ONLY_DISALLOWED_TOOLS
+                ),
+            ] {
+                assert!(
+                    arguments.contains(&serde_json::json!(flag)),
+                    "{flag}: {arguments:?}"
+                );
+            }
         }
     }
 

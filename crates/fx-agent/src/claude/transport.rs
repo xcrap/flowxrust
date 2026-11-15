@@ -306,14 +306,22 @@ impl TurnRequest {
             Some(AgentAccess::Supervised) | Some(AgentAccess::FullAccess) => {
                 push_permission_mode(&mut arguments, "manual")
             }
-            // Asks like Supervised, and FlowX refuses what is not a read. The
-            // edit tools are taken away besides: a settings file's allow rule
-            // would otherwise let an edit through without asking, and with no
-            // edit tools the model does not spend calls being refused. Written
-            // with `=`, because the flag takes a list and would read a bare
-            // argument after it as one more tool.
+            // Asks like Supervised, and FlowX refuses what is not a read. That
+            // holds only for what reaches FlowX: an allow rule in the user's
+            // settings, or in the checkout's own `.claude/settings*.json` —
+            // which a reviewed diff can add — runs a command without asking.
+            // Live against 2.1.325, a project rule `Bash(touch:*)` created the
+            // file under Read Only. `--restricted` reads no settings files, so
+            // no rule or settings hook applies; it also drops Bash, which
+            // `--tools` names back with the tools a reader needs (WebFetch
+            // stays out: a fetch can carry what it read away). The edit tools
+            // are denied besides. Every list is written with `=`, because the
+            // flags take lists and would read a bare argument after them as
+            // one more tool.
             Some(AgentAccess::ReadOnly) => {
                 push_permission_mode(&mut arguments, "manual");
+                arguments.push("--restricted".into());
+                arguments.push(format!("--tools={READ_ONLY_TOOLS}"));
                 arguments.push(format!("--disallowedTools={READ_ONLY_DISALLOWED_TOOLS}"));
             }
             None => {}
@@ -336,8 +344,13 @@ impl TurnRequest {
 /// withholds the text.
 pub const THINKING_DISPLAY: &str = "summarized";
 
-/// Claude's tools that only write, removed from a Read Only turn.
-pub const READ_ONLY_DISALLOWED_TOOLS: &str = "Edit,Write,MultiEdit,NotebookEdit";
+/// The built-in tools a Read Only turn has: reading, searching, running
+/// commands for FlowX to judge, sub-agents, and questions to the reader.
+pub const READ_ONLY_TOOLS: &str = "Bash,Read,Grep,Glob,Agent,ToolSearch,WebSearch,AskUserQuestion";
+
+/// Claude's tools that only write, denied in a Read Only turn. 2.1.325 has no
+/// `MultiEdit`, and warns about a rule that names it.
+pub const READ_ONLY_DISALLOWED_TOOLS: &str = "Edit,Write,NotebookEdit";
 
 fn push_permission_mode(arguments: &mut Vec<String>, mode: &str) {
     arguments.push("--permission-mode".into());
@@ -1474,18 +1487,31 @@ mod tests {
     }
 
     #[test]
-    fn read_only_takes_the_edit_tools_away_and_only_there() {
-        let flag = format!("--disallowedTools={READ_ONLY_DISALLOWED_TOOLS}");
+    fn read_only_reads_no_settings_and_has_no_edit_tools_and_only_there() {
+        let flags = [
+            "--restricted".to_string(),
+            format!("--tools={READ_ONLY_TOOLS}"),
+            format!("--disallowedTools={READ_ONLY_DISALLOWED_TOOLS}"),
+        ];
         for access in AgentAccess::ALL {
             let arguments = TurnRequest {
                 access: Some(access),
                 ..request()
             }
             .arguments();
-            assert_eq!(
-                arguments.contains(&flag),
-                access == AgentAccess::ReadOnly,
-                "{access:?}: {arguments:?}"
+            for flag in &flags {
+                assert_eq!(
+                    arguments.contains(flag),
+                    access == AgentAccess::ReadOnly,
+                    "{access:?} {flag}: {arguments:?}"
+                );
+            }
+        }
+        assert!(READ_ONLY_TOOLS.split(',').any(|tool| tool == "Bash"));
+        for writer in ["Edit", "Write", "NotebookEdit", "WebFetch"] {
+            assert!(
+                !READ_ONLY_TOOLS.split(',').any(|tool| tool == writer),
+                "{writer}"
             );
         }
     }

@@ -1227,6 +1227,11 @@ fn composer_row(
     {
         state.update(cx, |state, cx| state.probe_context_if_unknown(agent.id, cx));
     }
+    // A review sends its findings to a thread that must be loaded first; one
+    // shown after a relaunch is usually opened before the thread it reviews.
+    if agent.review_of.is_some() {
+        state.update(cx, |state, cx| state.load_review_source(agent.id, cx));
+    }
     {
         let state = state.read(cx);
         chrome.attachments_enabled = accepts_images(state, &agent);

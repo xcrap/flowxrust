@@ -81,23 +81,41 @@ pub fn title(source_title: &str) -> String {
 /// Only the last text, because a turn's earlier prose is the reviewer talking
 /// to itself between calls ("Let me read the diff"); the answer is what it
 /// wrote last. `None` while the latest prompt has no reply, so a follow-up the
-/// reader asked does not hand back the previous answer.
-pub fn findings<'a>(messages: impl IntoIterator<Item = &'a ConversationMessage>) -> Option<String> {
-    let mut answer = None;
-    for message in messages {
+/// reader asked does not hand back the previous answer. Read from the end, so
+/// it costs the last turn and not the transcript.
+pub fn findings<'a>(
+    messages: impl DoubleEndedIterator<Item = &'a ConversationMessage>,
+) -> Option<String> {
+    last_reply(messages).map(|message| message.text_content().trim().to_string())
+}
+
+/// Whether [`findings`] has something to return, without building it: the
+/// review row asks on every frame.
+pub fn has_findings<'a>(
+    messages: impl DoubleEndedIterator<Item = &'a ConversationMessage>,
+) -> bool {
+    last_reply(messages).is_some()
+}
+
+fn last_reply<'a>(
+    messages: impl DoubleEndedIterator<Item = &'a ConversationMessage>,
+) -> Option<&'a ConversationMessage> {
+    for message in messages.rev() {
         match message.role {
-            MessageRole::User => answer = None,
-            MessageRole::Assistant => {
-                let text = message.text_content();
-                let text = text.trim();
-                if !text.is_empty() {
-                    answer = Some(text.to_string());
-                }
+            MessageRole::User => return None,
+            MessageRole::Assistant
+                if message
+                    .content
+                    .iter()
+                    .filter_map(|content| content.as_text())
+                    .any(|text| !text.trim().is_empty()) =>
+            {
+                return Some(message);
             }
-            MessageRole::System | MessageRole::Tool => {}
+            _ => {}
         }
     }
-    answer
+    None
 }
 
 /// What lands in the reviewed thread's composer: the findings, framed as a
@@ -145,6 +163,7 @@ mod tests {
             findings(messages.iter()).as_deref(),
             Some("- [P1] Off by one — stats.py:3")
         );
+        assert!(has_findings(messages.iter()));
     }
 
     #[test]
@@ -155,6 +174,7 @@ mod tests {
             message(MessageRole::User, "Look at the tests too."),
         ];
         assert_eq!(findings(messages.iter()), None);
+        assert!(!has_findings(messages.iter()));
         assert_eq!(findings(std::iter::empty::<&ConversationMessage>()), None);
     }
 

@@ -1207,13 +1207,27 @@ its own side, because FlowX only hears about what a provider asks:
   `nl -ba file`; a live review spent four calls on refusals. A write inside
   the sandbox fails with `Operation not permitted`, and codex-cli 0.167
   reports no item for that command at all.
-- **Claude runs `manual` with `--disallowedTools=Edit,Write,MultiEdit,NotebookEdit`.**
-  An allow rule in the user's settings would otherwise let an edit through
-  without asking. Written with `=`, because the flag takes a list.
+- **Claude runs `manual --restricted`, with `--tools` naming a reader's set
+  and the edit tools denied.** FlowX hears only what Claude asks, and an
+  allow rule in any settings file runs a command without asking: live
+  against 2.1.325, a checkout's `.claude/settings.local.json` allowing
+  `Bash(touch:*)` created the file under Read Only, and a reviewed diff can
+  add that file. `--restricted` reads no user, project or local settings, so
+  no rule or settings hook applies; it also drops Bash, which `--tools` names
+  back (`READ_ONLY_TOOLS`; `default,Bash` leaves Bash alone). WebFetch stays
+  out, because a fetch can carry away what was read. Lists are written with
+  `=`, because the flags take lists. 2.1.325 has no `MultiEdit` and warns
+  about a rule naming it.
+- **`GIT_OPTIONAL_LOCKS=0` is in the environment** (`launch_environment`),
+  so a reviewer's `git status` refreshes the index in memory instead of
+  writing it beside the author's own `git add`. Porcelain `git diff` ignores
+  the variable; Codex's sandbox stops that write, and Claude has none, so a
+  Claude review run during the author's commit can still collide with it.
 
-A Codex thread recorded with a read-only sandbox reads as Read Only. A saved
-level this build cannot read is still Supervised, not Read Only: it may be a
-level that only asked.
+A Codex thread recorded with a read-only sandbox reads as Supervised, not
+Read Only: Codex asks before a command leaves the sandbox and the reader may
+approve, where Read Only refuses. A saved level this build cannot read is
+Supervised too: it may be a level that only asked.
 
 ### Scrolling
 
@@ -1383,21 +1397,29 @@ Four rules:
   thread's project and folder (its worktree binding included), with
   `review::BRIEF` as its system prompt so it holds for follow-ups, opened with
   `review::PROMPT`. `Agent::review_of` links it to the thread it reviews; a
-  review started from a review reviews that thread again. It is named after
-  what it reviews and is never auto-titled.
+  review started from a review reviews that thread again, and one whose
+  thread was deleted reviews for nobody rather than for itself. It is named
+  after what it reviews, and the name is recorded as a rename is: without the
+  override, the first sync pass after its turn replaced it with the
+  provider's title, the first prompt.
 - **It is a prompt, not Codex's `review/start`.** Run against codex-cli 0.167,
   a native review streamed nothing of what it wrote: the whole review arrived
   in one `exitedReviewMode` item and one completed `agentMessage` at the end,
   with no deltas and no reasoning summary, under a second turn id
   (`rootTurnId`), and it left a thread of its own behind. A prompt streams like
   any turn and reads the same on both providers.
-- **The findings are the last reply to the last prompt** (`review::findings`).
-  A turn's earlier prose is the reviewer talking between calls, and while a
-  follow-up runs there is nothing to send.
+- **The findings are the last reply to the last prompt** (`review::findings`),
+  and only of a turn that completed. A turn's earlier prose is the reviewer
+  talking between calls; a stopped or failed turn's last words are exactly
+  that, so the saved `execution_state` must be `Success`. The row asks
+  `review_ready` on every frame, which reads the transcript from its end and
+  builds nothing.
 - **Nothing is sent for the reader.** The row above a review's composer adds
   the findings to the reviewed thread's draft (`append_prompt_context`, after
   whatever the reader had typed), shows that thread and focuses its composer.
-  FlowX never sends a prompt on its own.
+  FlowX never sends a prompt on its own. The reviewed thread must be loaded
+  first, or its saved draft is still on its way; a review shown after a
+  relaunch is usually opened first, so showing one starts that read.
 
 ## Porting conventions
 

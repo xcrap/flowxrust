@@ -383,14 +383,15 @@ impl AppState {
             .snapshot
             .active_project_id
             .ok_or("Open a project to review its changes.")?;
+        // A review's own source, never the review itself: a review whose
+        // source was deleted has nothing to send findings to, and would
+        // otherwise send them to a Read Only reviewer.
         let source = self.snapshot.active_agent_id.and_then(|id| {
             let agent = self.thread(id)?;
-            Some(
-                agent
-                    .review_of
-                    .and_then(|source| self.thread(source))
-                    .unwrap_or(agent),
-            )
+            match agent.review_of {
+                Some(source) => self.thread(source),
+                None => Some(agent),
+            }
         });
         let mut agent = Agent::new(review::title(
             source.map(|source| source.title.as_str()).unwrap_or(""),
@@ -403,25 +404,70 @@ impl AppState {
         self.insert_thread(project_id, agent, false)
     }
 
-    /// What a review sends back, and to which thread: its findings, framed for
-    /// the reviewed thread's agent. An error says why there is nothing to send.
-    pub(crate) fn review_handoff(&self, review_id: Uuid) -> Result<(Uuid, String), String> {
-        use fx_core::policy::review;
+    /// Whether a review has findings to send, and where: the thread it
+    /// reviews. Cheap, because the review row asks on every frame: it reads
+    /// the transcript from its end and builds nothing.
+    ///
+    /// Only a turn that completed has findings. A stopped or failed one's last
+    /// words are the reviewer talking between calls, and the saved outcome
+    /// says which it was, across a relaunch too. The reviewed thread must be
+    /// loaded, so the findings join its saved draft rather than racing it.
+    pub(crate) fn review_ready(&self, review_id: Uuid) -> Result<Uuid, &'static str> {
         let review = self
             .thread(review_id)
             .ok_or("This review no longer exists.")?;
         let source = review.review_of.ok_or("This thread is not a review.")?;
         if self.thread(source).is_none() {
-            return Err("The reviewed thread no longer exists.".into());
+            return Err("The reviewed thread no longer exists.");
         }
+        if review.execution_state != fx_core::AgentExecutionState::Success {
+            return Err("The review has not finished. Ask it to continue, or start a new review.");
+        }
+        let answered = self
+            .conversations
+            .get(&review_id)
+            .is_some_and(|conversation| {
+                let conversation = conversation.lock().unwrap_or_else(|e| e.into_inner());
+                !conversation.is_busy()
+                    && fx_core::policy::review::has_findings(conversation.messages())
+            });
+        if !answered {
+            return Err("The review has not answered yet.");
+        }
+        if !self.conversations.contains_key(&source) || self.loading.contains(&source) {
+            return Err("The reviewed thread is still loading.");
+        }
+        Ok(source)
+    }
+
+    /// Start reading the reviewed thread's transcript, so the review's
+    /// findings can be sent: a review shown after a relaunch is often opened
+    /// before the thread it reviews.
+    pub(crate) fn load_review_source(&mut self, review_id: Uuid, cx: &mut Context<Self>) {
+        let Some(source) = self.thread(review_id).and_then(|review| review.review_of) else {
+            return;
+        };
+        if self.conversations.contains_key(&source) || self.loading.contains(&source) {
+            return;
+        }
+        if let Some(project_id) = self.project_for_agent(source) {
+            self.request_conversation(project_id, source, cx);
+        }
+    }
+
+    /// What a review sends back, and to which thread: its findings, framed for
+    /// the reviewed thread's agent. An error says why there is nothing to send.
+    pub(crate) fn review_handoff(&self, review_id: Uuid) -> Result<(Uuid, String), String> {
+        use fx_core::policy::review;
+        let source = self.review_ready(review_id)?;
+        let review = self
+            .thread(review_id)
+            .ok_or("This review no longer exists.")?;
         let findings = self
             .conversations
             .get(&review_id)
             .and_then(|conversation| {
                 let conversation = conversation.lock().unwrap_or_else(|e| e.into_inner());
-                if conversation.is_busy() {
-                    return None;
-                }
                 review::findings(conversation.messages())
             })
             .ok_or("The review has not answered yet.")?;
@@ -435,7 +481,8 @@ impl AppState {
     }
 
     /// Add a thread to a project, saved before it exists in memory, and
-    /// select it. `auto_title` queues it for naming after its first prompt.
+    /// select it. `auto_title` queues it for naming after its first prompt;
+    /// otherwise its title is the one it was given, and a sync pass keeps it.
     fn insert_thread(
         &mut self,
         project_id: Uuid,
@@ -446,6 +493,7 @@ impl AppState {
             return Err("Restore the saved workspace before creating a chat.".into());
         }
         let id = agent.id;
+        let title = agent.title.clone();
         if self.thread(id).is_some() {
             return Err("This chat has already been created.".into());
         }
@@ -467,6 +515,11 @@ impl AppState {
         record.agents.push(agent);
         if auto_title {
             record.auto_title_pending.push(id);
+        } else {
+            // A name chosen here is kept as a rename is: without it, the
+            // first sync pass after the thread's turn replaced it with the
+            // provider's title, which is the first prompt.
+            local_override(record, id).title = Some(title);
         }
         record.is_expanded = true;
         record.last_selected_agent_id = Some(id);
@@ -4684,8 +4737,8 @@ fn native_contains_local_tail<'a>(
 fn recovery_message(conversation: &Conversation) -> Option<&fx_core::ConversationMessage> {
     conversation
         .messages()
-        .filter(|message| message.role == fx_core::MessageRole::User)
-        .last()
+        .rev()
+        .find(|message| message.role == fx_core::MessageRole::User)
         .filter(|message| {
             conversation
                 .unsent()
@@ -8533,6 +8586,42 @@ mod native_sync_tests {
                 current_context_tokens: Some(123),
                 history_truncated: false,
             }))),
+        });
+    }
+
+    #[test]
+    fn a_review_keeps_its_name_through_a_sync_pass() {
+        // The provider names the thread after its first prompt; a sync pass
+        // took that name over the one the review was given.
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().to_string_lossy().to_string();
+        let paths = AppPaths::at(temp.path().join("store"));
+        let test = gpui::TestAppContext::single();
+        let (state, project) = test.update(|cx| setup(cx, paths, &root));
+        test.update(|cx| {
+            state.update(cx, |state, _| {
+                let id = state.create_review_thread("claude").unwrap();
+                let title = state.thread(id).unwrap().title.clone();
+                state
+                    .conversation(project, id)
+                    .lock()
+                    .unwrap()
+                    .set_session_id("review-session");
+                state.bind_local_session(id);
+                index(
+                    state,
+                    project,
+                    "claude",
+                    vec![entry(
+                        &root,
+                        "claude",
+                        "review-session",
+                        fx_core::policy::review::PROMPT,
+                    )],
+                    Vec::new(),
+                );
+                assert_eq!(state.thread(id).unwrap().title, title);
+            })
         });
     }
 

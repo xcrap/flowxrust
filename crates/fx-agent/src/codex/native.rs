@@ -666,8 +666,10 @@ fn native_defaults(raw: &Value) -> NativeDefaults {
     let access = match (approval.as_deref(), sandbox.as_str()) {
         (Some("never"), "dangerfullaccess") => Some(AgentAccess::FullAccess),
         (Some("on-request"), "workspacewrite") => Some(AgentAccess::AcceptEdits),
-        (Some("untrusted"), "workspacewrite") => Some(AgentAccess::Supervised),
-        (_, "readonly") => Some(AgentAccess::ReadOnly),
+        // A read-only sandbox reads as Supervised, not Read Only: Codex asks
+        // before a command leaves it, and the reader may approve; FlowX's
+        // Read Only refuses without asking.
+        (Some("untrusted"), "workspacewrite") | (_, "readonly") => Some(AgentAccess::Supervised),
         _ => None,
     };
     NativeDefaults {
@@ -1737,6 +1739,23 @@ for line in sys.stdin:
                 thread.current_context_tokens
             );
             assert!(thread.messages.iter().all(|message| !message.id.is_nil()));
+        }
+    }
+
+    #[test]
+    fn a_read_only_codex_thread_still_asks_in_flowx() {
+        // Codex asks before a command leaves its read-only sandbox, and the
+        // reader may approve. FlowX's Read Only would refuse without asking.
+        for approval in ["on-request", "untrusted", "never"] {
+            let defaults = native_defaults(&json!({
+                "approvalPolicy": approval,
+                "sandboxPolicy": {"type": "readOnly"},
+            }));
+            assert_eq!(
+                defaults.agent_access,
+                Some(AgentAccess::Supervised),
+                "{approval}"
+            );
         }
     }
 }
