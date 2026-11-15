@@ -170,7 +170,7 @@ impl Render for ArchivedChats {
             body = body.child(
                 div()
                     .fx_caption()
-                    .text_color(Colors::error(&theme))
+                    .text_color(Colors::error_ink(&theme))
                     .child(SharedString::from(error.clone())),
             );
         }

@@ -319,15 +319,17 @@ fn side_palette(side: SplitSide, theme: &Theme) -> (gpui::Rgba, gpui::Rgba) {
     }
 }
 
-/// The status letter's colour. A conflict's `U` is the letter alone carrying
-/// the state, so it takes `warning_ink`: light-mode `warning` is below 3:1.
+/// The status letter's colour. Each letter is the hue alone carrying the
+/// state, so each takes its ink: light-mode `warning` is below 3:1 for a
+/// conflict's `U`, `error` is 3.7:1 on `bg_surface`, and light `success` is
+/// 2.9:1 there.
 pub(super) fn status_ink(status: &str, theme: &Theme) -> gpui::Rgba {
     if status.contains('U') {
         Colors::warning_ink(theme)
     } else if status.contains('D') {
-        Colors::error(theme)
+        Colors::error_ink(theme)
     } else if status.contains('A') || status.contains('?') {
-        Colors::success(theme)
+        Colors::success_ink(theme)
     } else {
         Colors::fg_secondary(theme)
     }
@@ -1456,19 +1458,32 @@ mod tests {
     }
 
     #[test]
-    fn a_conflicts_status_letter_clears_three_to_one() {
-        for dark in [false, true] {
-            let theme = Theme {
-                appearance_mode: if dark {
-                    fx_design::theme::AppearanceMode::Dark
-                } else {
-                    fx_design::theme::AppearanceMode::Light
-                },
-                ..Default::default()
-            };
-            for background in [Colors::content_bg(&theme), Colors::bg_elevated(&theme)] {
-                let ratio = fx_design::theme::contrast(status_ink("UU", &theme), background);
-                assert!(ratio >= 3.0, "dark={dark}: {ratio}:1");
+    fn every_status_letter_clears_three_to_one_on_its_row() {
+        // The letter is the hue alone carrying the state. `D` in `error` was
+        // 3.7:1 on `bg_surface`, and a light `A` in `success` 2.9:1 there.
+        for tone in fx_design::theme::BaseTone::ALL {
+            for appearance_mode in [
+                fx_design::theme::AppearanceMode::Light,
+                fx_design::theme::AppearanceMode::Dark,
+            ] {
+                let theme = Theme {
+                    appearance_mode,
+                    base_tone: tone,
+                    ..Default::default()
+                };
+                let palette = theme.palette();
+                let selected = [palette.bg, palette.bg_elevated, palette.bg_surface]
+                    .map(|surface| fx_design::theme::composite(palette.bg_selected, surface));
+                for status in ["UU", "D", "A", "??"] {
+                    let ink = status_ink(status, &theme);
+                    for fill in palette.text_fills().into_iter().chain(selected) {
+                        let ratio = fx_design::theme::contrast(ink, fill);
+                        assert!(
+                            ratio >= 3.0,
+                            "{tone:?} {appearance_mode:?}: {status} is {ratio}:1"
+                        );
+                    }
+                }
             }
         }
     }

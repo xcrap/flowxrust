@@ -389,6 +389,16 @@ fn inspector_empty(icon: Icon, title: &str, hint: &str) -> AnyElement {
         .into_any_element()
 }
 
+/// A note's ink: `error_ink` for a failure, which clears AA on the panel and
+/// under the hover wash where `error` is 3.7:1 on `bg_surface`.
+fn note_ink(error: bool, theme: &fx_design::theme::Theme) -> gpui::Rgba {
+    if error {
+        Colors::error_ink(theme)
+    } else {
+        Colors::fg_secondary(theme)
+    }
+}
+
 fn note(text: &str, error: bool) -> AnyElement {
     let theme = global::current();
     div()
@@ -396,11 +406,7 @@ fn note(text: &str, error: bool) -> AnyElement {
         .px(px_len(Spacing::MD))
         .py(px_len(Spacing::SM))
         .fx_caption()
-        .text_color(if error {
-            Colors::error(&theme)
-        } else {
-            Colors::fg_secondary(&theme)
-        })
+        .text_color(note_ink(error, &theme))
         .child(SharedString::from(text.to_string()))
         .into_any_element()
 }
@@ -1420,5 +1426,26 @@ mod tests {
         });
         visual.simulate_click(select_all.center(), Default::default());
         test.read(|cx| assert_eq!(inspector.read(cx).composer.chosen.len(), files));
+    }
+
+    #[test]
+    fn an_error_note_clears_aa_on_the_panel_and_under_the_pointer() {
+        // `error` was 3.7:1 on `bg_surface` in both modes.
+        for base_tone in fx_design::theme::BaseTone::ALL {
+            for appearance_mode in [
+                fx_design::theme::AppearanceMode::Light,
+                fx_design::theme::AppearanceMode::Dark,
+            ] {
+                let theme = fx_design::theme::Theme {
+                    base_tone,
+                    appearance_mode,
+                    ..Default::default()
+                };
+                for fill in theme.palette().text_fills() {
+                    let ratio = fx_design::theme::contrast(note_ink(true, &theme), fill);
+                    assert!(ratio >= 4.5, "{base_tone:?} {appearance_mode:?}: {ratio}:1");
+                }
+            }
+        }
     }
 }

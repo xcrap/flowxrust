@@ -126,6 +126,19 @@ pub trait FxStyled: Styled + Sized {
         self.bg(Colors::border(&global::current()))
     }
 
+    /// The corners a filled row takes inside a rounded panel: the panel's
+    /// radius on whichever ends of the panel the row touches.
+    ///
+    /// GPUI 0.2.2's overflow mask is a plain rectangle, so a panel's
+    /// `overflow_hidden` does not round what it clips. A header filled
+    /// differently from its panel painted square corners over the panel's
+    /// rounded edge.
+    fn fx_inner_corners(self, radius: f32, top: bool, bottom: bool) -> Self {
+        let radius = px_len(radius);
+        let this = if top { self.rounded_t(radius) } else { self };
+        if bottom { this.rounded_b(radius) } else { this }
+    }
+
     // ── Focus ──────────────────────────────────────────────────────────────
 
     /// The keyboard focus ring, for a `.focus(|s| s.fx_focus_ring())`
@@ -351,6 +364,26 @@ mod tests {
             Some(gpui::FontWeight(600.0)),
             "retinting dropped an unrelated text field"
         );
+    }
+
+    #[test]
+    fn a_row_takes_the_panels_corners_only_at_the_ends_it_touches() {
+        let radius = Some(px_len(Radii::MD));
+        let mut header = gpui::div().fx_inner_corners(Radii::MD, true, false);
+        let corners = &header.style().corner_radii;
+        assert_eq!((corners.top_left, corners.top_right), (radius, radius));
+        assert_eq!((corners.bottom_left, corners.bottom_right), (None, None));
+
+        let mut footer = gpui::div().fx_inner_corners(Radii::MD, false, true);
+        let corners = &footer.style().corner_radii;
+        assert_eq!((corners.top_left, corners.top_right), (None, None));
+        assert_eq!(
+            (corners.bottom_left, corners.bottom_right),
+            (radius, radius)
+        );
+
+        let mut middle = gpui::div().fx_inner_corners(Radii::MD, false, false);
+        assert_eq!(middle.style().corner_radii.top_left, None);
     }
 
     #[test]

@@ -70,9 +70,10 @@ use fx_core::{ConversationMessage, MessageContent, MessageRole};
 use fx_design::components::button::text_disclosure;
 use fx_design::components::surface::banner;
 use fx_design::components::{
-    BadgeTone, ButtonStyle, ChecklistMark, DividerAxis, MenuItem, MenuModel, MenuSection, badge,
-    button, card, checklist, checklist_row, compact_action_button, context_region,
-    divider_with_axis, empty_state, panel, spinner_arc, typing_indicator,
+    BadgeTone, ButtonStyle, ChecklistMark, DividerAxis, MenuItem, MenuModel, MenuSection,
+    StatusGlyph, badge, button, card, checklist, checklist_row, compact_action_button,
+    context_region, divider_with_axis, empty_state, panel, spinner_arc, status_glyph,
+    typing_indicator,
 };
 use fx_design::icon::Icon;
 use fx_design::styled::{FxRefinement, FxStyled, px_len};
@@ -2903,7 +2904,7 @@ fn inline_tool_call(name: &str, input: &str, place: Place) -> AnyElement {
                 .child(
                     div()
                         .fx_role(TextRole::CaptionMedium)
-                        .text_color(Colors::accent_secondary(&theme))
+                        .text_color(Colors::accent_secondary_ink(&theme))
                         .child(SharedString::from(name.to_string())),
                 ),
         );
@@ -2947,19 +2948,14 @@ fn inline_tool_result(content: &str, is_error: bool, place: Place) -> AnyElement
                 .flex_row()
                 .items_center()
                 .gap(px_len(Spacing::SM))
-                .child(if is_error {
-                    Icon::EXCLAMATIONMARK_TRIANGLE_FILL.render(
-                        IconSize::Regular,
-                        Colors::error(&theme),
-                        &theme,
-                    )
-                } else {
-                    Icon::CHECKMARK_CIRCLE_FILL.render(
-                        IconSize::Regular,
-                        Colors::success(&theme),
-                        &theme,
-                    )
-                })
+                .child(status_glyph(
+                    if is_error {
+                        StatusGlyph::Failed
+                    } else {
+                        StatusGlyph::Done
+                    },
+                    None,
+                ))
                 .child(
                     div()
                         .fx_role(TextRole::CaptionMedium)
@@ -3871,15 +3867,9 @@ fn background_task_row(task: &BackgroundTask, now: Instant, frame: u32) -> AnyEl
         TaskStatus::Running => {
             spinner_arc(Colors::accent(&theme), spin_degrees(frame)).into_any_element()
         }
-        TaskStatus::Completed => {
-            Icon::CHECKMARK.render(IconSize::Micro, Colors::success(&theme), &theme)
-        }
-        TaskStatus::Failed => {
-            Icon::XMARK_CIRCLE_FILL.render(IconSize::Small, Colors::error(&theme), &theme)
-        }
-        TaskStatus::Stopped => {
-            Icon::STOP_CIRCLE_FILL.render(IconSize::Small, Colors::fg_tertiary(&theme), &theme)
-        }
+        TaskStatus::Completed => status_glyph(StatusGlyph::Done, None),
+        TaskStatus::Failed => status_glyph(StatusGlyph::Failed, None),
+        TaskStatus::Stopped => status_glyph(StatusGlyph::Stopped, None),
     };
     let selector = format!(
         "transcript.background-task:{}:{}",
@@ -4364,11 +4354,11 @@ fn tool_row(
     let open = is_disclosed(&key);
 
     let status: AnyElement = if call.is_error {
-        Icon::XMARK_CIRCLE_FILL.render(IconSize::Small, Colors::error(&theme), &theme)
+        status_glyph(StatusGlyph::Failed, None)
     } else if running {
         spinner_arc(Colors::accent(&theme), spin_degrees(frame)).into_any_element()
     } else {
-        Icon::CHECKMARK.render(IconSize::Micro, Colors::success(&theme), &theme)
+        status_glyph(StatusGlyph::Done, None)
     };
 
     let title = div()
@@ -4476,7 +4466,7 @@ fn tool_row(
 /// header per section, then its lines on their own fills.
 fn edit_preview_panel(preview: &EditPreview, key: &str) -> AnyElement {
     let theme = global::current();
-    let mut panel = div()
+    let panel = div()
         .w_full()
         .min_w_0()
         .flex()
@@ -4485,6 +4475,8 @@ fn edit_preview_panel(preview: &EditPreview, key: &str) -> AnyElement {
         .overflow_hidden()
         .border(px_len(BorderWidth::HAIRLINE))
         .border_color(Colors::border_subtle(&theme));
+    // Every row is filled, so the first and the last take the panel's corners.
+    let mut rows: Vec<gpui::Div> = Vec::new();
     for (section_index, section) in preview.sections.iter().enumerate() {
         let mut header = div()
             .flex()
@@ -4523,11 +4515,11 @@ fn edit_preview_panel(preview: &EditPreview, key: &str) -> AnyElement {
                     .child(SharedString::from(format!("−{}", section.removed))),
             );
         }
-        panel = panel.child(header);
+        rows.push(header);
         for (line_index, line) in section.lines.iter().enumerate() {
             let (fg, bg) = crate::inspector::diff_view::line_palette(line.kind, &theme);
             let text = preview_line_text(line);
-            panel = panel.child(
+            rows.push(
                 div()
                     .w_full()
                     .min_w_0()
@@ -4546,7 +4538,7 @@ fn edit_preview_panel(preview: &EditPreview, key: &str) -> AnyElement {
             );
         }
         if section.omitted > 0 {
-            panel = panel.child(
+            rows.push(
                 div()
                     .px(px_len(Spacing::MD))
                     .py(px_len(Spacing::XS))
@@ -4565,7 +4557,14 @@ fn edit_preview_panel(preview: &EditPreview, key: &str) -> AnyElement {
             );
         }
     }
-    panel.into_any_element()
+    let last = rows.len().saturating_sub(1);
+    panel
+        .children(
+            rows.into_iter()
+                .enumerate()
+                .map(|(index, row)| row.fx_inner_corners(Radii::MD, index == 0, index == last)),
+        )
+        .into_any_element()
 }
 
 /// What a running call has printed so far, dimmed under its row.
@@ -5058,6 +5057,20 @@ enum BlockTone {
     Failure,
 }
 
+impl BlockTone {
+    /// The label's ink on the panel's `bg_elevated` header, and the body's on
+    /// its `bg_surface`.
+    ///
+    /// A failure is read in `error_ink`: `error` itself is 3.7:1 on
+    /// `bg_surface`, and the body is the failure the reader came for.
+    fn inks(self, theme: &fx_design::theme::Theme) -> (gpui::Rgba, gpui::Rgba) {
+        match self {
+            BlockTone::Standard => (Colors::fg_tertiary(theme), Colors::fg_secondary(theme)),
+            BlockTone::Failure => (Colors::error_ink(theme), Colors::error_ink(theme)),
+        }
+    }
+}
+
 /// A labelled block of monospaced text on a bordered panel.
 ///
 /// `key` makes the body selectable. `copyable` adds the copy button, which
@@ -5073,6 +5086,7 @@ fn mono_panel(
     let theme = global::current();
     let shown = SharedString::from(bounded_detail(body));
     let panel_id = SharedString::from(format!("panel:{key}"));
+    let (label_ink, body_ink) = tone.inks(&theme);
     div()
         .w_full()
         .min_w_0()
@@ -5092,16 +5106,14 @@ fn mono_panel(
                 .px(px_len(Spacing::MD))
                 .py(px_len(Spacing::XS))
                 .bg(Colors::bg_elevated(&theme))
+                .fx_inner_corners(Radii::MD, true, false)
                 .child(
                     div()
                         .flex_1()
                         .min_w_0()
                         .fx_caption()
                         .truncate()
-                        .text_color(match tone {
-                            BlockTone::Standard => Colors::fg_tertiary(&theme),
-                            BlockTone::Failure => Colors::error(&theme),
-                        })
+                        .text_color(label_ink)
                         .child(SharedString::from(label.to_string())),
                 )
                 .children(
@@ -5114,10 +5126,7 @@ fn mono_panel(
                 .px(px_len(Spacing::MD))
                 .py(px_len(Spacing::MD))
                 .fx_role(TextRole::MonoSmall)
-                .text_color(match tone {
-                    BlockTone::Standard => Colors::fg_secondary(&theme),
-                    BlockTone::Failure => Colors::error(&theme),
-                })
+                .text_color(body_ink)
                 .child(SelectableText::new(
                     key,
                     shown.clone(),
@@ -5246,7 +5255,7 @@ fn question_card(input: &str, place: Place) -> AnyElement {
                 .child(
                     div()
                         .fx_overline()
-                        .text_color(Colors::accent_secondary(&theme))
+                        .text_color(Colors::accent_secondary_ink(&theme))
                         .truncate()
                         .child(SharedString::from(question.header.clone())),
                 )
@@ -9678,5 +9687,97 @@ mod tests {
                 duration_label(finished.tasks()[0].elapsed(Instant::now()).as_secs())
             )
         );
+    }
+
+    // ── Polish ──────────────────────────────────────────────────────────────
+
+    /// Every tone and mode the palette is generated for.
+    fn every_theme() -> Vec<fx_design::theme::Theme> {
+        let mut themes = Vec::new();
+        for base_tone in fx_design::theme::BaseTone::ALL {
+            for appearance_mode in [
+                fx_design::theme::AppearanceMode::Light,
+                fx_design::theme::AppearanceMode::Dark,
+            ] {
+                themes.push(fx_design::theme::Theme {
+                    base_tone,
+                    appearance_mode,
+                    ..Default::default()
+                });
+            }
+        }
+        themes
+    }
+
+    #[test]
+    fn a_failure_panel_reads_in_error_ink_on_its_header_and_body() {
+        // `error` was 3.7:1 on the body's `bg_surface` in both modes.
+        for theme in every_theme() {
+            let (label, body) = BlockTone::Failure.inks(&theme);
+            let header = fx_design::theme::contrast(label, Colors::bg_elevated(&theme));
+            let panel = fx_design::theme::contrast(body, Colors::bg_surface(&theme));
+            assert!(header >= 4.5, "{theme:?}: the label is {header}:1");
+            assert!(panel >= 4.5, "{theme:?}: the body is {panel}:1");
+        }
+    }
+
+    /// A finished turn whose one group holds a done call and a failed one,
+    /// opened and painted at `width`.
+    fn opened_finished_calls(width: f32, failed_name: &str) -> (TestAppContext, VisualTestContext) {
+        let conversation = conversation_with(vec![
+            ProviderEvent::Lifecycle(Lifecycle::TurnStarted),
+            ProviderEvent::ToolUse {
+                id: "polish-done".into(),
+                name: "Read".into(),
+                input: r#"{"file_path":"/tmp/notes.md"}"#.into(),
+            },
+            ProviderEvent::ToolResult {
+                id: "polish-done".into(),
+                content: "contents".into(),
+                is_error: false,
+            },
+            ProviderEvent::ToolUse {
+                id: "polish-failed".into(),
+                name: failed_name.into(),
+                input: r#"{"command":"cargo build --workspace --all-targets"}"#.into(),
+            },
+            ProviderEvent::ToolResult {
+                id: "polish-failed".into(),
+                content: "permission denied".into(),
+                is_error: true,
+            },
+            ProviderEvent::Done {
+                stop_reason: "end_turn".into(),
+            },
+        ]);
+        let messages: Vec<_> = conversation.messages().collect();
+        let rows = build_rows(&messages, false, conversation.id);
+        let key = only_group(&rows).key.clone();
+        if !is_disclosed(&key) {
+            toggle_disclosure(&key);
+        }
+        let mut test = TestAppContext::single();
+        let window = test.add_window(|_, _| Harness { conversation });
+        let visual = VisualTestContext::from_window(*window.deref(), &test);
+        visual.simulate_resize(size(px(width), px(800.0)));
+        test.refresh().unwrap();
+        test.update(|_| {});
+        (test, visual)
+    }
+
+    #[test]
+    fn a_done_and_a_failed_call_draw_one_status_mark_size() {
+        // The check was 9pt and the failure 11pt, beside a 14pt spinner.
+        let (_test, mut visual) = opened_finished_calls(900.0, "Bash");
+        let done = visual
+            .debug_bounds("status-glyph:done")
+            .expect("a done mark");
+        let failed = visual
+            .debug_bounds("status-glyph:failed")
+            .expect("a failure mark");
+        assert_eq!(done.size, failed.size);
+        let slot =
+            Typography::icon(fx_design::components::STATUS_GLYPH_SIZE, &global::current()).size;
+        assert_eq!(done.size.width, px(slot));
     }
 }
