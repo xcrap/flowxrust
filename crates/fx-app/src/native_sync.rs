@@ -362,10 +362,47 @@ pub(crate) fn protect_missing_thread(
     }
 }
 
-pub(crate) fn same_project(left: &str, right: &str) -> bool {
-    fn canonical(path: &str) -> std::path::PathBuf {
-        std::fs::canonicalize(path).unwrap_or_else(|_| std::path::PathBuf::from(path))
+#[cfg(test)]
+thread_local! {
+    /// How many paths this thread has resolved.
+    pub(crate) static RESOLVED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+fn canonical(path: &str) -> std::path::PathBuf {
+    #[cfg(test)]
+    RESOLVED.set(RESOLVED.get() + 1);
+    std::fs::canonicalize(path).unwrap_or_else(|_| std::path::PathBuf::from(path))
+}
+
+/// A project root as one pass compares threads against it: as written and as
+/// resolved, resolved once.
+///
+/// Providers record the resolved directory, so a root that is a symlink, or
+/// under `/tmp`, never matched as written, and [`same_project`] resolved both
+/// paths for every thread at each of four checks, on every pass, on the UI
+/// thread. Only a path matching neither spelling is resolved now.
+pub(crate) struct ProjectRoot {
+    written: String,
+    resolved: std::path::PathBuf,
+}
+
+impl ProjectRoot {
+    pub fn new(root: &str) -> Self {
+        Self {
+            written: root.to_owned(),
+            resolved: canonical(root),
+        }
     }
+
+    /// Whether `path` is this root, as [`same_project`] decides.
+    pub fn is(&self, path: &str) -> bool {
+        path == self.written
+            || std::path::Path::new(path) == self.resolved
+            || canonical(path) == self.resolved
+    }
+}
+
+pub(crate) fn same_project(left: &str, right: &str) -> bool {
     // The same text resolves to the same place, and nearly every thread
     // records its project's root exactly as the project does. Resolving both
     // anyway was two `realpath` calls per thread at each of four checks, on

@@ -789,29 +789,29 @@ impl AppState {
     /// The active project's threads in sidebar order, borrowed, so a caller
     /// that wants a few of them pays for those. The menu bar is rebuilt on
     /// every render and wants nine titles; it copied every thread for them.
+    ///
+    /// Read from the index's list, which the sidebar builds in the same
+    /// frame. Mapping every thread and searching the archived and missing
+    /// lists for each was millions of comparisons a frame in a large project
+    /// of mostly archived threads.
     pub fn visible_active_agents(&self) -> impl Iterator<Item = &Agent> {
-        let record = self.active_project().and_then(|project| {
-            self.snapshot.projects.iter().find(|p| {
+        let position = self.active_project().and_then(|project| {
+            self.snapshot.projects.iter().position(|p| {
                 p.project
                     .as_ref()
                     .is_some_and(|inner| inner.id == project.id)
             })
         });
-        let by_id: HashMap<Uuid, &Agent> = record
-            .map(|record| record.agents.iter().map(|a| (a.id, a)).collect())
-            .unwrap_or_default();
-        let order: &[Uuid] = record
-            .and_then(|record| record.project.as_ref())
-            .map_or(&[], |project| project.agent_order.as_slice());
-        order
-            .iter()
-            .filter(move |id| {
-                record.is_some_and(|record| {
-                    !record.archived_agent_ids.contains(id)
-                        && !record.missing_native_agent_ids.contains(id)
-                })
+        let record = position.map(|position| &self.snapshot.projects[position]);
+        let visible: Rc<[usize]> = position
+            .and_then(|position| {
+                self.snapshot_index()
+                    .records
+                    .get(position)
+                    .map(|r| r.visible.clone())
             })
-            .filter_map(move |id| by_id.get(id).copied())
+            .unwrap_or_default();
+        (0..visible.len()).filter_map(move |at| record?.agents.get(visible[at]))
     }
 
     pub fn active_agent(&self) -> Option<Agent> {
@@ -3089,12 +3089,12 @@ impl AppState {
                     })
                     .map(|agent| agent.id)
                     .collect();
+                let here = crate::native_sync::ProjectRoot::new(&root);
                 let missing_candidates = record
                     .native_bindings
                     .iter()
                     .filter(|binding| {
-                        binding.provider_id == provider
-                            && crate::native_sync::same_project(&binding.working_directory, &root)
+                        binding.provider_id == provider && here.is(&binding.working_directory)
                     })
                     .map(|binding| (binding.agent_id, binding.session_id.clone()))
                     .collect();
@@ -3146,7 +3146,7 @@ impl AppState {
         &mut self,
         project: Uuid,
         provider: &str,
-        root: &str,
+        root: &crate::native_sync::ProjectRoot,
         waiting: Vec<(Uuid, String)>,
     ) {
         let threads: HashSet<Uuid> = self
@@ -3156,8 +3156,7 @@ impl AppState {
             .filter(|record| record.project.as_ref().is_some_and(|p| p.id == project))
             .flat_map(|record| &record.native_bindings)
             .filter(|binding| {
-                binding.provider_id == provider
-                    && crate::native_sync::same_project(&binding.working_directory, root)
+                binding.provider_id == provider && root.is(&binding.working_directory)
             })
             .map(|binding| binding.agent_id)
             .collect();
@@ -3167,7 +3166,7 @@ impl AppState {
     }
 
     fn apply_native_completion(&mut self, completion: crate::native_sync::Completion) -> bool {
-        use crate::native_sync::{Payload, RequestKind, same_project};
+        use crate::native_sync::{Payload, ProjectRoot, RequestKind, same_project};
         let ticket = completion.ticket;
         let expected_root = match &ticket.kind {
             RequestKind::Index { .. } => self.project(ticket.project).map(|p| p.root_path.clone()),
@@ -3185,7 +3184,7 @@ impl AppState {
                     self.forget_waiting_elsewhere(
                         ticket.project,
                         &ticket.provider,
-                        &ticket.root,
+                        &ProjectRoot::new(&ticket.root),
                         Vec::new(),
                     );
                     self.native_sync.warnings.insert(
@@ -3205,6 +3204,7 @@ impl AppState {
                 protected,
             }) => {
                 let mut warnings = index.warnings;
+                let here = ProjectRoot::new(&ticket.root);
                 let mut waiting = Vec::new();
                 let present: HashSet<_> = index
                     .threads
@@ -3288,7 +3288,7 @@ impl AppState {
                     let identity = &entry.summary.identity;
                     if identity.provider_id != ticket.provider
                         || identity.session_id.is_empty()
-                        || !same_project(&entry.summary.working_directory, &ticket.root)
+                        || !here.is(&entry.summary.working_directory)
                     {
                         warnings.push("A native history entry belonged to another provider or project and was ignored.".into());
                         continue;
@@ -3410,7 +3410,7 @@ impl AppState {
                 if warnings.is_empty() {
                     for binding in record.native_bindings.iter().filter(|binding| {
                         binding.provider_id == ticket.provider
-                            && same_project(&binding.working_directory, &ticket.root)
+                            && here.is(&binding.working_directory)
                     }) {
                         let id = binding.agent_id;
                         let protected = protected.contains(&id)
@@ -3461,12 +3461,7 @@ impl AppState {
                         self.commit_thread_change(next, "save native thread discovery");
                     }
                 }
-                self.forget_waiting_elsewhere(
-                    ticket.project,
-                    &ticket.provider,
-                    &ticket.root,
-                    waiting,
-                );
+                self.forget_waiting_elsewhere(ticket.project, &ticket.provider, &here, waiting);
                 self.native_sync
                     .warnings
                     .insert((ticket.project, ticket.provider), warnings);
@@ -3484,7 +3479,7 @@ impl AppState {
                 self.forget_waiting_elsewhere(
                     ticket.project,
                     &ticket.provider,
-                    &ticket.root,
+                    &ProjectRoot::new(&ticket.root),
                     Vec::new(),
                 );
                 self.native_sync
@@ -9231,6 +9226,93 @@ mod native_sync_tests {
                     order(state),
                     vec![d_id, c_id, worktree, created, b_id, a_id]
                 );
+            })
+        });
+    }
+
+    #[test]
+    fn a_root_that_is_a_symlink_is_resolved_once_a_pass() {
+        // Providers record the resolved directory, so a root that is a
+        // symlink, or under /tmp, never matched as written: each of four
+        // checks resolved both paths, for every thread, on every pass, on
+        // the UI thread.
+        let temp = tempfile::tempdir().unwrap();
+        let real = temp.path().join("real");
+        std::fs::create_dir(&real).unwrap();
+        let link = temp.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let root = link.to_string_lossy().to_string();
+        let resolved = std::fs::canonicalize(&real)
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+        let test = gpui::TestAppContext::single();
+        let (state, project) =
+            test.update(|cx| setup(cx, AppPaths::at(temp.path().join("store")), &root));
+        test.update(|cx| {
+            state.update(cx, |state, cx| {
+                let entries: Vec<_> = (0..40)
+                    .map(|i| entry(&resolved, "codex", &format!("s{i}"), &format!("T{i}")))
+                    .collect();
+                index(state, project, "codex", entries.clone(), Vec::new());
+                assert_eq!(state.visible_active_agents().count(), 40);
+                let (codex_jobs, _codex_results) = state.native_sync.test_worker("codex");
+                let (_claude_jobs, _claude_results) = state.native_sync.test_worker("claude");
+                state.snapshot.active_agent_id = None;
+                crate::native_sync::RESOLVED.set(0);
+                state.poll_native_sync(cx);
+                let ticket = codex_jobs.try_recv().unwrap();
+                state.apply_native_completion(Completion {
+                    ticket,
+                    result: Ok(Payload::Index {
+                        index: NativeThreadIndex {
+                            threads: entries,
+                            warnings: Vec::new(),
+                        },
+                        sessions: Vec::new(),
+                        protected: Vec::new(),
+                    }),
+                });
+                assert_eq!(state.visible_active_agents().count(), 40);
+                assert!(
+                    crate::native_sync::RESOLVED.get() <= 3,
+                    "{} paths resolved",
+                    crate::native_sync::RESOLVED.get()
+                );
+            })
+        });
+    }
+
+    #[test]
+    fn the_menu_bars_threads_are_read_from_the_index() {
+        // The menu bar asks for the first nine threads on every render. They
+        // were found by mapping every thread and searching the archived and
+        // missing lists for each: millions of comparisons a frame in a large
+        // project of mostly archived threads.
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().to_string_lossy().to_string();
+        let test = gpui::TestAppContext::single();
+        let (state, project) =
+            test.update(|cx| setup(cx, AppPaths::at(temp.path().join("store")), &root));
+        test.update(|cx| {
+            state.update(cx, |state, _| {
+                let entries = (0..12)
+                    .map(|i| entry(&root, "codex", &format!("s{i}"), &format!("T{i}")))
+                    .collect();
+                index(state, project, "codex", entries, Vec::new());
+                let order = state.snapshot.projects[0]
+                    .project
+                    .as_ref()
+                    .unwrap()
+                    .agent_order
+                    .clone();
+                let record = &mut state.snapshot.projects[0];
+                record.archived_agent_ids = order[1..10].to_vec();
+                record.missing_native_agent_ids = vec![order[11]];
+                assert!(state.current_index().is_none());
+                let listed: Vec<Uuid> = state.visible_active_agents().map(|a| a.id).collect();
+                assert_eq!(listed, vec![order[0], order[10]]);
+                assert!(state.current_index().is_some(), "the threads were scanned");
             })
         });
     }
