@@ -733,14 +733,15 @@ impl Job {
         );
 
         // The account's limits, which Codex reports as they change during a
-        // turn but says nothing about before one. Bounded, and an answer the
-        // turn does not wait on: an account without limits may refuse or
-        // never answer, and neither is a reason to hold the prompt.
-        if let Ok(Ok(Some(limits))) =
-            tokio::time::timeout(RATE_LIMITS_TIMEOUT, session.rate_limits()).await
-        {
-            self.apply(fx_agent::ProviderEvent::RateLimits(limits));
-        }
+        // turn but says nothing about before one. Read beside the turn and
+        // applied when they land: an account without limits may refuse or
+        // never answer, and awaited first, every prompt waited on the read
+        // and a Stop meanwhile went unheard.
+        let mut limits = Box::pin(tokio::time::timeout(
+            RATE_LIMITS_TIMEOUT,
+            session.rate_limits(),
+        ));
+        let mut limits_read = false;
 
         // Whether `Accepted` went out from inside the turn, so a Stop that has to
         // report it afterwards does not report it twice. Atomic only because
@@ -793,6 +794,12 @@ impl Job {
                     (id, result) = steering.next_answer(), if steering.in_flight() => {
                         self.steer_settled(&mut steering, id, result);
                     }
+                    // Before the turn, so the read is written first, and an
+                    // answer that lands is taken before the turn can end.
+                    read = &mut limits, if !limits_read => {
+                        limits_read = true;
+                        self.limits_read(read);
+                    }
                     ending = &mut turn => break Ending::Ran(ending),
                     _ = interrupts.recv() => break Ending::Interrupted,
                     // Steering is a request made while the turn's own future
@@ -803,9 +810,19 @@ impl Job {
                 }
             };
             drop(turn);
+            // An answer that landed in the poll that ended the turn. Anything
+            // later is not waited for.
+            if !limits_read && let Some(read) = futures::FutureExt::now_or_never(&mut limits) {
+                self.limits_read(read);
+            }
             ending
         };
-        self.abandon_steers(&mut steering, &mut steers).await;
+        // A Stop settles guidance in flight after its interrupt, not before:
+        // given its moment first, a steer held Stop back from Codex, and the
+        // composer from saying so, for as long as it was allowed.
+        if !matches!(ending, Ending::Interrupted) {
+            self.abandon_steers(&mut steering, &mut steers).await;
+        }
         drop(files);
 
         // A turn that failed or was stopped part-way can leave a tool running,
@@ -836,6 +853,7 @@ impl Job {
                 // a server that has gone cannot be told. The turn ends as
                 // cancelled either way.
                 let _ = tokio::time::timeout(Duration::from_secs(2), session.interrupt()).await;
+                self.abandon_steers(&mut steering, &mut steers).await;
                 // A Stop between writing `turn/start` and its reply: the
                 // interrupt collected that reply, and a prompt Codex has must not
                 // be offered back, or sending it again delivers it twice.
@@ -983,7 +1001,11 @@ impl Job {
                         // panel sends only the kind it shows.
                         Err(ClaudeTransportError::NotAControl { .. }) => {}
                         // Claude holds no such request, so nobody is waiting.
+                        // Nor can one asked after the input closed be answered:
+                        // a steer that raced the last `result` is answered then,
+                        // and Claude fails the call itself and goes on.
                         Err(ClaudeTransportError::UnknownControl { .. }) => { waiting.remove(&id); self.resolve(id); }
+                        Err(ClaudeTransportError::InputClosed) if background.input_closed => { waiting.remove(&id); self.resolve(id); }
                         // The answer could not be delivered, so Claude will
                         // never get it. Left open, the request kept both of the
                         // panel's buttons disabled with nothing left to clear
@@ -1042,6 +1064,10 @@ impl Job {
                                         // Claude withdrew it before the policy
                                         // answered: nothing is waiting for a reply.
                                         Ok(()) | Err(ClaudeTransportError::UnknownControl { .. }) => {}
+                                        // Asked after the input closed, by the
+                                        // answer to a steer that raced the last
+                                        // `result`: Claude fails the call itself.
+                                        Err(ClaudeTransportError::InputClosed) if background.input_closed => {}
                                         Err(error) => break TurnOutcome::Failed { thread_id, reason: error.to_string() },
                                     }
                                     continue;
@@ -1100,14 +1126,25 @@ impl Job {
                                 }
                             }
                         }
-                        Some(StreamItem::Exited(exit)) => match background.completed_at_exit() {
-                            Some(stop_reason) => break TurnOutcome::Completed { thread_id, stop_reason },
-                            None => break TurnOutcome::Failed { thread_id, reason: exit.reason() },
-                        },
-                        None => match background.completed_at_exit() {
-                            Some(stop_reason) => break TurnOutcome::Completed { thread_id, stop_reason },
-                            None => break TurnOutcome::Failed { thread_id, reason: "Claude Code ended before reporting a result.".into() },
-                        },
+                        // The transport also closes the input at a line that is
+                        // not a `result`: a task that ended owing nothing, such
+                        // as one killed while Claude was idle. Claude then exits
+                        // with nothing more to say, and only the input says the
+                        // turn it answered was over.
+                        Some(StreamItem::Exited(exit)) => {
+                            background.input_closed |= !transport.input_open().await;
+                            match background.completed_at_exit() {
+                                Some(stop_reason) => break TurnOutcome::Completed { thread_id, stop_reason },
+                                None => break TurnOutcome::Failed { thread_id, reason: exit.reason() },
+                            }
+                        }
+                        None => {
+                            background.input_closed |= !transport.input_open().await;
+                            match background.completed_at_exit() {
+                                Some(stop_reason) => break TurnOutcome::Completed { thread_id, stop_reason },
+                                None => break TurnOutcome::Failed { thread_id, reason: "Claude Code ended before reporting a result.".into() },
+                            }
+                        }
                     }
                 }
             }
@@ -1418,6 +1455,20 @@ impl Job {
         emit(&self.on_update, SessionUpdate::Changed);
     }
 
+    /// The account's limits, read once a Codex thread is open. A refusal, a
+    /// timeout or an account with none says nothing.
+    fn limits_read(
+        &self,
+        read: Result<
+            Result<Option<fx_agent::provider::RateLimits>, fx_agent::ProviderError>,
+            tokio::time::error::Elapsed,
+        >,
+    ) {
+        if let Ok(Ok(Some(limits))) = read {
+            self.apply(ProviderEvent::RateLimits(limits));
+        }
+    }
+
     fn resolve(&self, id: String) {
         let mut conversation = lock(&self.conversation);
         conversation.remove_approval(&id);
@@ -1482,6 +1533,10 @@ impl Job {
         // would discard the turn's last and often only sentence. `fail` commits
         // for the same reason.
         conversation.commit_streaming();
+        // A stopped turn's calls still running were stopped with it.
+        if matches!(outcome, TurnOutcome::Cancelled { .. }) {
+            conversation.end_unanswered_calls("Stopped with the turn.");
+        }
         // Guidance no request read is still the reader's, and stays where they
         // can see it: at the end, after the turn's last words.
         conversation.place_steers();
@@ -1520,6 +1575,7 @@ impl Job {
         };
         let mut conversation = lock(&self.conversation);
         conversation.commit_streaming();
+        conversation.end_unanswered_calls("Ended when the turn failed.");
         conversation.place_steers();
         conversation.stop_running_tasks("Ended when the turn failed.");
         conversation.set_error(reason.clone());
@@ -2657,6 +2713,17 @@ def background(prompt):
             ANSWER_ORIGIN.append("task-notification")
             send({"type":"control_request","request_id":"control-f","request":{"subtype":"can_use_tool","tool_name":"Bash","tool_use_id":"tool-f","input":{"command":"cargo test"}}})
         worker=threading.Thread(target=later)
+    elif prompt=="background-killed":
+        # A task killed while Claude is idle, as TaskStop or a Monitor's
+        # timeout does: Claude marks it told as it kills it, so nothing is
+        # owed. Its input closes, and Claude answers the context question
+        # and exits 0 with no `result` after the first.
+        def later():
+            while not Path("release-background").exists(): time.sleep(0.005)
+            send({"type":"system","subtype":"task_updated","task_id":"task-1","patch":{"status":"killed","end_time":1}})
+            send({"type":"system","subtype":"task_notification","task_id":"task-1","tool_use_id":"tool-bg","status":"stopped","summary":"Agent \"review the transport\" was stopped"})
+        worker=threading.Thread(target=later, daemon=True)
+        finish("started")
     else:
         def later():
             while not Path("release-background").exists(): time.sleep(0.005)
@@ -2704,6 +2771,37 @@ for line in sys.stdin:
             continue
         turn()
         if prompt=="hang": continue
+        if prompt=="steer-after-result":
+            # The race: a steer written just before FlowX read a `result`
+            # with nothing queued. The line is held open until the steer
+            # arrives, only so that FlowX writes it first; Claude sees what it
+            # would either way, a message after its `result`, and answers it
+            # as a turn of its own with its input about to close.
+            send({"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"done"}}})
+            result=json.dumps({"type":"result","subtype":"end_turn","session_id":SESSION,"queued_turn_count":0,"usage":{"input_tokens":5,"output_tokens":2}})
+            with LOCK:
+                sys.stdout.write(result[:-1]); sys.stdout.flush()
+            Path("result-started").write_text("1")
+            steer=json.loads(sys.stdin.readline())
+            record(steer)
+            with LOCK:
+                sys.stdout.write(result[-1:] + "\n"); sys.stdout.flush()
+            turn()
+            send({"type":"command_lifecycle","state":"started","command_uuid":steer.get("uuid")})
+            send({"type":"control_request","request_id":"control-s","request":{"subtype":"can_use_tool","tool_name":"Bash","tool_use_id":"tool-s","input":{"command":"cargo test"}}})
+            # Assumed from the "Stream closed" Claude reports for a follow-up
+            # whose input closed: the permission fails inside Claude, and the
+            # turn goes on without it.
+            for rest in sys.stdin:
+                rest=json.loads(rest)
+                record(rest)
+                if rest.get("type")=="control_request":
+                    send({"type":"control_response","response":{"subtype":"success","request_id":rest.get("request_id"),
+                          "response":{"categories":[],"totalTokens":1200,"maxTokens":200000}}})
+            while not Path("release-closed-steer").exists(): time.sleep(0.005)
+            send({"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"tool-s","is_error":True,"content":"Stream closed"}]}})
+            finish("answered without it")
+            sys.exit(0)
         if prompt=="late-steer":
             # The race: a steer written just before a request goes out is not
             # in that request. Claude Code 2.1.283 names the message it takes
@@ -2750,11 +2848,11 @@ for line in sys.stdin:
             time.sleep(0.5)
             send({"type":"control_request","request_id":"control-b","request":{"subtype":"can_use_tool","tool_name":"Bash","tool_use_id":"tool-b","input":{"command":"cargo build"}}})
             while True: time.sleep(1)
-        if prompt in ("quiet", "quiet-tool", "quiet-exit"):
-            if prompt=="quiet-tool":
+        if prompt in ("quiet", "quiet-tool", "quiet-exit", "quiet-tool-exit"):
+            if prompt in ("quiet-tool", "quiet-tool-exit"):
                 send({"type":"assistant","message":{"content":[{"type":"tool_use","id":"long-tool","name":"Bash","input":{"command":"long-running build"}}]}})
             while not Path("release-quiet-turn").exists(): time.sleep(0.005)
-            if prompt=="quiet-exit":
+            if prompt in ("quiet-exit", "quiet-tool-exit"):
                 print("fixture process failed", file=sys.stderr, flush=True)
                 sys.exit(7)
             if prompt=="quiet-tool":
@@ -3898,6 +3996,8 @@ def record_steer(params):
     send({"jsonrpc": "2.0", "method": "item/completed", "params": {"item": item}})
 
 workflow = "default"
+# An `account/rateLimits/read` held until the turn starts, when asked to be.
+held_limits = None
 for line in sys.stdin:
     line = line.strip()
     if not line:
@@ -3926,11 +4026,16 @@ for line in sys.stdin:
         for item in (msg.get("params") or {}).get("input") or []:
             if item.get("type") == "text":
                 prompt = item.get("text") or ""
-        if prompt == "slow-ack":
+        if prompt in ("slow-ack", "slow-ack-steer"):
             # Codex has the prompt; its reply is still on the way when Stop lands.
             open("THREAD_LOG" + ".turn-start", "w").close()
             time.sleep(0.5)
         send({"jsonrpc": "2.0", "id": mid, "result": {"turn": {"id": "turn-1"}}})
+        if held_limits is not None:
+            # What a ChatGPT account reports, answered only now.
+            send({"jsonrpc": "2.0", "id": held_limits, "result": {"rateLimits": {
+                "primary": {"usedPercent": 42, "windowDurationMins": 300, "resetsAt": 1793980800}}}})
+            held_limits = None
 
         if prompt == "spawn-and-hang":
             # A tool that is still running when the user presses Stop, in a
@@ -3980,7 +4085,25 @@ for line in sys.stdin:
             record_steer(params)
             send({"jsonrpc": "2.0", "method": "item/agentMessage/delta", "params": {"itemId": "msg-2", "delta": "Switching to staging."}})
             send({"jsonrpc": "2.0", "method": "turn/completed", "params": {"turn": {"id": "turn-1", "status": "completed"}}})
-        elif prompt == "wait-for-steer":
+        elif prompt == "steer-unanswered":
+            # Takes a steer and never answers it, until Stop.
+            send({"jsonrpc": "2.0", "method": "turn/started", "params": {"turn": {"id": "turn-1"}}})
+            while True:
+                waiting = sys.stdin.readline()
+                if not waiting:
+                    sys.exit(0)
+                if not waiting.strip():
+                    continue
+                request = json.loads(waiting)
+                if request.get("method") == "turn/steer":
+                    with open("THREAD_LOG", "a") as log:
+                        log.write(json.dumps({"method": "turn/steer", "params": request.get("params")}) + "\n")
+                if request.get("method") == "turn/interrupt":
+                    with open("THREAD_LOG" + ".interrupts", "a") as log:
+                        log.write(json.dumps(request.get("params")) + "\n")
+                    send({"jsonrpc": "2.0", "id": request.get("id"), "result": {}})
+                    break
+        elif prompt in ("wait-for-steer", "slow-ack-steer"):
             # Starts, then waits for guidance and answers it within the turn.
             send({"jsonrpc": "2.0", "method": "turn/started", "params": {"turn": {"id": "turn-1"}}})
             while True:
@@ -4073,6 +4196,10 @@ for line in sys.stdin:
             send({"jsonrpc": "2.0", "method": "turn/completed",
                   "params": {"turn": {"id": "turn-1", "status": "completed",
                                       "usage": {"input_tokens": 12, "output_tokens": 3}}}})
+    elif method == "account/rateLimits/read" and os.path.exists("THREAD_LOG" + ".slow-limits"):
+        # The account's limits are Codex asking its backend, which can be
+        # slow; held here until the turn starts.
+        held_limits = mid
     elif method == "turn/interrupt":
         with open("THREAD_LOG" + ".interrupts", "a") as log:
             log.write(json.dumps(msg.get("params")) + "\n")
@@ -4363,6 +4490,134 @@ for line in sys.stdin:
             );
         }
         assert!(!rows(&conversation).contains(&"text: too late".to_string()));
+    }
+
+    #[test]
+    fn guidance_sent_before_codex_acknowledges_the_turn_waits_for_it() {
+        // The composer offers Steer as soon as a turn is running, which is
+        // before Codex has answered `turn/start`. A steer sent then was
+        // refused: "Codex has not started a steerable turn yet".
+        let Some(server) = FakeServer::new() else {
+            return;
+        };
+        let Some(provider) = server.provider() else {
+            return;
+        };
+        let conversation = conversation();
+        let (runner, recorder) = start(
+            &conversation,
+            provider,
+            "slow-ack-steer",
+            ApprovalPolicy::AllowAll,
+        );
+        let marker = server.log.with_extension("turn-start");
+        wait_until(&recorder, "turn/start", || marker.exists());
+        let id = Uuid::new_v4();
+        assert!(runner.steer(id, "use zsh".into(), Vec::new()));
+        let updates = recorder.wait_for_end(TURN_BUDGET);
+        assert!(
+            updates.contains(&SessionUpdate::Steered { id, result: Ok(()) }),
+            "{updates:?}"
+        );
+        assert_eq!(
+            rows(&conversation),
+            vec!["text: use zsh", "text: Steered: use zsh"]
+        );
+        let steer = server
+            .thread_calls()
+            .into_iter()
+            .find(|(method, _)| method == "turn/steer")
+            .expect("Codex was steered");
+        assert_eq!(steer.1["expectedTurnId"], "turn-1");
+    }
+
+    #[test]
+    fn stopping_a_codex_turn_interrupts_before_it_settles_guidance_in_flight() {
+        // Guidance still unanswered was given its two seconds first, so a
+        // Stop reached Codex, and the composer said "stopping", only after.
+        let Some(server) = FakeServer::new() else {
+            return;
+        };
+        let Some(provider) = server.provider() else {
+            return;
+        };
+        let conversation = conversation();
+        let (runner, recorder) = start(
+            &conversation,
+            provider,
+            "steer-unanswered",
+            ApprovalPolicy::AllowAll,
+        );
+        wait_for_phase(&conversation, Phase::Running);
+        let id = Uuid::new_v4();
+        assert!(runner.steer(id, "use zsh".into(), Vec::new()));
+        wait_until(&recorder, "the steer to reach Codex", || {
+            server
+                .thread_calls()
+                .iter()
+                .any(|(method, _)| method == "turn/steer")
+        });
+        let stopped = Instant::now();
+        runner.interrupt();
+        wait_for_file(&server.log.with_extension("interrupts"));
+        assert!(
+            stopped.elapsed() < STEER_SETTLE,
+            "Stop reached Codex after {:?}",
+            stopped.elapsed()
+        );
+        let updates = recorder.wait_for_end(TURN_BUDGET);
+        assert!(
+            matches!(
+                updates.last(),
+                Some(SessionUpdate::Finished {
+                    outcome: TurnOutcome::Cancelled { .. }
+                })
+            ),
+            "{updates:?}"
+        );
+        // Still answered, after the interrupt.
+        assert!(
+            updates.iter().any(|update| matches!(
+                update,
+                SessionUpdate::Steered { id: steered, result: Err(_) } if *steered == id
+            )),
+            "{updates:?}"
+        );
+    }
+
+    #[test]
+    fn the_accounts_limits_are_read_beside_the_turn_not_before_it() {
+        // The read was awaited before `turn/start`, for up to two seconds, so
+        // every prompt waited on Codex's backend, and limits that answered
+        // only once the turn had started were never shown.
+        let Some(server) = FakeServer::new() else {
+            return;
+        };
+        let Some(provider) = server.provider() else {
+            return;
+        };
+        std::fs::write(server.log.with_extension("slow-limits"), "").unwrap();
+        let conversation = conversation();
+        let started = Instant::now();
+        let (_runner, recorder) = start(&conversation, provider, "hello", ApprovalPolicy::AllowAll);
+        let updates = recorder.wait_for_end(TURN_BUDGET);
+        assert!(
+            matches!(updates.last(), Some(SessionUpdate::Finished { outcome }) if outcome.is_completed()),
+            "{updates:?}"
+        );
+        assert!(
+            updates.iter().any(|update| matches!(
+                update,
+                SessionUpdate::RateLimits { provider, limits }
+                    if provider == "codex" && limits.windows.len() == 1
+            )),
+            "{updates:?}"
+        );
+        assert!(
+            started.elapsed() < RATE_LIMITS_TIMEOUT,
+            "the prompt waited {:?} on the limits",
+            started.elapsed()
+        );
     }
 
     #[test]
@@ -4687,6 +4942,92 @@ for line in sys.stdin:
     }
 
     #[test]
+    fn a_task_that_ends_owing_nothing_lets_the_answered_turn_complete_at_exit() {
+        // The transport closed Claude's input at the killed task's patch,
+        // with no `result` after it, and Claude exited 0. Only a `result`
+        // marked the input closed for the turn, so that exit read as one
+        // part-way through the turn: the answered turn failed, and the tree
+        // was killed.
+        let Some(server) = ClaudeFixture::new() else {
+            return;
+        };
+        let conversation = conversation();
+        let (_runner, recorder) =
+            server.start(&conversation, "background-killed", AgentAccess::FullAccess);
+        wait_for_the_background_wait(&conversation, &recorder);
+        assert!(!ended(&recorder), "the turn ended with a task running");
+        std::fs::write(server.dir.path().join("release-background"), "go").unwrap();
+        let updates = recorder.wait_for_end(TURN_BUDGET);
+        assert!(
+            matches!(updates.last(), Some(SessionUpdate::Finished { outcome }) if outcome.is_completed()),
+            "{updates:?}"
+        );
+        let conversation = lock(&conversation);
+        assert_eq!(conversation.error(), None);
+        assert_eq!(
+            conversation.tasks()[0].status,
+            fx_agent::TaskStatus::Stopped
+        );
+        assert_eq!(conversation.last_text().as_deref(), Some("started"));
+    }
+
+    #[test]
+    fn a_steer_claude_answers_after_its_input_closed_does_not_fail_the_turn() {
+        // A steer written just before FlowX read a `result` with nothing
+        // queued is answered after it, once Claude's input has closed. The
+        // answer to that turn's permission could not be written, and the
+        // turn failed for it: by policy under Full Access, and on the
+        // reader's click under Supervised. Claude fails the call itself.
+        let Some(server) = ClaudeFixture::new() else {
+            return;
+        };
+        for access in [AgentAccess::FullAccess, AgentAccess::Supervised] {
+            for marker in ["result-started", "release-closed-steer"] {
+                let _ = std::fs::remove_file(server.dir.path().join(marker));
+            }
+            let conversation = conversation();
+            let (runner, recorder) = server.start(&conversation, "steer-after-result", access);
+            wait_for_file(&server.dir.path().join("result-started"));
+            let id = Uuid::new_v4();
+            assert!(runner.steer(id, "use zsh".into(), Vec::new()));
+            if access == AgentAccess::Supervised {
+                let ProviderEvent::Approval(request) = wait_for_interaction(&recorder) else {
+                    panic!("approval expected")
+                };
+                assert!(runner.respond(UserResponse::Approval {
+                    id: request.id.clone(),
+                    approved: true
+                }));
+                let resolved = SessionUpdate::InteractionResolved { id: request.id };
+                wait_until(&recorder, "the card to go", || {
+                    recorder.updates().contains(&resolved) || ended(&recorder)
+                });
+            } else {
+                wait_until(&recorder, "the steer's turn", || {
+                    rows(&conversation).iter().any(|row| row == "text: use zsh")
+                });
+                // Long enough for the policy's answer to fail the turn.
+                std::thread::sleep(Duration::from_millis(300));
+            }
+            assert!(!ended(&recorder), "{access:?}: {:?}", recorder.updates());
+            std::fs::write(server.dir.path().join("release-closed-steer"), "go").unwrap();
+            let updates = recorder.wait_for_end(TURN_BUDGET);
+            assert!(
+                matches!(updates.last(), Some(SessionUpdate::Finished { outcome }) if outcome.is_completed()),
+                "{access:?}: {updates:?}"
+            );
+            assert!(updates.contains(&SessionUpdate::Steered { id, result: Ok(()) }));
+            assert_eq!(lock(&conversation).error(), None);
+            assert_eq!(
+                rows(&conversation).last().map(String::as_str),
+                Some("text: answered without it"),
+                "{:?}",
+                rows(&conversation)
+            );
+        }
+    }
+
+    #[test]
     fn stopping_claude_while_it_waits_on_a_background_task_ends_the_process_group() {
         let Some(server) = ClaudeFixture::new() else {
             return;
@@ -4724,6 +5065,73 @@ for line in sys.stdin:
             conversation.tasks()[0].summary.as_deref(),
             Some("Stopped with the turn.")
         );
+    }
+
+    /// The last row, read as a call's result: its id, text and whether it
+    /// is an error.
+    fn last_result(conversation: &Mutex<Conversation>) -> Option<(String, String, bool)> {
+        match lock(conversation).messages().last()?.content.as_slice() {
+            [
+                MessageContent::ToolResult {
+                    id,
+                    content,
+                    is_error,
+                },
+            ] => Some((id.clone(), content.clone(), *is_error)),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn a_stopped_or_failed_turn_does_not_leave_its_calls_reading_as_succeeded() {
+        // A settled group draws a call with no result as finished, and
+        // neither ending recorded one: "Ran command cargo build" with a green
+        // check after the user had stopped the build.
+        let Some(server) = ClaudeFixture::new() else {
+            return;
+        };
+        let conversation = conversation();
+        let (runner, recorder) = server.start(&conversation, "quiet-tool", AgentAccess::FullAccess);
+        wait_until(&recorder, "the call", || {
+            rows(&conversation).iter().any(|row| row == "call: Bash")
+        });
+        runner.interrupt();
+        let updates = recorder.wait_for_end(TURN_BUDGET);
+        assert!(
+            matches!(
+                updates.last(),
+                Some(SessionUpdate::Finished {
+                    outcome: TurnOutcome::Cancelled { .. }
+                })
+            ),
+            "{updates:?}"
+        );
+        assert_eq!(
+            last_result(&conversation),
+            Some(("long-tool".into(), "Stopped with the turn.".into(), true))
+        );
+
+        let conversation = self::conversation();
+        let (_runner, recorder) =
+            server.start(&conversation, "quiet-tool-exit", AgentAccess::FullAccess);
+        wait_until(&recorder, "the call", || {
+            rows(&conversation).iter().any(|row| row == "call: Bash")
+        });
+        std::fs::write(server.dir.path().join("release-quiet-turn"), "go").unwrap();
+        let updates = recorder.wait_for_end(TURN_BUDGET);
+        assert!(
+            matches!(updates.last(), Some(SessionUpdate::Failed { .. })),
+            "{updates:?}"
+        );
+        assert_eq!(
+            last_result(&conversation),
+            Some((
+                "long-tool".into(),
+                "Ended when the turn failed.".into(),
+                true
+            ))
+        );
+        assert_eq!(rows(&conversation), ["call: Bash", "result"]);
     }
 
     #[test]

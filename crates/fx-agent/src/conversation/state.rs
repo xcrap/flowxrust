@@ -1413,6 +1413,47 @@ impl Conversation {
         self.completed_tool_lookup.contains(id)
     }
 
+    /// Give every call the current turn started and never heard back about
+    /// `reason` as its error result.
+    ///
+    /// For a turn that was stopped or failed: its process is gone, so those
+    /// calls will never report, and a settled group draws a call with no
+    /// result as one that finished — a green check on the build the user had
+    /// just stopped. A plan call never has a result, and is left alone.
+    pub fn end_unanswered_calls(&mut self, reason: &str) {
+        let Some(started) = self.turn_started_at else {
+            return;
+        };
+        let unanswered: Vec<String> = self
+            .messages
+            .iter()
+            .rev()
+            .take_while(|message| message.timestamp >= started)
+            .flat_map(|message| message.content.iter())
+            .filter_map(|block| match block {
+                fx_core::MessageContent::ToolUse { id, name, .. }
+                    if !fx_core::policy::TurnPlan::is_plan_tool(name)
+                        && !self.has_completed_tool(id) =>
+                {
+                    Some(id.clone())
+                }
+                _ => None,
+            })
+            .collect();
+        for id in unanswered.into_iter().rev() {
+            self.claim_tool_id(&id);
+            self.clear_live_output(&id);
+            self.append(ConversationMessage::new(
+                MessageRole::Tool,
+                vec![fx_core::MessageContent::ToolResult {
+                    id,
+                    content: reason.to_string(),
+                    is_error: true,
+                }],
+            ));
+        }
+    }
+
     // ── Events ─────────────────────────────────────────────────────────────
 
     /// Apply one provider event.
@@ -2969,6 +3010,60 @@ mod tests {
             crate::provider::Lifecycle::TurnStarted,
         ));
         assert!(c.turn_started_at().unwrap() > started);
+    }
+
+    #[test]
+    fn only_the_turns_own_unanswered_calls_are_ended_with_it() {
+        let call = |id: &str, name: &str| ProviderEvent::ToolUse {
+            id: id.into(),
+            name: name.into(),
+            input: "{}".into(),
+        };
+        let results = |c: &Conversation| -> Vec<(String, String)> {
+            c.messages()
+                .flat_map(|message| message.content.iter())
+                .filter_map(|block| match block {
+                    fx_core::MessageContent::ToolResult {
+                        id,
+                        content,
+                        is_error: true,
+                    } => Some((id.clone(), content.clone())),
+                    _ => None,
+                })
+                .collect()
+        };
+        let mut c = Conversation::new(Uuid::nil());
+        // An earlier turn's call is that turn's business.
+        c.set_phase(Phase::Running);
+        c.apply(call("earlier", "Bash"));
+        c.set_phase(Phase::Idle);
+        std::thread::sleep(std::time::Duration::from_millis(2));
+
+        c.set_phase(Phase::Starting);
+        // Answered, with nothing worth a row: claimed all the same.
+        c.apply(call("answered", "Read"));
+        c.apply(ProviderEvent::ToolResult {
+            id: "answered".into(),
+            content: String::new(),
+            is_error: false,
+        });
+        c.apply(call("running", "Bash"));
+        c.apply(ProviderEvent::ToolOutputDelta {
+            id: "running".into(),
+            delta: "Compiling".into(),
+        });
+        // A plan call never has a result.
+        c.apply(call("plan", "TodoWrite"));
+        c.end_unanswered_calls("Stopped with the turn.");
+        assert_eq!(
+            results(&c),
+            [("running".to_string(), "Stopped with the turn.".to_string())]
+        );
+        assert!(c.has_completed_tool("running"));
+        assert_eq!(c.live_output("running"), None);
+        // Nothing is left to end a second time.
+        c.end_unanswered_calls("again");
+        assert_eq!(results(&c).len(), 1);
     }
 
     #[test]

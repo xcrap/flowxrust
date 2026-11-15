@@ -41,7 +41,9 @@ use crate::codex::session::{
 };
 use crate::codex::session::{goal_set_params, steer_params};
 use crate::codex::transport::Requester;
-use crate::codex::transport::{PendingResponse, ServerEvent, Transport, TransportError};
+use crate::codex::transport::{
+    CONTROL_REQUEST_TIMEOUT, PendingResponse, ServerEvent, Transport, TransportError,
+};
 use crate::elicitation::{Elicitation, Reply};
 use crate::provider::{ApprovalRequest, ProviderError, ProviderEvent, RiskLevel, UserResponse};
 use fx_core::models::goal::{ConversationGoal, GoalStatus};
@@ -159,8 +161,9 @@ pub struct CodexSession {
     /// it says whether the prompt was taken, and which turn to interrupt.
     starting: Option<PendingResponse>,
     /// The running turn's id, readable by a [`TurnSteerer`] while
-    /// `run_turn_interactive` holds the session mutably.
-    steer_turn: std::sync::Arc<std::sync::Mutex<Option<String>>>,
+    /// `run_turn_interactive` holds the session mutably, and waited for by
+    /// one sent before Codex acknowledged the turn.
+    steer_turn: tokio::sync::watch::Sender<Option<String>>,
     approvals: ApprovalPolicy,
     /// The thread's `cwd`, which every turn and steer runs in and which a
     /// prompt's `@path` mentions are resolved against.
@@ -218,7 +221,7 @@ impl CodexSession {
             thread_id,
             active_turn_id: None,
             starting: None,
-            steer_turn: Default::default(),
+            steer_turn: tokio::sync::watch::Sender::new(None),
             approvals,
             working_directory: working_directory.to_string(),
         })
@@ -323,10 +326,7 @@ impl CodexSession {
         self.starting = None;
         let turn_id = turn_id_of(&ack.map_err(classify_turn_error)?);
         self.active_turn_id = Some(turn_id.clone());
-        *self
-            .steer_turn
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(turn_id.clone());
+        self.steer_turn.send_replace(Some(turn_id.clone()));
         accepted();
         let mut notifications = TurnNotifications::new();
         let mut pending: HashMap<String, PendingRequest> = HashMap::new();
@@ -534,7 +534,7 @@ pub const COMPACTION_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 pub struct TurnSteerer {
     requester: Requester,
     thread_id: String,
-    turn: std::sync::Arc<std::sync::Mutex<Option<String>>>,
+    turn: tokio::sync::watch::Receiver<Option<String>>,
     working_directory: String,
 }
 
@@ -551,11 +551,17 @@ impl TurnSteerer {
         prompt: &str,
         image_paths: &[String],
     ) -> Result<(), ProviderError> {
-        let Some(turn_id) = self
-            .turn
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .clone()
+        // Held until Codex acknowledges the turn, not refused: the app offers
+        // Steer once a turn is running, which is before `turn/start` is
+        // answered, and refused there the guidance was lost. Bounded as that
+        // answer is, and over at once if the session is gone.
+        let mut turn = self.turn.clone();
+        let acknowledged =
+            tokio::time::timeout(CONTROL_REQUEST_TIMEOUT, turn.wait_for(Option::is_some)).await;
+        let Some(turn_id) = acknowledged
+            .ok()
+            .and_then(Result::ok)
+            .and_then(|id| id.clone())
         else {
             return Err(ProviderError::Unavailable(
                 "Codex has not started a steerable turn yet, or the active turn has already ended."
@@ -592,7 +598,7 @@ impl CodexSession {
         TurnSteerer {
             requester: self.transport.requester(),
             thread_id: self.thread_id.clone(),
-            turn: self.steer_turn.clone(),
+            turn: self.steer_turn.subscribe(),
             working_directory: self.working_directory.clone(),
         }
     }
@@ -684,15 +690,26 @@ impl CodexSession {
 
     /// The account's usage limits (`account/rateLimits/read`), or `None` for
     /// an account that has none to report, such as an API key.
-    pub async fn rate_limits(&self) -> Result<Option<crate::provider::RateLimits>, ProviderError> {
-        let result = self
-            .transport
-            .request("account/rateLimits/read", Some(json!({})))
-            .await
-            .map_err(map_error)?;
-        Ok(super::session::rate_limits_of(
-            result.get("rateLimits").unwrap_or(&result),
-        ))
+    ///
+    /// Read through a [`Requester`], so it runs beside a turn, which holds
+    /// the session for its whole length. Awaited before the turn, every
+    /// prompt waited on Codex's backend first.
+    pub fn rate_limits(
+        &self,
+    ) -> impl std::future::Future<
+        Output = Result<Option<crate::provider::RateLimits>, ProviderError>,
+    > + Send
+    + 'static {
+        let requester = self.transport.requester();
+        async move {
+            let result = requester
+                .request("account/rateLimits/read", Some(json!({})))
+                .await
+                .map_err(map_error)?;
+            Ok(super::session::rate_limits_of(
+                result.get("rateLimits").unwrap_or(&result),
+            ))
+        }
     }
 
     /// The thread's goal, if it has one (`thread/goal/get`).
