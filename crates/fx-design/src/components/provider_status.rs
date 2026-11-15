@@ -1,15 +1,12 @@
 //! Provider identity and live activity in one compact sidebar tile.
 
-use std::sync::OnceLock;
-use std::time::{Duration, Instant};
-
 use gpui::prelude::*;
 use gpui::{AnyElement, App, IntoElement, Rgba, SharedString, Window, div, px};
 
-use super::{ActivityState, spinner_arc};
+use super::{ActivityState, activity_beat, spinner};
 use crate::icon::Icon;
 use crate::theme::{
-    BorderWidth, Colors, FxAnimation, IconSize, Radii, Spacing, Theme, WithAlpha, global,
+    Beat, BorderWidth, Colors, IconSize, Motion, Radii, Spacing, Theme, WithAlpha, global,
 };
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -75,17 +72,6 @@ pub fn provider_status_palette(
     }
 }
 
-/// How long from `now` until the next multiple of `frame`, counted from one
-/// process-wide origin, so timers started at different moments fire together
-/// and their refreshes land in one frame.
-fn delay_to_next_beat(now: Instant, frame: Duration) -> Duration {
-    static ORIGIN: OnceLock<Instant> = OnceLock::new();
-    let origin = *ORIGIN.get_or_init(|| now);
-    let frame_ns = frame.as_nanos().max(1);
-    let into = now.saturating_duration_since(origin).as_nanos() % frame_ns;
-    Duration::from_nanos((frame_ns - into) as u64)
-}
-
 pub fn provider_status(
     id: impl Into<SharedString>,
     provider: ProviderIdentity,
@@ -111,53 +97,19 @@ struct ProviderStatus {
 impl RenderOnce for ProviderStatus {
     fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
         let theme = global::current();
-        let (clock, scheduled) = window.with_element_namespace(self.id.clone(), |window| {
-            (
-                window.use_keyed_state("activity-clock", cx, |_, _| Instant::now()),
-                window.use_keyed_state("activity-frame", cx, |_, _| false),
-            )
-        });
-        let elapsed = clock.read(cx).elapsed().as_secs_f32();
-        let waiting = self.activity == ActivityState::Waiting;
-        let running = self.activity == ActivityState::Running;
-        // One timed repaint at a time, not a frame per display refresh. Settled
-        // tiles schedule nothing, so motion ends as soon as the state does.
-        if (running || waiting) && !*scheduled.read(cx) {
-            scheduled.update(cx, |scheduled, _| *scheduled = true);
-            let frame = if waiting || !window.is_window_active() {
-                FxAnimation::QUIET_ACTIVITY_FRAME
-            } else {
-                FxAnimation::ACTIVITY_FRAME
-            };
-            // Every tile wakes on the same beat. Each one counting from its
-            // own last paint, three running threads refreshed the window at
-            // three unrelated phases, close to the display's full rate.
-            let delay = delay_to_next_beat(cx.background_executor().now(), frame);
-            window
-                .spawn(cx, async move |cx| {
-                    // The platform's timer, which a test clock can advance.
-                    cx.background_executor().timer(delay).await;
-                    let _ = cx.update(|window, cx| {
-                        scheduled.update(cx, |scheduled, _| *scheduled = false);
-                        window.refresh();
-                    });
-                })
-                .detach();
-        }
-        let pulse = if waiting {
-            let phase = elapsed / FxAnimation::STATUS_PULSE.as_secs_f32();
-            0.5 + 0.5 * (phase * std::f32::consts::TAU).cos()
+        // The pulse breathes on the activity clock, every other beat; a
+        // running tile's spinner asks for its own beats. A settled tile asks
+        // for nothing, so motion ends with the state that drew it. Under
+        // reduced motion the pulse is a steady tint at its strongest.
+        let pulse = if self.activity == ActivityState::Waiting {
+            activity_beat(Motion::Pulse, window, cx).map_or(1.0, Beat::pulse)
         } else {
             1.0
         };
         let palette = provider_status_palette(self.provider, self.activity, pulse, &theme);
         let ink = palette.glyph;
         let glyph: AnyElement = match self.activity {
-            ActivityState::Running => spinner_arc(
-                ink,
-                elapsed / FxAnimation::ACTIVITY_SPIN.as_secs_f32() * 360.0,
-            )
-            .into_any_element(),
+            ActivityState::Running => spinner(ink).into_any_element(),
             ActivityState::Completed => Icon::CHECKMARK
                 .render(IconSize::Small, ink, &theme)
                 .into_any_element(),
@@ -196,29 +148,5 @@ impl RenderOnce for ProviderStatus {
             .bg(palette.fill)
             .tooltip(move |window, cx| super::tooltip(detail.clone(), window, cx))
             .child(glyph)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn tiles_started_apart_wake_on_the_same_beat() {
-        let frame = FxAnimation::ACTIVITY_FRAME;
-        let start = Instant::now();
-        let first = delay_to_next_beat(start, frame);
-        assert!(first > Duration::ZERO && first <= frame);
-        for offset_ms in [1, 7, 20, 32, 45, 101] {
-            let later = start + Duration::from_millis(offset_ms);
-            let next = later + delay_to_next_beat(later, frame);
-            let beat = start + first;
-            let apart = next.saturating_duration_since(beat).as_nanos() % frame.as_nanos();
-            assert_eq!(
-                apart, 0,
-                "a tile started {offset_ms} ms later woke off the beat"
-            );
-            assert!(next > later, "a beat is never in the past");
-        }
     }
 }

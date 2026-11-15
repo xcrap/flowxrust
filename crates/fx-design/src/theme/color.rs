@@ -716,6 +716,11 @@ pub struct Theme {
     /// The OS appearance, consulted only when `appearance_mode` is `System`.
     /// Defaults to dark so a headless test never depends on the desktop.
     pub system_appearance: bool,
+    /// Whether the platform asks for reduced motion. The app reads it and
+    /// keeps it here, so the design system stays free of platform code: with
+    /// it on, nothing travels — an entrance only fades, a panel jumps, and
+    /// the spinner and the waiting pulse hold still. Off in a headless test.
+    pub reduce_motion: bool,
 }
 
 impl Default for Theme {
@@ -726,6 +731,7 @@ impl Default for Theme {
             accent_color: AccentColor::Violet,
             text_size: TextSizePreset::Standard,
             system_appearance: true,
+            reduce_motion: false,
         }
     }
 }
@@ -766,6 +772,7 @@ impl Theme {
             accent_color,
             text_size,
             system_appearance: true,
+            reduce_motion: false,
         }
     }
 

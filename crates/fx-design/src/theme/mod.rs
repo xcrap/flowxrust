@@ -9,7 +9,7 @@ pub mod global;
 pub mod metrics;
 pub mod typography;
 
-pub use animation::{Easing, FxAnimation};
+pub use animation::{Beat, Easing, Entrance, EntranceFrame, FxAnimation, Motion};
 pub use color::{
     AccentColor, AppearanceMode, BaseTone, Colors, NON_TEXT_FLOOR, Palette, Rgba, TEXT_FLOOR,
     TextSizePreset, Theme, ThemeSignature, ToneScale, WithAlpha, blend, composite, contrast,

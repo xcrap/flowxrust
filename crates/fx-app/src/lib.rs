@@ -854,7 +854,8 @@ fn title_bar(
                 )),
         )
         // Stopped on the reader outranks working: it is the one that needs
-        // them, whether FlowX can take the answer or another app has to.
+        // them, whether FlowX can take the answer or another app has to. A
+        // working dot's arc turns on the activity clock.
         .children((busy || waiting).then(|| {
             div()
                 .debug_selector(move || format!("titlebar-activity:{waiting}"))
@@ -865,7 +866,6 @@ fn title_bar(
                     } else {
                         fx_design::components::ActivityState::Running
                     },
-                    0.0,
                 ))
         }))
         .child(titlebar_control(project_changes::view(state.clone(), cx)))

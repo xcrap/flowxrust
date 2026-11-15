@@ -13,6 +13,10 @@
 //!   element's own overflow mask, so only a clipping ancestor can cut it.
 //! - A menu shows at most one open at a time. Rather than a broadcast, opening
 //!   any menu closes the others through a shared [`MenuLayer`].
+//! - A menu enters: it fades in over `QUICK` while rising the last
+//!   [`RISE`](crate::theme::FxAnimation::RISE) toward its anchor, measured
+//!   from the first frame each open — each [`MenuLayer::generation`] — is
+//!   drawn in. Closing is instant: a dismissed menu is simply not drawn.
 
 use std::rc::Rc;
 
@@ -24,10 +28,11 @@ use gpui::{
 };
 
 use crate::components::menu_model::{MenuItem, MenuItemTone, MenuModel};
+use crate::components::motion::{Approach, entering};
 use crate::components::surface::floating_scroll;
 use crate::icon::Icon;
 use crate::styled::{FxRefinement, FxStyled, px_len};
-use crate::theme::{BorderWidth, Colors, Layout, Radii, Spacing, TextRole, global};
+use crate::theme::{BorderWidth, Colors, Entrance, Layout, Radii, Spacing, TextRole, global};
 
 /// The one open menu, app-wide.
 ///
@@ -462,12 +467,19 @@ pub fn menu_overlay(
     on_dismiss: impl Fn(&mut Window, &mut App) + 'static,
     on_mouse_move: impl Fn(&str, &mut Window, &mut App) + 'static,
 ) -> AnyElement {
-    menu_overlay_at(model, None, on_choose, on_dismiss, on_mouse_move)
+    menu_overlay_at(model, None, 0, on_choose, on_dismiss, on_mouse_move)
+}
+
+/// The element id an open menu's entrance is measured under: one per open,
+/// so a menu that replaces another enters too.
+pub fn menu_entrance_id(generation: u64) -> SharedString {
+    SharedString::from(format!("menu-entrance:{generation}"))
 }
 
 fn menu_overlay_at(
     model: &MenuModel,
     position: Option<Point<Pixels>>,
+    generation: u64,
     on_choose: impl Fn(String, String, &mut Window, &mut App) + 'static,
     on_dismiss: impl Fn(&mut Window, &mut App) + 'static,
     on_mouse_move: impl Fn(&str, &mut Window, &mut App) + 'static,
@@ -492,7 +504,12 @@ fn menu_overlay_at(
         panel = panel.position(position);
     }
     let panel = panel
-        .child(menu_surface(model, on_choose, on_mouse_move))
+        .child(entering(
+            menu_entrance_id(generation),
+            Entrance::POPOVER,
+            Approach::FromBelow,
+            menu_surface(model, on_choose, on_mouse_move),
+        ))
         .into_any_element();
 
     div()
@@ -584,6 +601,7 @@ pub fn menu_layer_overlay(
     menu_overlay_at(
         &model,
         position,
+        generation,
         move |section, item, window, cx| {
             let dismissed = for_choice.update(cx, |layer, cx| {
                 if layer.generation() != generation {

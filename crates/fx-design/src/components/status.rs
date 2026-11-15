@@ -6,7 +6,7 @@ use gpui::{
 use crate::icon::Icon;
 use crate::styled::{FxRefinement, FxStyled, px_len};
 use crate::theme::{
-    Colors, FxAnimation, IconSize, Spacing, TextRole, Typography, WithAlpha, global,
+    Beat, Colors, FxAnimation, IconSize, Motion, Spacing, TextRole, Typography, WithAlpha, global,
 };
 
 /// One layer centered in a fixed square. Absolute positioning keeps overlaid
@@ -191,8 +191,9 @@ impl ActivityState {
 /// A compact identity dot that can also report live activity.
 ///
 /// This keeps a sidebar row to a single line: the dot replaces a second badge or
-/// a status label beside the title.
-pub fn activity_dot(identity: Rgba, state: ActivityState, spin: f32) -> impl IntoElement {
+/// a status label beside the title. A running dot's arc turns on the activity
+/// clock, and holds still under reduced motion.
+pub fn activity_dot(identity: Rgba, state: ActivityState) -> impl IntoElement {
     let theme = global::current();
     let inner = div()
         .size(px_len(ACTIVITY_INNER))
@@ -206,8 +207,8 @@ pub fn activity_dot(identity: Rgba, state: ActivityState, spin: f32) -> impl Int
             .rounded_full()
             .bg(color)
             .into_any_element(),
-        // An arc, drawn as rotated capsules below.
-        None => spinner_arc(identity, spin).into_any_element(),
+        // An arc, drawn as rotated capsules, on the activity clock.
+        None => super::spinner(identity).into_any_element(),
     };
 
     let ring_size = if state == ActivityState::Running {
@@ -241,8 +242,9 @@ const SPINNER_RING_SIZE: f32 = 14.0;
 
 /// A partial ring, approximated with rotated capsules.
 ///
-/// `spin` is in degrees. Anything motion-sensitive belongs in the animation
-/// system, not here: this function draws one frame.
+/// `spin` is in degrees. This draws one frame and asks for no other: the
+/// spinner that turns is [`spinner`](super::spinner), which reads its angle
+/// from the activity clock.
 pub fn spinner_arc(color: Rgba, spin: f32) -> impl IntoElement {
     let radius = (SPINNER_RING_SIZE - ACTIVITY_STROKE) / 2.0;
     let stroke = ACTIVITY_STROKE;
@@ -345,18 +347,16 @@ pub fn status_glyph_ink(glyph: StatusGlyph, theme: &crate::theme::Theme) -> Rgba
 
 /// A status glyph at [`STATUS_GLYPH_SIZE`].
 ///
-/// `spin` turns a running glyph into the spinner at that angle, in degrees;
-/// without it, a running glyph is a still ring, which is what reduced motion
-/// or a stalled frame should show.
-pub fn status_glyph(glyph: StatusGlyph, spin: Option<f32>) -> gpui::AnyElement {
+/// `live` turns a running glyph into the spinner, on the activity clock;
+/// without it, a running glyph is a still ring, which is what work that has
+/// stopped reporting should show. Reduced motion stills it either way.
+pub fn status_glyph(glyph: StatusGlyph, live: bool) -> gpui::AnyElement {
     let theme = global::current();
     let ink = status_glyph_ink(glyph, &theme);
     let slot = Typography::icon(STATUS_GLYPH_SIZE, &theme).size;
     let mark = match glyph {
-        StatusGlyph::Running => match spin {
-            Some(spin) => spinner_arc(ink, spin).into_any_element(),
-            None => static_ring(ink).into_any_element(),
-        },
+        StatusGlyph::Running if live => super::spinner(ink).into_any_element(),
+        StatusGlyph::Running => static_ring(ink).into_any_element(),
         StatusGlyph::Done => Icon::CHECKMARK_CIRCLE_FILL.render(STATUS_GLYPH_SIZE, ink, &theme),
         StatusGlyph::Failed => Icon::XMARK_CIRCLE_FILL.render(STATUS_GLYPH_SIZE, ink, &theme),
         StatusGlyph::Stopped => Icon::STOP_CIRCLE_FILL.render(STATUS_GLYPH_SIZE, ink, &theme),
@@ -372,12 +372,34 @@ pub fn status_glyph(glyph: StatusGlyph, spin: Option<f32>) -> gpui::AnyElement {
         .into_any_element()
 }
 
-/// One dot of the typing indicator.
+/// One dot of the typing indicator, at rest.
 const TYPING_DOT_SIZE: f32 = 4.0;
+/// The square each dot sits in: the lit dot's size, so the dot growing and
+/// shrinking moves nothing beside it.
+pub const TYPING_DOT_CELL: f32 = TYPING_DOT_SIZE * FxAnimation::TYPING_DOT_EMPHASIS;
 
-/// Three dots that cycle while the assistant composes a reply.
-pub fn typing_indicator(phase: usize, reduce_motion: bool) -> impl IntoElement {
+/// Three dots that cycle while the assistant composes a reply, on the
+/// activity clock. Under reduced motion they hold still at an even weight.
+pub fn typing_indicator() -> TypingIndicator {
+    TypingIndicator
+}
+
+#[derive(IntoElement)]
+pub struct TypingIndicator;
+
+impl RenderOnce for TypingIndicator {
+    fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
+        let beat = super::motion::activity_beat(Motion::Typing, window, cx);
+        typing_dots(beat.map(Beat::typing_dot))
+    }
+}
+
+/// The typing indicator with dot `lit` emphasised, or with every dot even
+/// for reduced motion. One frame, asking for no other.
+pub fn typing_dots(lit: Option<usize>) -> gpui::Div {
     let theme = global::current();
+    let reduce_motion = lit.is_none();
+    let phase = lit.unwrap_or(0);
     div()
         .flex()
         .flex_row()
@@ -387,18 +409,65 @@ pub fn typing_indicator(phase: usize, reduce_motion: bool) -> impl IntoElement {
             (0..3)
                 .map(|i| {
                     // GPUI cannot scale an element without a transform, so the
-                    // emphasis is expressed as a slightly larger dot.
+                    // emphasis is expressed as a slightly larger dot, inside a
+                    // cell that is always the larger size.
+                    let size =
+                        TYPING_DOT_SIZE * FxAnimation::typing_dot_scale(i, phase, reduce_motion);
                     div()
-                        .size(px_len(
-                            TYPING_DOT_SIZE
-                                * FxAnimation::typing_dot_scale(i, phase, reduce_motion),
-                        ))
-                        .rounded_full()
-                        .bg(Colors::fg_tertiary(&theme))
-                        .opacity(FxAnimation::typing_dot_opacity(i, phase, reduce_motion))
+                        .debug_selector(move || format!("typing-dot:{i}"))
+                        .size(px_len(TYPING_DOT_CELL))
+                        .flex_shrink_0()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .child(
+                            div()
+                                .size(px(size))
+                                .rounded_full()
+                                .bg(Colors::fg_tertiary(&theme))
+                                .opacity(FxAnimation::typing_dot_opacity(i, phase, reduce_motion)),
+                        )
                 })
                 .collect::<Vec<_>>(),
         )
+}
+
+/// The caret's width. A hairline would disappear at some zoom levels and a
+/// wider bar stops reading as a cursor.
+pub const CARET_WIDTH: f32 = 2.0;
+/// The caret's opacity on the half of its blink it is faded.
+pub const CARET_FADED_OPACITY: f32 = 0.25;
+
+/// The caret at the end of a reply still streaming in, `height` tall,
+/// blinking on the activity clock: solid half a second, faded half a second.
+///
+/// A blink is not travel, so it keeps blinking under reduced motion, as the
+/// system's own caret does.
+pub fn streaming_caret(color: Rgba, height: f32) -> StreamingCaret {
+    StreamingCaret { color, height }
+}
+
+#[derive(IntoElement)]
+pub struct StreamingCaret {
+    color: Rgba,
+    height: f32,
+}
+
+impl RenderOnce for StreamingCaret {
+    fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
+        super::motion::request_activity_frame(Motion::Caret, window, cx);
+        let solid = Beat::at(super::motion::now(cx)).caret_solid();
+        div()
+            .debug_selector(move || {
+                format!("streaming-caret:{}", if solid { "solid" } else { "faded" })
+            })
+            .w(px(CARET_WIDTH))
+            .flex_shrink_0()
+            .h(px(self.height))
+            .rounded_full()
+            .bg(self.color)
+            .opacity(if solid { 1.0 } else { CARET_FADED_OPACITY })
+    }
 }
 
 /// Progress fraction at which the context ring escalates its color.

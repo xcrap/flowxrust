@@ -38,8 +38,8 @@
 //! and paints only the rows in view and remembers every other row's height.
 //! A pass resolves the messages into a [`RowPlan`] per row — indices, nothing
 //! built — and a row's element exists only while it is on screen. That is
-//! what lets a caret blink or each frame of the sidebar's slide redraw a long
-//! thread without re-wrapping all of it. Two things follow:
+//! what lets a spinner's beat or a caret blink redraw a long thread without
+//! re-wrapping all of it. Two things follow:
 //!
 //! - **The list must hear about every row that changed**, or an off-screen row
 //!   keeps a height it no longer has. Each pass stamps the rows and splices
@@ -72,11 +72,12 @@ use fx_design::components::surface::banner;
 use fx_design::components::{
     BadgeTone, ButtonStyle, ChecklistMark, DividerAxis, MenuItem, MenuModel, MenuSection,
     StatusGlyph, badge, button, card, checklist, checklist_row, compact_action_button,
-    context_region, divider_with_axis, empty_state, empty_state_glyph, panel, spinner_arc,
-    status_glyph, typing_indicator,
+    context_region, divider_with_axis, empty_state, empty_state_glyph, panel, spinner,
+    status_glyph, streaming_caret, typing_indicator,
 };
 use fx_design::icon::Icon;
 use fx_design::styled::{FxRefinement, FxStyled, px_len};
+use fx_design::theme::animation::on_the_beat;
 use fx_design::theme::{
     BorderWidth, Colors, FxAnimation, IconSize, Layout, Radii, Spacing, TextRole, TextSizePreset,
     Typography, WithAlpha, global,
@@ -188,19 +189,10 @@ const TOOL_TITLE_MAX_SHARE: f32 = 0.5;
 /// How many characters a one-line tool summary shows before it is elided.
 const SUMMARY_CHARACTER_LIMIT: usize = 100;
 
-/// The caret's width. A hairline would disappear at some zoom levels and a
-/// wider bar stops reading as a cursor.
-const CARET_WIDTH: f32 = 2.0;
-
 /// Width of the gutter a question's option number sits in, so option text lines
 /// up under itself rather than under its own marker.
 const OPTION_MARKER_WIDTH: f32 = 16.0;
 
-/// Opacity of the caret on the half of its blink it is faded.
-///
-/// Not a theme token: a caret is an animation frame, and the animation system
-/// owns its own constants.
-const CARET_FADED_OPACITY: f32 = 0.25;
 /// How far a thought is dimmed against the reply. Markdown draws in `fg`, and
 /// a thought is the same prose at a remove: read when wanted, never mistaken
 /// for the answer.
@@ -211,13 +203,6 @@ const LIVE_OUTPUT_TAIL_LINES: usize = 6;
 const LIVE_OUTPUT_EXPANDED_LINES: usize = 60;
 /// The most characters of one diff line a preview draws.
 const PREVIEW_LINE_CHARACTERS: usize = 400;
-
-/// How many rendered passes make up one half of the caret's blink.
-///
-/// With no animation clock, passes are the only unit available. Eight is a
-/// compromise: fast enough that the caret reads as blinking, slow enough that a
-/// stream does not turn this into a frame per delta.
-const CARET_BLINK_PASSES: u32 = 8;
 
 const MICROS_PER_SECOND: i64 = 1_000_000;
 
@@ -247,12 +232,6 @@ struct ViewMemory {
     /// How many edit previews have been built, for the tests.
     #[cfg(test)]
     previews_built: usize,
-    /// Advances once per pass.
-    ///
-    /// GPUI 0.2.2 has no animation clock, so nothing could drive the spinner or
-    /// the typing indicator on a timer. Counting passes instead is honest about
-    /// what it is: motion that only happens while there is something to report.
-    frame: u32,
 }
 
 /// What the view remembers about one conversation.
@@ -286,8 +265,6 @@ struct ThreadMemory {
     /// this, a long-lived thread accumulates one entry per group it has ever
     /// shown.
     pruned_at: Option<(u64, bool)>,
-    /// The blink phase the last caret frame was requested for.
-    blink_requested_at: Option<u32>,
     /// Whether a clock tick is already scheduled, so a running turn has one
     /// timer at a time however often it is drawn.
     tick_pending: bool,
@@ -328,7 +305,6 @@ impl ThreadMemory {
             plan: None,
             focus: None,
             pruned_at: None,
-            blink_requested_at: None,
             tick_pending: false,
             messages: None,
             steers: Rc::from(Vec::new()),
@@ -450,11 +426,6 @@ impl ThreadMemory {
 }
 
 impl ViewMemory {
-    fn next_frame(&mut self) -> u32 {
-        self.frame = self.frame.wrapping_add(1);
-        self.frame
-    }
-
     fn thread(&mut self, conversation: Uuid) -> &mut ThreadMemory {
         self.threads
             .entry(conversation)
@@ -1531,10 +1502,6 @@ pub(crate) struct Snapshot {
 }
 
 impl Snapshot {
-    fn is_streaming(&self) -> bool {
-        !self.streaming.is_empty()
-    }
-
     fn is_thinking(&self) -> bool {
         !self.thinking.trim().is_empty()
     }
@@ -1808,8 +1775,6 @@ fn render(mut snapshot: Snapshot, window: &mut Window, cx: &mut App) -> AnyEleme
         || live_groups(&rows.plan, &snapshot),
     );
 
-    let frame = MEMORY.with(|memory| memory.borrow_mut().next_frame());
-    request_caret_frame(&snapshot, frame, window);
     let target = crate::AppHandle::get(cx)
         .and_then(|handle| handle.0.read(cx).search_target)
         .filter(|target| target.agent == snapshot.agent_id);
@@ -1893,7 +1858,7 @@ fn render(mut snapshot: Snapshot, window: &mut Window, cx: &mut App) -> AnyEleme
         let (for_rows, for_snapshot) = (rows.clone(), snapshot.clone());
         list(state.clone(), move |index, _window, cx| {
             match for_rows.get(index) {
-                Some(row) => row_element(&row, &for_snapshot, has_active_group, frame, cx),
+                Some(row) => row_element(&row, &for_snapshot, has_active_group, cx),
                 // Asked for past the end only if the list was told of a row that
                 // is gone; an empty row is the honest answer.
                 None => div().into_any_element(),
@@ -1964,14 +1929,11 @@ fn render(mut snapshot: Snapshot, window: &mut Window, cx: &mut App) -> AnyEleme
 ///
 /// The list calls this only for rows in view, and for rows near it whose
 /// height it does not know yet. Everything per row — Markdown, shaping,
-/// grouping a burst of tool calls — happens here and nowhere else.
-fn row_element(
-    row: &RowPlan,
-    snapshot: &Snapshot,
-    has_active_group: bool,
-    frame: u32,
-    cx: &App,
-) -> AnyElement {
+/// grouping a burst of tool calls — happens here and nowhere else, and so
+/// does asking for motion: a spinner or a caret asks the activity clock for
+/// its next beat as it is built, so a row scrolled out of view costs no
+/// frames.
+fn row_element(row: &RowPlan, snapshot: &Snapshot, has_active_group: bool, cx: &App) -> AnyElement {
     #[cfg(test)]
     tests::ROWS_BUILT.with(|built| built.set(built.get() + 1));
     let content = match row {
@@ -1985,16 +1947,14 @@ fn row_element(
             activity_group(
                 &group_for(snapshot.id, &messages, *index, *is_active),
                 snapshot,
-                frame,
             )
         }
-        RowPlan::Plan { message, is_live } => {
-            plan_card(&snapshot.messages[*message], *is_live, frame)
+        RowPlan::Plan { message, is_live } => plan_card(&snapshot.messages[*message], *is_live),
+        RowPlan::Tail => {
+            streaming_tail(snapshot, has_active_group).unwrap_or_else(|| div().into_any_element())
         }
-        RowPlan::Tail => streaming_tail(snapshot, frame, has_active_group)
-            .unwrap_or_else(|| div().into_any_element()),
         RowPlan::Steer(index) => held_steer(&snapshot.steers[*index], snapshot, cx),
-        RowPlan::Tasks => background_tasks(&snapshot.tasks, Instant::now(), frame),
+        RowPlan::Tasks => background_tasks(&snapshot.tasks, Instant::now()),
         RowPlan::Failure => match snapshot.error.as_deref() {
             Some(error) => error_banner(error, snapshot),
             None => div().into_any_element(),
@@ -2144,43 +2104,6 @@ fn page_with_keyboard(list: &ListState, event: &KeyDownEvent) -> bool {
     true
 }
 
-/// Keep the caret blinking while a reply arrives.
-///
-/// GPUI 0.2.2 has no animation clock, and `Window::request_animation_frame` is
-/// not usable from here: it reaches for the entity currently painting, which
-/// unwraps a stack only populated during prepaint and paint — and a render
-/// function runs before either. Registering a next-frame callback is the one
-/// animation hook that is safe to call from a render pass.
-///
-/// The request is keyed on the blink *phase*, not on every pass. The rows in
-/// view are rebuilt from scratch on each render, and the original went to some
-/// length to avoid exactly that per delta, so asking for a frame per pass would
-/// undo the saving. Keying on the phase bounds it to one extra frame every
-/// `CARET_BLINK_PASSES` passes, however fast the stream runs.
-fn request_caret_frame(snapshot: &Snapshot, frame: u32, window: &mut Window) {
-    if !snapshot.is_streaming() {
-        return;
-    }
-    let phase = blink_phase(frame);
-    let wanted = with_thread(snapshot.id, |thread| {
-        if thread.blink_requested_at == Some(phase) {
-            return false;
-        }
-        thread.blink_requested_at = Some(phase);
-        true
-    });
-    if wanted {
-        // `refresh` forces the view to re-render rather than repaint its cached
-        // tree, which is the point: the caret's opacity is decided here.
-        window.on_next_frame(move |_window, cx| cx.refresh_windows());
-    }
-}
-
-/// Whether the caret is drawn solid or faded, as a phase rather than a boolean.
-fn blink_phase(frame: u32) -> u32 {
-    (frame / CARET_BLINK_PASSES) % 2
-}
-
 /// Repaint once a second while a turn runs, so its clocks move.
 ///
 /// One pending tick per thread at a time, from the executor's timer — which a
@@ -2189,6 +2112,10 @@ fn blink_phase(frame: u32) -> u32 {
 /// rebuilt, as on any pass, and every other row keeps its height. The clocks
 /// sit on lines of a fixed height for the same reason. A settled thread
 /// schedules nothing, so the ticking stops with the turn.
+///
+/// The tick lands on the activity clock's next beat after the second turns,
+/// so while a spinner turns beside the clock the two share one frame rather
+/// than costing a thirteenth.
 fn schedule_tick(snapshot: &Snapshot, window: &mut Window, cx: &mut App) {
     if !snapshot.busy {
         return;
@@ -2206,6 +2133,7 @@ fn schedule_tick(snapshot: &Snapshot, window: &mut Window, cx: &mut App) {
         .map_or(FxAnimation::CLOCK_TICK, |start| {
             snapshot.clock.until_next_second(start)
         });
+    let delay = on_the_beat(delay, cx.background_executor().now());
     window
         .spawn(cx, async move |cx| {
             cx.background_executor().timer(delay).await;
@@ -2958,7 +2886,7 @@ fn inline_tool_result(content: &str, is_error: bool, place: Place) -> AnyElement
                     } else {
                         StatusGlyph::Done
                     },
-                    None,
+                    false,
                 ))
                 .child(
                     div()
@@ -3676,7 +3604,7 @@ fn thinking_tokens_label(tokens: u64) -> String {
 
 /// The reply still being written, or the indicator that stands in for one before
 /// any of it has arrived. `None` when there is nothing live to show.
-fn streaming_tail(snapshot: &Snapshot, frame: u32, has_active_group: bool) -> Option<AnyElement> {
+fn streaming_tail(snapshot: &Snapshot, has_active_group: bool) -> Option<AnyElement> {
     if !has_tail(snapshot, has_active_group) {
         return None;
     }
@@ -3710,19 +3638,10 @@ fn streaming_tail(snapshot: &Snapshot, frame: u32, has_active_group: bool) -> Op
                         // The caret is exactly one body line tall. GPUI has no
                         // caret, and a bar taller than the line it sits in reads
                         // as a stray rule rather than as a cursor.
-                        .child(
-                            div()
-                                .w(px(CARET_WIDTH))
-                                .flex_shrink_0()
-                                .h(px(body.size * TextRole::Body.line_height_multiplier()))
-                                .rounded_full()
-                                .bg(Colors::accent(&theme))
-                                .opacity(if blink_phase(frame) == 0 {
-                                    1.0
-                                } else {
-                                    CARET_FADED_OPACITY
-                                }),
-                        ),
+                        .child(streaming_caret(
+                            Colors::accent(&theme),
+                            body.size * TextRole::Body.line_height_multiplier(),
+                        )),
                 )
                 .into_any_element(),
         );
@@ -3756,7 +3675,7 @@ fn streaming_tail(snapshot: &Snapshot, frame: u32, has_active_group: bool) -> Op
                 .items_center()
                 .gap(px_len(Spacing::MD))
                 .py(px_len(Spacing::SM))
-                .child(typing_indicator(typing_phase(frame), false))
+                .child(typing_indicator())
                 .child(
                     div()
                         .fx_caption()
@@ -3802,9 +3721,11 @@ fn request_task_clock(snapshot: &Snapshot, cx: &mut App) {
     if already {
         return;
     }
+    // On the beat, so it shares a frame with the spinner beside it.
+    let delay = on_the_beat(TASK_CLOCK_INTERVAL, cx.background_executor().now());
     cx.spawn(async move |cx| {
         // The executor's timer, so a test clock can drive it.
-        cx.background_executor().timer(TASK_CLOCK_INTERVAL).await;
+        cx.background_executor().timer(delay).await;
         // Through `update`, which flushes the refresh: `AsyncApp::refresh`
         // only queues it, and the window would wait for some other event.
         let _ = cx.update(|cx| {
@@ -3823,7 +3744,7 @@ fn request_task_clock(snapshot: &Snapshot, cx: &mut App) {
 
 /// The latest turn's background tasks, as one block: what each is, what it is
 /// doing, and how each ended.
-fn background_tasks(tasks: &[BackgroundTask], now: Instant, frame: u32) -> AnyElement {
+fn background_tasks(tasks: &[BackgroundTask], now: Instant) -> AnyElement {
     let theme = global::current();
     let mut list = div()
         .w_full()
@@ -3832,7 +3753,7 @@ fn background_tasks(tasks: &[BackgroundTask], now: Instant, frame: u32) -> AnyEl
         .flex_col()
         .gap(px_len(Spacing::SM));
     for task in tasks {
-        list = list.child(background_task_row(task, now, frame));
+        list = list.child(background_task_row(task, now));
     }
     div()
         .debug_selector(|| TASKS_SELECTOR.to_string())
@@ -3860,15 +3781,13 @@ fn background_tasks(tasks: &[BackgroundTask], now: Instant, frame: u32) -> AnyEl
 
 /// One task: its state, what it is, its last tool, its tool count and its
 /// clock, and below them what it said it found.
-fn background_task_row(task: &BackgroundTask, now: Instant, frame: u32) -> AnyElement {
+fn background_task_row(task: &BackgroundTask, now: Instant) -> AnyElement {
     let theme = global::current();
     let status: AnyElement = match task.status {
-        TaskStatus::Running => {
-            spinner_arc(Colors::accent(&theme), spin_degrees(frame)).into_any_element()
-        }
-        TaskStatus::Completed => status_glyph(StatusGlyph::Done, None),
-        TaskStatus::Failed => status_glyph(StatusGlyph::Failed, None),
-        TaskStatus::Stopped => status_glyph(StatusGlyph::Stopped, None),
+        TaskStatus::Running => spinner(Colors::accent(&theme)).into_any_element(),
+        TaskStatus::Completed => status_glyph(StatusGlyph::Done, false),
+        TaskStatus::Failed => status_glyph(StatusGlyph::Failed, false),
+        TaskStatus::Stopped => status_glyph(StatusGlyph::Stopped, false),
     };
     let selector = format!(
         "transcript.background-task:{}:{}",
@@ -4192,7 +4111,7 @@ fn error_banner(message: &str, snapshot: &Snapshot) -> AnyElement {
 // ── The activity group ─────────────────────────────────────────────────────
 
 /// A collapsible group of tool traffic.
-fn activity_group(group: &ActivityGroup<'_>, snapshot: &Snapshot, frame: u32) -> AnyElement {
+fn activity_group(group: &ActivityGroup<'_>, snapshot: &Snapshot) -> AnyElement {
     let theme = global::current();
     // Progress stays compact until the reader asks for details. Streaming new
     // calls must never override a reader's decision to close the disclosure.
@@ -4205,7 +4124,7 @@ fn activity_group(group: &ActivityGroup<'_>, snapshot: &Snapshot, frame: u32) ->
     }
     .render(IconSize::Micro, Colors::fg_quaternary(&theme), &theme);
     let status: AnyElement = if group.is_active {
-        spinner_arc(Colors::accent(&theme), spin_degrees(frame)).into_any_element()
+        spinner(Colors::accent(&theme)).into_any_element()
     } else {
         Icon::TERMINAL.render(IconSize::Small, Colors::fg_tertiary(&theme), &theme)
     };
@@ -4321,7 +4240,7 @@ fn activity_group(group: &ActivityGroup<'_>, snapshot: &Snapshot, frame: u32) ->
                 GroupEntry::Thought(thought) => {
                     thought_block(thought.text, thought_key(group, thought))
                 }
-                GroupEntry::Call(position) => tool_row(group, position, snapshot, frame),
+                GroupEntry::Call(position) => tool_row(group, position, snapshot),
             });
         }
         // The thought arriving now, after everything recorded: it is
@@ -4340,12 +4259,7 @@ fn activity_group(group: &ActivityGroup<'_>, snapshot: &Snapshot, frame: u32) ->
 /// The row opens on a click to what the call is: an edit's diff, or any other
 /// call's arguments, and its output once it has one. While it runs in a live
 /// group, what it has printed so far is drawn under it, open or closed.
-fn tool_row(
-    group: &ActivityGroup<'_>,
-    position: usize,
-    snapshot: &Snapshot,
-    frame: u32,
-) -> AnyElement {
+fn tool_row(group: &ActivityGroup<'_>, position: usize, snapshot: &Snapshot) -> AnyElement {
     let theme = global::current();
     let call = &group.calls[position];
     let running = !call_finished(call, snapshot) && group.is_active;
@@ -4353,11 +4267,11 @@ fn tool_row(
     let open = is_disclosed(&key);
 
     let status: AnyElement = if call.is_error {
-        status_glyph(StatusGlyph::Failed, None)
+        status_glyph(StatusGlyph::Failed, false)
     } else if running {
-        spinner_arc(Colors::accent(&theme), spin_degrees(frame)).into_any_element()
+        spinner(Colors::accent(&theme)).into_any_element()
     } else {
-        status_glyph(StatusGlyph::Done, None)
+        status_glyph(StatusGlyph::Done, false)
     };
 
     let title = div()
@@ -5001,7 +4915,7 @@ fn live_step_line(group: &ActivityGroup<'_>, snapshot: &Snapshot) -> AnyElement 
 /// While the turn runs the step in progress spins. Afterwards the card stays
 /// where it was as the record of how far the plan got, with a step that was
 /// still in progress shown as stopped rather than as still going.
-fn plan_card(message: &ConversationMessage, is_live: bool, frame: u32) -> AnyElement {
+fn plan_card(message: &ConversationMessage, is_live: bool) -> AnyElement {
     let Some(plan) = message_plan(message) else {
         return div().into_any_element();
     };
@@ -5053,7 +4967,7 @@ fn plan_card(message: &ConversationMessage, is_live: bool, frame: u32) -> AnyEle
             PlanStatus::Pending => (ChecklistMark::Pending, "pending"),
         };
         let label = step.label().to_string();
-        let spin = (is_live && mark == ChecklistMark::Active).then(|| spin_degrees(frame));
+        let live = is_live && mark == ChecklistMark::Active;
         rows.push(
             div()
                 .debug_selector({
@@ -5062,7 +4976,7 @@ fn plan_card(message: &ConversationMessage, is_live: bool, frame: u32) -> AnyEle
                 })
                 .w_full()
                 .min_w_0()
-                .child(checklist_row(label, mark, spin))
+                .child(checklist_row(label, mark, live))
                 .into_any_element(),
         );
     }
@@ -5737,19 +5651,6 @@ fn awaiting_response_note() -> AnyElement {
             "Waiting for your response in the dialog above.",
         )))
         .into_any_element()
-}
-
-// ── Motion ─────────────────────────────────────────────────────────────────
-
-/// How far the spinner has turned, in degrees.
-fn spin_degrees(frame: u32) -> f32 {
-    // Twelve steps over a full turn, so the arc lands where it started.
-    (frame % 12) as f32 * 30.0
-}
-
-/// Which dot of the typing indicator is lit.
-fn typing_phase(frame: u32) -> usize {
-    ((frame / 8) % 3) as usize
 }
 
 #[cfg(test)]
@@ -6456,10 +6357,10 @@ mod tests {
     #[test]
     fn activity_progress_replaces_only_the_empty_working_indicator() {
         let mut conversation = working_calls(12);
-        assert!(streaming_tail(&snapshot(&conversation), 0, true).is_none());
-        assert!(streaming_tail(&snapshot(&conversation), 0, false).is_some());
+        assert!(streaming_tail(&snapshot(&conversation), true).is_none());
+        assert!(streaming_tail(&snapshot(&conversation), false).is_some());
         conversation.apply(ProviderEvent::TextDelta("Here is what I found.".into()));
-        assert!(streaming_tail(&snapshot(&conversation), 0, true).is_some());
+        assert!(streaming_tail(&snapshot(&conversation), true).is_some());
     }
 
     #[test]
@@ -6478,7 +6379,7 @@ mod tests {
                 group_title(only_group(&rows), conversation.phase().label(), None),
                 format!("{}… · 12 actions", phase.label())
             );
-            assert!(streaming_tail(&snapshot(&conversation), 0, true).is_none());
+            assert!(streaming_tail(&snapshot(&conversation), true).is_none());
         }
     }
 
@@ -8612,7 +8513,7 @@ mod tests {
     }
 
     #[test]
-    fn a_tick_rebuilds_only_the_rows_in_view_and_re_measures_none() {
+    fn a_beat_or_a_tick_rebuilds_only_the_rows_in_view_and_re_measures_none() {
         let mut conversation = long_conversation(200);
         conversation.apply(ProviderEvent::Lifecycle(Lifecycle::TurnStarted));
         conversation.apply(ProviderEvent::ToolUse {
@@ -8624,20 +8525,60 @@ mod tests {
         redraw(&mut test);
 
         SPLICES.with(|splices| splices.borrow_mut().clear());
-        let ticked = rows_built_by_a_frame(&mut test, |test| {
-            // One tick: the next lands a second after this one.
+        // One beat of the running call's spinner, on the cadence of a window
+        // that is not the key window, as a test window is not.
+        let beat = rows_built_by_a_frame(&mut test, |test| {
+            test.executor()
+                .advance_clock(FxAnimation::BEAT * FxAnimation::QUIET_BEATS);
+            test.run_until_parked();
+        });
+        assert!((1..=24).contains(&beat), "a beat built {beat} of 201 rows");
+        // A second of beats with the clock's tick among them: twelve frames
+        // of the rows in view and the tick's, never the thread.
+        let second = rows_built_by_a_frame(&mut test, |test| {
             test.executor()
                 .advance_clock(FxAnimation::CLOCK_TICK + CLOCK_TICK_MARGIN);
             test.run_until_parked();
         });
         assert!(
-            (1..=24).contains(&ticked),
-            "a tick built {ticked} of 201 rows"
+            second <= beat * 14,
+            "a second built {second} rows where one beat built {beat}"
         );
         assert_eq!(
             SPLICES.with(|splices| splices.borrow().clone()),
             Vec::new(),
-            "a tick re-measured rows whose height it cannot change"
+            "a beat or a tick re-measured rows whose height it cannot change"
+        );
+    }
+
+    #[test]
+    fn a_spinner_out_of_view_costs_no_frames() {
+        // The running call is in the last row. Scrolled to the top of a long
+        // thread, nothing that moves is built, so nothing asks for a beat:
+        // only the clock's tick, once a second, repaints.
+        let mut conversation = long_conversation(200);
+        conversation.apply(ProviderEvent::Lifecycle(Lifecycle::TurnStarted));
+        conversation.apply(ProviderEvent::ToolUse {
+            id: "test".into(),
+            name: "Bash".into(),
+            input: r#"{"command":"cargo test"}"#.into(),
+        });
+        let id = conversation.id;
+        let (mut test, _visual) = open(conversation, 900.0, 800.0);
+        list_state(id).scroll_to(ListOffset {
+            item_ix: 0,
+            offset_in_item: px(0.0),
+        });
+        redraw(&mut test);
+        test.executor().advance_clock(FxAnimation::CLOCK_TICK);
+        test.run_until_parked();
+        let wakes = fx_design::components::activity_wakes_scheduled();
+        test.executor().advance_clock(FxAnimation::CLOCK_TICK * 3);
+        test.run_until_parked();
+        assert_eq!(
+            fx_design::components::activity_wakes_scheduled(),
+            wakes,
+            "a spinner nobody can see kept the clock running"
         );
     }
 

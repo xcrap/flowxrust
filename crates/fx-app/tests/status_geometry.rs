@@ -1,14 +1,21 @@
 //! Native layout regressions for layered design-system controls.
 
+use std::cell::Cell;
+use std::rc::Rc;
+use std::time::Duration;
+
 use fx_design::components::{
-    ActivityState, ButtonStyle, ContextUsage, MenuItem, MenuModel, MenuSection, ProviderIdentity,
-    activity_dot, button_with_icon, context_meter, context_ring_icon, menu_surface,
-    provider_status,
+    ActivityState, ButtonStyle, ContextUsage, MenuItem, MenuLayer, MenuModel, MenuSection,
+    ProviderIdentity, TYPING_DOT_CELL, activity_dot, activity_wakes_scheduled, button_with_icon,
+    context_meter, context_ring_icon, entrance_frames_requested, menu_layer_overlay, menu_surface,
+    provider_status, typing_dots,
 };
 use fx_design::icon::Icon;
-use fx_design::theme::{Colors, IconSize, Typography, global};
+use fx_design::theme::{
+    Colors, Entrance, FxAnimation, IconSize, Theme, ThemeGuard, Typography, global,
+};
 use gpui::prelude::*;
-use gpui::{Context, Render, Window, div, px};
+use gpui::{Context, Entity, Render, SharedString, Window, div, px};
 
 struct StatusProbe;
 
@@ -27,11 +34,7 @@ impl Render for StatusProbe {
                 false,
                 |_, _, _| {},
             ))
-            .child(activity_dot(
-                Colors::accent(&theme),
-                ActivityState::Idle,
-                0.0,
-            ))
+            .child(activity_dot(Colors::accent(&theme), ActivityState::Idle))
     }
 }
 
@@ -204,34 +207,43 @@ fn live_provider_states_paint_without_moving_or_growing_the_context_control() {
     }
 }
 
+/// Draws `tiles` provider tiles, all in one activity, and counts its renders.
 struct CountingProbe {
     activity: ActivityState,
-    renders: std::rc::Rc<std::cell::Cell<usize>>,
+    tiles: usize,
+    renders: Rc<Cell<usize>>,
 }
 
 impl Render for CountingProbe {
     fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
         self.renders.set(self.renders.get() + 1);
-        div().child(provider_status(
-            "counted",
-            ProviderIdentity::Codex,
-            self.activity,
-            "Working",
-        ))
+        div().flex().children((0..self.tiles).map(|index| {
+            provider_status(
+                SharedString::from(format!("counted-{index}")),
+                ProviderIdentity::Codex,
+                self.activity,
+                "Working",
+            )
+        }))
     }
 }
 
-#[test]
-fn a_moving_status_tile_repaints_on_a_bounded_clock_and_a_settled_one_stops() {
-    use fx_design::theme::FxAnimation;
-    use std::time::Duration;
-
+/// A key window drawing `tiles` tiles in `activity`, settled onto the beat.
+fn counting(
+    activity: ActivityState,
+    tiles: usize,
+) -> (
+    gpui::TestAppContext,
+    gpui::WindowHandle<CountingProbe>,
+    Rc<Cell<usize>>,
+) {
     let mut test = gpui::TestAppContext::single();
-    let renders = std::rc::Rc::new(std::cell::Cell::new(0));
+    let renders = Rc::new(Cell::new(0));
     let window = test.add_window({
         let renders = renders.clone();
         move |_, _| CountingProbe {
-            activity: ActivityState::Running,
+            activity,
+            tiles,
             renders,
         }
     });
@@ -242,31 +254,31 @@ fn a_moving_status_tile_repaints_on_a_bounded_clock_and_a_settled_one_stops() {
     test.run_until_parked();
     test.refresh().unwrap();
     test.run_until_parked();
-    // The first tick was asked for before activation landed, on the slow
-    // clock, and ticks fall on a shared beat, so the next may land early.
-    test.executor()
-        .advance_clock(FxAnimation::QUIET_ACTIVITY_FRAME + FxAnimation::ACTIVITY_FRAME);
+    // The first wake was asked for before activation landed, on the quiet
+    // cadence; two beats later the window is on the beat.
+    test.executor().advance_clock(FxAnimation::BEAT * 2);
     test.run_until_parked();
+    (test, window, renders)
+}
 
-    // One repaint per tick keeps the spinner moving.
-    let start = renders.get();
-    for _ in 0..10 {
-        test.executor().advance_clock(FxAnimation::ACTIVITY_FRAME);
-        test.run_until_parked();
-    }
-    assert_eq!(renders.get() - start, 10, "one repaint per frame interval");
-
-    // Time shorter than the interval asks for nothing more.
+/// How many times the window rendered over `span` of the executor's clock.
+fn renders_over(test: &mut gpui::TestAppContext, renders: &Cell<usize>, span: Duration) -> usize {
     let before = renders.get();
-    test.executor()
-        .advance_clock(FxAnimation::ACTIVITY_FRAME / 2 - Duration::from_millis(1));
+    test.executor().advance_clock(span);
     test.run_until_parked();
-    assert!(
-        renders.get() - before <= 1,
-        "more than the beat's own repaint before the interval"
-    );
+    renders.get() - before
+}
 
-    // Waiting can last all day, so it breathes on the slower clock.
+#[test]
+fn a_running_tile_repaints_once_a_beat_and_a_waiting_one_every_other() {
+    let second = Duration::from_secs(1);
+    let (mut test, window, renders) = counting(ActivityState::Running, 1);
+    // Twelve positions a second, one repaint each: the spinner's whole cost.
+    assert_eq!(renders_over(&mut test, &renders, second), 12);
+    // A beat not yet reached asks for nothing more.
+    assert!(renders_over(&mut test, &renders, FxAnimation::BEAT / 3) <= 1);
+
+    // Waiting can last all day, so it breathes at half the beat.
     window
         .update(&mut test, |probe, _, cx| {
             probe.activity = ActivityState::Waiting;
@@ -274,37 +286,250 @@ fn a_moving_status_tile_repaints_on_a_bounded_clock_and_a_settled_one_stops() {
         })
         .unwrap();
     test.run_until_parked();
-    test.executor()
-        .advance_clock(FxAnimation::QUIET_ACTIVITY_FRAME);
-    test.run_until_parked();
-    let waiting = renders.get();
-    for _ in 0..10 {
-        test.executor()
-            .advance_clock(FxAnimation::QUIET_ACTIVITY_FRAME);
-        test.run_until_parked();
-    }
-    let quiet = renders.get() - waiting;
-    assert!(
-        (10..=11).contains(&quiet),
-        "waiting repainted {quiet} times in ten slow intervals"
-    );
+    renders_over(&mut test, &renders, FxAnimation::BEAT * 2);
+    assert_eq!(renders_over(&mut test, &renders, second), 6);
 
-    // Settled: the pending tick lands once, then nothing.
-    for activity in [ActivityState::Waiting, ActivityState::Idle] {
+    // Settled: the pending wake lands once, then nothing.
+    window
+        .update(&mut test, |probe, _, cx| {
+            probe.activity = ActivityState::Idle;
+            cx.notify();
+        })
+        .unwrap();
+    test.run_until_parked();
+    renders_over(&mut test, &renders, FxAnimation::BEAT * 2);
+    let wakes = activity_wakes_scheduled();
+    assert_eq!(renders_over(&mut test, &renders, second * 10), 0);
+    assert_eq!(
+        activity_wakes_scheduled(),
+        wakes,
+        "a settled tile kept a clock"
+    );
+}
+
+#[test]
+fn every_spinner_on_screen_shares_one_repaint() {
+    // Three running threads, three spinners: still twelve rebuilds a
+    // second, not thirty-six, because they wake on one beat.
+    let (mut test, _window, renders) = counting(ActivityState::Running, 3);
+    assert_eq!(
+        renders_over(&mut test, &renders, Duration::from_secs(1)),
+        12
+    );
+}
+
+#[test]
+fn a_window_nobody_is_watching_spins_at_half_the_beat() {
+    let (mut test, window, renders) = counting(ActivityState::Running, 1);
+    let mut visual = gpui::VisualTestContext::from_window(window.into(), &test);
+    visual.deactivate_window();
+    renders_over(&mut test, &renders, FxAnimation::BEAT * 2);
+    assert_eq!(renders_over(&mut test, &renders, Duration::from_secs(1)), 6);
+}
+
+#[test]
+fn reduced_motion_holds_the_spinner_and_the_pulse_still() {
+    let _theme = ThemeGuard::install(Theme {
+        reduce_motion: true,
+        ..Theme::default()
+    });
+    for activity in [ActivityState::Running, ActivityState::Waiting] {
+        let (mut test, _window, renders) = counting(activity, 2);
+        let wakes = activity_wakes_scheduled();
+        assert_eq!(
+            renders_over(&mut test, &renders, Duration::from_secs(2)),
+            0,
+            "{activity:?} moved under reduced motion"
+        );
+        assert_eq!(activity_wakes_scheduled(), wakes);
+    }
+}
+
+/// The typing dots, lit at `phase`.
+struct TypingProbe(Option<usize>);
+
+impl Render for TypingProbe {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .flex()
+            .items_center()
+            .child(typing_dots(self.0))
+            .child(
+                div()
+                    .debug_selector(|| "typing-caption".into())
+                    .child("Thinking"),
+            )
+    }
+}
+
+#[test]
+fn the_typing_dots_keep_one_cell_whatever_dot_is_lit() {
+    // The lit dot grows by a fifth. Without a fixed cell it pushed the dots
+    // after it, and the caption beside them, on every step.
+    let mut test = gpui::TestAppContext::single();
+    let window = test.add_window(|_, _| TypingProbe(None));
+    let mut visual = gpui::VisualTestContext::from_window(window.into(), &test);
+    let mut first = None;
+    for phase in [None, Some(0), Some(1), Some(2)] {
         window
             .update(&mut test, |probe, _, cx| {
-                probe.activity = activity;
+                probe.0 = phase;
                 cx.notify();
             })
             .unwrap();
-        test.run_until_parked();
+        test.refresh().unwrap();
+        let cells: Vec<_> = ["typing-dot:0", "typing-dot:1", "typing-dot:2"]
+            .into_iter()
+            .map(|selector| visual.debug_bounds(selector).unwrap())
+            .collect();
+        let caption = visual.debug_bounds("typing-caption").unwrap();
+        // The cell holds the lit dot, to the half pixel the layout rounds
+        // its edges to.
+        for cell in &cells {
+            for edge in [cell.size.width, cell.size.height] {
+                assert!((f32::from(edge) - TYPING_DOT_CELL).abs() <= 0.5, "{cell:?}");
+            }
+        }
+        let layout = (cells, caption.origin);
+        let first = first.get_or_insert_with(|| layout.clone());
+        assert_eq!(&layout, first, "lit at {phase:?} moved the row");
     }
-    test.executor().advance_clock(FxAnimation::ACTIVITY_FRAME);
-    test.run_until_parked();
-    let settled = renders.get();
-    for _ in 0..10 {
-        test.executor().advance_clock(FxAnimation::ACTIVITY_FRAME);
-        test.run_until_parked();
+}
+
+/// The app-wide menu layer, drawn as the shell draws it.
+struct LayerProbe {
+    layer: Entity<MenuLayer>,
+}
+
+impl Render for LayerProbe {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        div().size_full().child(menu_layer_overlay(
+            &self.layer,
+            cx,
+            |_, _, _, _| {},
+            |_, _| {},
+            |_, _, _| {},
+        ))
     }
-    assert_eq!(renders.get(), settled, "a settled tile stops repainting");
+}
+
+fn layer_model() -> MenuModel {
+    MenuModel::new(vec![MenuSection::new(
+        "choices",
+        vec![MenuItem::new("one", "One"), MenuItem::new("two", "Two")],
+    )])
+}
+
+fn redraw(test: &mut gpui::TestAppContext) {
+    test.refresh().unwrap();
+    test.update(|_| {});
+}
+
+#[test]
+fn a_menu_rises_into_place_over_its_entrance_and_then_asks_for_nothing() {
+    let mut test = gpui::TestAppContext::single();
+    let layer = test.update(|cx| cx.new(|_| MenuLayer::default()));
+    let window = test.add_window({
+        let layer = layer.clone();
+        move |_, _| LayerProbe { layer }
+    });
+    let mut visual = gpui::VisualTestContext::from_window(window.into(), &test);
+    redraw(&mut test);
+    let closed = entrance_frames_requested();
+    redraw(&mut test);
+    assert_eq!(
+        entrance_frames_requested(),
+        closed,
+        "a closed layer asked for frames"
+    );
+
+    let open = |test: &mut gpui::TestAppContext| {
+        test.update(|cx| {
+            layer.update(cx, |layer, cx| {
+                layer.dismiss();
+                layer.open(layer_model(), "probe");
+                cx.notify();
+            })
+        });
+        redraw(test);
+    };
+    let top = |visual: &mut gpui::VisualTestContext| {
+        f32::from(visual.debug_bounds("menu-panel").unwrap().top())
+    };
+
+    open(&mut test);
+    let opened = entrance_frames_requested();
+    assert!(opened > closed, "an opening menu asked for no frame");
+    let first = top(&mut visual);
+
+    test.executor().advance_clock(FxAnimation::QUICK / 2);
+    redraw(&mut test);
+    let halfway = top(&mut visual);
+    assert!(
+        entrance_frames_requested() > opened,
+        "the entrance stopped early"
+    );
+
+    test.executor().advance_clock(FxAnimation::QUICK);
+    redraw(&mut test);
+    let settled = top(&mut visual);
+    // It rose the whole rise, most of it in the first half (ease-out).
+    assert!(
+        (first - settled - FxAnimation::RISE).abs() < 0.01,
+        "{first} → {settled}"
+    );
+    let rise = Entrance::POPOVER.at(FxAnimation::QUICK / 2, false).rise;
+    assert!(
+        (halfway - settled - rise).abs() < 0.01,
+        "{halfway} → {settled}"
+    );
+    let requested = entrance_frames_requested();
+    for _ in 0..3 {
+        redraw(&mut test);
+    }
+    assert_eq!(
+        entrance_frames_requested(),
+        requested,
+        "a settled menu asked for frames"
+    );
+
+    // Each open enters again, even one replacing a menu already up.
+    open(&mut test);
+    assert!(entrance_frames_requested() > requested);
+    assert!((top(&mut visual) - settled - FxAnimation::RISE).abs() < 0.01);
+}
+
+#[test]
+fn under_reduced_motion_a_menu_only_fades() {
+    let _theme = ThemeGuard::install(Theme {
+        reduce_motion: true,
+        ..Theme::default()
+    });
+    let mut test = gpui::TestAppContext::single();
+    let layer = test.update(|cx| cx.new(|_| MenuLayer::default()));
+    let window = test.add_window({
+        let layer = layer.clone();
+        move |_, _| LayerProbe { layer }
+    });
+    let mut visual = gpui::VisualTestContext::from_window(window.into(), &test);
+    test.update(|cx| {
+        layer.update(cx, |layer, cx| {
+            layer.open(layer_model(), "probe");
+            cx.notify();
+        })
+    });
+    let before = entrance_frames_requested();
+    redraw(&mut test);
+    let first = visual.debug_bounds("menu-panel").unwrap().top();
+    assert!(
+        entrance_frames_requested() > before,
+        "the fade was dropped too"
+    );
+    test.executor().advance_clock(FxAnimation::QUICK * 2);
+    redraw(&mut test);
+    assert_eq!(
+        visual.debug_bounds("menu-panel").unwrap().top(),
+        first,
+        "it travelled"
+    );
 }

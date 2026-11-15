@@ -16,6 +16,7 @@ pub mod dialog;
 pub mod loading;
 pub mod menu;
 pub mod menu_model;
+pub mod motion;
 pub mod palette;
 pub mod provider_status;
 pub mod reference;
@@ -52,6 +53,10 @@ pub use menu::{
     menu_trigger, row_palette,
 };
 pub use menu_model::{MenuItem, MenuItemTone, MenuModel, MenuSection};
+pub use motion::{
+    Approach, Entering, Spinner, activity_beat, activity_wakes_scheduled, entering, entering_since,
+    entrance_frames_requested, request_activity_frame, spinner,
+};
 pub use palette::{
     PaletteRow, PaletteRowPalette, palette_panel, palette_row, palette_row_palette,
     palette_surface, shortcut_chip,
@@ -77,9 +82,9 @@ pub use settings::{
     settings_search, settings_section, settings_section_with_action, switch, switch_palette,
 };
 pub use status::{
-    ActivityState, BadgeTone, STATUS_GLYPH_SIZE, StatusGlyph, activity_dot, badge,
+    ActivityState, BadgeTone, STATUS_GLYPH_SIZE, StatusGlyph, TYPING_DOT_CELL, activity_dot, badge,
     context_ring_color, context_ring_icon, spinner_arc, static_ring, status_glyph,
-    status_glyph_ink, typing_indicator,
+    status_glyph_ink, streaming_caret, typing_dots, typing_indicator,
 };
 pub use surface::{
     DividerAxis, EMPTY_STATE_ICON, FloatingPalette, NoticePalette, NoticeTone, card, card_default,

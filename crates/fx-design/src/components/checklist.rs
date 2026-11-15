@@ -7,7 +7,7 @@
 use gpui::prelude::*;
 use gpui::{AnyElement, IntoElement, Rgba, SharedString, div, px};
 
-use super::{spinner_arc, static_ring};
+use super::{spinner, static_ring};
 use crate::icon::Icon;
 use crate::styled::{FxStyled, px_len};
 use crate::theme::{BorderWidth, Colors, IconSize, Radii, Spacing, TextRole, Theme, Typography};
@@ -93,14 +93,14 @@ pub fn checklist(header: impl IntoElement, rows: Vec<AnyElement>) -> impl IntoEl
 
 /// One row of a checklist.
 ///
-/// `spin` turns the active row's mark into a spinner at that angle; without it
-/// the active row shows a still ring, which is what a list whose work has
-/// stopped should say. Text wraps rather than truncates: a step is a sentence,
+/// `live` turns the active row's mark into the spinner, on the activity
+/// clock; without it the active row shows a still ring, which is what a list
+/// whose work has stopped should say. Text wraps rather than truncates: a step is a sentence,
 /// and its end is often the part that says what it is.
 pub fn checklist_row(
     text: impl Into<SharedString>,
     mark: ChecklistMark,
-    spin: Option<f32>,
+    live: bool,
 ) -> impl IntoElement {
     let theme = crate::theme::global::current();
     let ink = checklist_ink(mark, &theme);
@@ -110,12 +110,12 @@ pub fn checklist_row(
     };
     let line = Typography::style(role, &theme).size * role.line_height_multiplier();
     let slot = Typography::icon(IconSize::Medium, &theme).size;
-    let glyph: AnyElement = match (mark, spin) {
+    let glyph: AnyElement = match (mark, live) {
         (ChecklistMark::Done, _) => {
             Icon::CHECKMARK_CIRCLE_FILL.render(IconSize::Medium, ink.mark, &theme)
         }
-        (ChecklistMark::Active, Some(spin)) => spinner_arc(ink.mark, spin).into_any_element(),
-        (ChecklistMark::Active, None) => static_ring(ink.mark).into_any_element(),
+        (ChecklistMark::Active, true) => spinner(ink.mark).into_any_element(),
+        (ChecklistMark::Active, false) => static_ring(ink.mark).into_any_element(),
         (ChecklistMark::Pending, _) => Icon::CIRCLE.render(IconSize::Medium, ink.mark, &theme),
     };
     div()
