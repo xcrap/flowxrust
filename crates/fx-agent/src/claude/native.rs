@@ -893,7 +893,7 @@ fn parse_file(
                         if message.get("model").is_some() {
                             parsed.defaults.model_id = nonempty(&message["model"]);
                         }
-                        if let Some(usage) = context_usage(&message["usage"]) {
+                        if let Some(usage) = reply_context_usage(message) {
                             parsed.current_context_tokens = Some(usage);
                         }
                     }
@@ -1211,6 +1211,17 @@ fn prompt_text(value: &Value) -> Option<String> {
 
 /// How large a conversation a reply answered: everything sent, cached or not,
 /// plus the reply itself, which the next turn carries too.
+/// How much context an assistant message answered, or `None` where it is no
+/// reading: a `<synthetic>` reply (an API error, a usage limit) never reached
+/// the model and carries zero usage, and a reply always reads something.
+/// Taken as a reading, either one emptied the meter.
+pub(crate) fn reply_context_usage(message: &Value) -> Option<u64> {
+    if message["model"].as_str() == Some("<synthetic>") {
+        return None;
+    }
+    context_usage(&message["usage"]).filter(|used| *used > 0)
+}
+
 pub(crate) fn context_usage(value: &Value) -> Option<u64> {
     let mut total = None::<u64>;
     for key in [
@@ -1752,6 +1763,27 @@ mod tests {
             ["fix them all", "continue...", "API Error: overloaded"],
             "an API error is what the turn said, and stays"
         );
+    }
+
+    #[test]
+    fn a_synthetic_reply_does_not_empty_a_restored_threads_context() {
+        // The API error is kept as what the turn said, and its zero usage
+        // read as the thread's context.
+        let fixture = Fixture::new();
+        let mut reply = fixture.record("assistant", "Looking.", Uuid::new_v4());
+        reply["message"]["usage"] = json!({"input_tokens": 9000, "output_tokens": 12});
+        let mut failure = fixture.record("assistant", "API Error: overloaded", Uuid::new_v4());
+        failure["message"]["id"] = json!("another-provider-message-id");
+        failure["message"]["model"] = json!("<synthetic>");
+        failure["message"]["usage"] = json!({"input_tokens": 0, "output_tokens": 0});
+        failure["isApiErrorMessage"] = json!(true);
+        fixture.write(&[
+            fixture.record("user", "fix it", Uuid::new_v4()),
+            reply,
+            failure,
+        ]);
+        let thread = fixture.store().read(fixture.root(), SESSION).unwrap();
+        assert_eq!(thread.current_context_tokens, Some(9012));
     }
 
     #[test]

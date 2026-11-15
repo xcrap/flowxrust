@@ -911,10 +911,13 @@ impl ClaudeStreamParser {
         // Each reply says how large the conversation it answered was. Without
         // this, Claude never reported context at all, and its threads' meter
         // could only ever say it did not know. The window is not known until
-        // `result`; zero says so, and the thread's model fills it in.
+        // `result`; zero says so, and the thread's model fills it in. A
+        // `<synthetic>` reply (an API error, a usage limit) was never sent to
+        // the model and counts nothing, and taken as a reading it emptied the
+        // meter.
         if let Some(used) = envelope
-            .pointer("/message/usage")
-            .and_then(super::native::context_usage)
+            .get("message")
+            .and_then(super::native::reply_context_usage)
             && self.context_tokens != Some(used)
         {
             self.context_tokens = Some(used);
@@ -1061,13 +1064,7 @@ impl ClaudeStreamParser {
         self.answered = true;
 
         if envelope.get("is_error").and_then(Value::as_bool) == Some(true) {
-            return vec![ProviderEvent::Error(
-                envelope
-                    .get("result")
-                    .and_then(Value::as_str)
-                    .unwrap_or("Claude Code returned an error.")
-                    .to_string(),
-            )];
+            return vec![ProviderEvent::Error(error_reason(envelope))];
         }
 
         let usage = match model_usage_of(envelope) {
@@ -1465,6 +1462,36 @@ fn since(total: Usage, previous: Option<Usage>) -> Usage {
         cached_input_tokens: total.cached_input_tokens - previous.cached_input_tokens,
         reasoning_output_tokens: total.reasoning_output_tokens - previous.reasoning_output_tokens,
         total_tokens: total.total_tokens - previous.total_tokens,
+    }
+}
+
+/// What an errored `result` says went wrong.
+///
+/// The error subtypes (`error_during_execution`, `error_max_turns`,
+/// `error_max_budget_usd`) carry `errors` and no `result`; read for `result`
+/// alone, every one of them told the reader nothing. With neither, the
+/// subtype at least names the kind.
+fn error_reason(envelope: &Value) -> String {
+    if let Some(result) = non_empty(envelope.get("result")) {
+        return result;
+    }
+    let errors: Vec<&str> = envelope
+        .get("errors")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .map(str::trim)
+        .filter(|error| !error.is_empty())
+        .collect();
+    if !errors.is_empty() {
+        return bounded(&errors.join("\n"), 4_096);
+    }
+    match non_empty(envelope.get("subtype")) {
+        Some(subtype) if subtype != "success" => {
+            format!("Claude Code returned an error ({subtype}).")
+        }
+        _ => "Claude Code returned an error.".to_string(),
     }
 }
 
@@ -2388,6 +2415,36 @@ mod tests {
     }
 
     #[test]
+    fn a_synthetic_reply_does_not_empty_the_context_meter() {
+        // An API error or a usage limit arrives as a `<synthetic>` reply with
+        // zero usage, which read as the conversation having emptied.
+        let mut parser = ClaudeStreamParser::new();
+        let reply = |model: &str, input: u64| {
+            line(json!({
+                "type": "assistant",
+                "message": {
+                    "model": model,
+                    "content": [{ "type": "text", "text": "API Error: overloaded" }],
+                    "usage": { "input_tokens": input, "output_tokens": 0 }
+                }
+            }))
+        };
+        let context = |events: Vec<ProviderEvent>| {
+            events
+                .into_iter()
+                .find(|event| matches!(event, ProviderEvent::ContextUsage { .. }))
+        };
+        assert!(context(parser.events(&reply("claude-opus", 9_000))).is_some());
+        assert_eq!(context(parser.events(&reply("<synthetic>", 0))), None);
+        assert_eq!(context(parser.events(&reply("<synthetic>", 5))), None);
+        assert_eq!(
+            context(parser.events(&reply("claude-opus", 0))),
+            None,
+            "a reply that counted nothing is no reading"
+        );
+    }
+
+    #[test]
     fn a_second_result_is_ignored() {
         // Otherwise a turn's cost is counted twice.
         let mut parser = ClaudeStreamParser::new();
@@ -2432,6 +2489,37 @@ mod tests {
                 .iter()
                 .any(|e| matches!(e, ProviderEvent::Done { .. })),
             "a failed turn reported completion"
+        );
+    }
+
+    #[test]
+    fn an_errored_result_without_a_result_says_what_its_errors_say() {
+        // The error subtypes carry `errors` and no `result`, so the reader
+        // was told only "Claude Code returned an error."
+        let errored = |extra: Value| {
+            let mut frame = json!({"type": "result", "subtype": "error_during_execution",
+                                   "is_error": true, "session_id": "s1"});
+            frame
+                .as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            ClaudeStreamParser::new().events(&line(frame))
+        };
+        assert_eq!(
+            errored(json!({"errors": ["Tool permission stream closed", "  ", "Second failure"]})),
+            vec![ProviderEvent::Error(
+                "Tool permission stream closed\nSecond failure".into()
+            )]
+        );
+        // With nothing to quote, the subtype at least says which kind.
+        let [ProviderEvent::Error(reason)] = &errored(json!({"errors": []}))[..] else {
+            panic!("an error was expected")
+        };
+        assert!(reason.contains("error_during_execution"), "{reason}");
+        // A `result` still wins where there is one.
+        assert_eq!(
+            errored(json!({"result": "hit a limit", "errors": ["other"]})),
+            vec![ProviderEvent::Error("hit a limit".into())]
         );
     }
 
