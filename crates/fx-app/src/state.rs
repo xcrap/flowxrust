@@ -3071,6 +3071,13 @@ impl AppState {
                     .iter()
                     .find(|record| record.project.as_ref().is_some_and(|p| p.id == project))
                     .unwrap();
+                // A set, not a scan of the bindings per thread, which was
+                // quadratic in the project's threads, on the UI thread.
+                let bound: HashSet<Uuid> = record
+                    .native_bindings
+                    .iter()
+                    .map(|binding| binding.agent_id)
+                    .collect();
                 let candidates = record
                     .agents
                     .iter()
@@ -3082,10 +3089,7 @@ impl AppState {
                                 .as_deref()
                                 .unwrap_or("codex")
                                 == provider
-                            && !record
-                                .native_bindings
-                                .iter()
-                                .any(|binding| binding.agent_id == agent.id)
+                            && !bound.contains(&agent.id)
                     })
                     .map(|agent| agent.id)
                     .collect();
@@ -3408,6 +3412,11 @@ impl AppState {
                     .missing_native_agent_ids
                     .retain(|agent| !found.contains(agent));
                 if warnings.is_empty() {
+                    // Sets, not scans of the lists, per binding: quadratic in
+                    // the project's threads, on the UI thread.
+                    let protected: HashSet<Uuid> = protected.into_iter().collect();
+                    let mut hidden: HashSet<Uuid> =
+                        record.missing_native_agent_ids.iter().copied().collect();
                     for binding in record.native_bindings.iter().filter(|binding| {
                         binding.provider_id == ticket.provider
                             && here.is(&binding.working_directory)
@@ -3432,10 +3441,10 @@ impl AppState {
                         if protected {
                             // A previous build may already have hidden an
                             // image-only draft. Recovery must make it reachable.
-                            record.missing_native_agent_ids.retain(|agent| *agent != id);
-                        } else if !present.contains(&binding.session_id)
-                            && !record.missing_native_agent_ids.contains(&id)
-                        {
+                            if hidden.remove(&id) {
+                                record.missing_native_agent_ids.retain(|agent| *agent != id);
+                            }
+                        } else if !present.contains(&binding.session_id) && hidden.insert(id) {
                             record.missing_native_agent_ids.push(id);
                         }
                     }
@@ -5189,11 +5198,15 @@ pub(crate) fn restore_conversation(
 }
 
 fn visible_agent(record: &fx_store::PersistedProject, preferred: Option<Uuid>) -> Option<Uuid> {
-    let visible = |id: &Uuid| {
-        !record.archived_agent_ids.contains(id)
-            && !record.missing_native_agent_ids.contains(id)
-            && record.agents.iter().any(|agent| agent.id == *id)
-    };
+    // Sets, not scans of the lists per thread: in a project of nothing but
+    // archived threads every id was looked for in all three, on every pass.
+    let hidden: HashSet<&Uuid> = record
+        .archived_agent_ids
+        .iter()
+        .chain(&record.missing_native_agent_ids)
+        .collect();
+    let threads: HashSet<&Uuid> = record.agents.iter().map(|agent| &agent.id).collect();
+    let visible = |id: &Uuid| !hidden.contains(id) && threads.contains(id);
     preferred
         .filter(visible)
         .or_else(|| {
@@ -9225,6 +9238,62 @@ mod native_sync_tests {
                 assert_eq!(
                     order(state),
                     vec![d_id, c_id, worktree, created, b_id, a_id]
+                );
+            })
+        });
+    }
+
+    #[test]
+    fn a_pass_over_a_large_archived_project_takes_time_in_proportion() {
+        // Each thread was looked for in the bindings to build the pass, in
+        // the missing list to hide it, and, with every thread archived, in
+        // the archived and missing lists again to choose one to select. All
+        // on the UI thread, and quadratic in the project's threads.
+        const THREADS: usize = 20_000;
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().to_string_lossy().to_string();
+        let test = gpui::TestAppContext::single();
+        let (state, project) =
+            test.update(|cx| setup(cx, AppPaths::at(temp.path().join("store")), &root));
+        test.update(|cx| {
+            state.update(cx, |state, cx| {
+                let record = &mut state.snapshot.projects[0];
+                for i in 0..THREADS {
+                    let mut agent = Agent::new(format!("T{i}"));
+                    agent.configuration.provider_id = Some("codex".into());
+                    let id = agent.id;
+                    record.agents.push(agent);
+                    record.project.as_mut().unwrap().agent_order.push(id);
+                    record.native_bindings.push(native_binding(
+                        id,
+                        &entry(&root, "codex", &format!("s{i}"), &format!("T{i}")),
+                    ));
+                    record.archived_agent_ids.push(id);
+                    record.missing_native_agent_ids.push(id);
+                }
+                state.snapshot.active_agent_id = None;
+                let (codex_jobs, _codex_results) = state.native_sync.test_worker("codex");
+                let (_claude_jobs, _claude_results) = state.native_sync.test_worker("claude");
+                let started = Instant::now();
+                state.poll_native_sync(cx);
+                let ticket = codex_jobs.try_recv().unwrap();
+                state.apply_native_completion(Completion {
+                    ticket,
+                    result: Ok(Payload::Index {
+                        index: NativeThreadIndex::default(),
+                        sessions: Vec::new(),
+                        protected: Vec::new(),
+                    }),
+                });
+                let elapsed = started.elapsed();
+                assert_eq!(state.snapshot.active_agent_id, None);
+                assert_eq!(
+                    state.snapshot.projects[0].missing_native_agent_ids.len(),
+                    THREADS
+                );
+                assert!(
+                    elapsed < Duration::from_secs(1),
+                    "a pass over {THREADS} threads took {elapsed:?}"
                 );
             })
         });
