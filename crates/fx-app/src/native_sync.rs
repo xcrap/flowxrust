@@ -23,6 +23,9 @@ pub(crate) const HISTORY_INTERVAL: Duration = Duration::from_secs(2);
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct NativeSyncStatus {
     pub syncing: bool,
+    /// A pass is running for a provider that has not yet answered for this
+    /// project once: what "Loading provider threads…" waits for.
+    pub discovering: bool,
     pub warnings: Vec<String>,
 }
 
@@ -88,6 +91,8 @@ pub(crate) struct NativeSync {
     pub completed_turns: HashMap<Uuid, Instant>,
     pub last_was_index: HashMap<String, bool>,
     pub loaded_revisions: HashMap<Uuid, String>,
+    /// The providers that have answered an index pass for each project.
+    pub indexed: HashMap<Uuid, HashSet<String>>,
     #[cfg(test)]
     test_enabled: bool,
 }
@@ -142,6 +147,23 @@ impl NativeSync {
                 .pending
                 .as_ref()
                 .is_some_and(|ticket| ticket.project == project)
+        })
+    }
+
+    /// Whether a project's first pass is under way: a provider that has not
+    /// answered for it yet is reading it. Tied to any running pass instead,
+    /// an empty project's label flickered between "Loading provider
+    /// threads…" and "No threads yet" on every pass.
+    pub fn discovering(&self, project: Uuid) -> bool {
+        self.workers.values().any(|worker| {
+            worker.pending.as_ref().is_some_and(|ticket| {
+                ticket.project == project
+                    && matches!(ticket.kind, RequestKind::Index { .. })
+                    && !self
+                        .indexed
+                        .get(&project)
+                        .is_some_and(|done| done.contains(&ticket.provider))
+            })
         })
     }
 

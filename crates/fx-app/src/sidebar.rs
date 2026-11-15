@@ -228,7 +228,9 @@ fn body(state: Entity<AppState>, cx: &mut App) -> AnyElement {
             .pt(px_len(Spacing::XXXS));
         {
             let native_status = app.native_status(id);
-            let loading = native_status.syncing && record.agents.is_empty();
+            // Until each provider has answered once: a pass runs every few
+            // seconds, and the label followed it.
+            let loading = native_status.discovering && record.agents.is_empty();
             if loading || !native_status.warnings.is_empty() {
                 let detail = sync_detail(&native_status.warnings);
                 let label = if detail.is_empty() {

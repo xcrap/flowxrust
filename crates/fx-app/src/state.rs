@@ -2847,6 +2847,7 @@ impl AppState {
         warnings.dedup();
         crate::native_sync::NativeSyncStatus {
             syncing: self.native_sync.pending_for(project_id),
+            discovering: self.native_sync.discovering(project_id),
             warnings,
         }
     }
@@ -2886,7 +2887,7 @@ impl AppState {
             .iter()
             .filter(|record| record.agents.is_empty())
             .filter_map(|record| record.project.as_ref())
-            .map(|project| self.native_sync.pending_for(project.id))
+            .map(|project| self.native_sync.discovering(project.id))
             .collect();
         loading.push(self.snapshot.active_agent_id.is_some_and(|agent| {
             self.native_sync.history_loading(agent)
@@ -3180,6 +3181,13 @@ impl AppState {
             || !expected_root.is_some_and(|root| same_project(&root, &ticket.root))
         {
             return false;
+        }
+        if matches!(ticket.kind, RequestKind::Index { .. }) {
+            self.native_sync
+                .indexed
+                .entry(ticket.project)
+                .or_default()
+                .insert(ticket.provider.clone());
         }
         match completion.result {
             Err(error) => match ticket.kind {
@@ -9239,6 +9247,54 @@ mod native_sync_tests {
                     order(state),
                     vec![d_id, c_id, worktree, created, b_id, a_id]
                 );
+            })
+        });
+    }
+
+    #[test]
+    fn an_empty_project_is_loading_only_until_its_first_pass() {
+        // The label followed whether a pass was running, so a project with no
+        // threads flickered between "Loading provider threads…" and "No
+        // threads yet" on every pass.
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().to_string_lossy().to_string();
+        let test = gpui::TestAppContext::single();
+        let (state, project) =
+            test.update(|cx| setup(cx, AppPaths::at(temp.path().join("store")), &root));
+        test.update(|cx| {
+            state.update(cx, |state, cx| {
+                let (codex_jobs, codex_results) = state.native_sync.test_worker("codex");
+                let (claude_jobs, claude_results) = state.native_sync.test_worker("claude");
+                let empty = |ticket| Completion {
+                    ticket,
+                    result: Ok(Payload::Index {
+                        index: NativeThreadIndex::default(),
+                        sessions: Vec::new(),
+                        protected: Vec::new(),
+                    }),
+                };
+                state.poll_native_sync(cx);
+                assert!(state.native_status(project).discovering);
+                codex_results
+                    .send(empty(codex_jobs.try_recv().unwrap()))
+                    .unwrap();
+                state.poll_native_sync(cx);
+                // Claude has not answered yet.
+                assert!(state.native_status(project).discovering);
+                claude_results
+                    .send(empty(claude_jobs.try_recv().unwrap()))
+                    .unwrap();
+                state.poll_native_sync(cx);
+                assert!(!state.native_status(project).discovering);
+                for provider in ["codex", "claude"] {
+                    state.native_sync.index_due.insert(
+                        (project, provider.into()),
+                        Instant::now() - Duration::from_secs(1),
+                    );
+                }
+                state.poll_native_sync(cx);
+                let status = state.native_status(project);
+                assert!(status.syncing && !status.discovering);
             })
         });
     }
