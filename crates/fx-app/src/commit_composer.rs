@@ -175,12 +175,28 @@ pub(super) fn commit_scope(
                 .iter()
                 .filter(|file| chosen.contains(&file.path))
                 .collect();
-            let chosen = files.iter().map(|file| file.path.clone()).collect();
+            // `git rm --cached x` lists `x` twice, as `D ` and as `??`.
+            let mut chosen: Vec<String> = Vec::with_capacity(files.len());
+            for file in &files {
+                if !chosen.contains(&file.path) {
+                    chosen.push(file.path.clone());
+                }
+            }
             let sources = files
                 .iter()
                 .filter_map(|file| file.rename_source().map(str::to_string))
                 .collect();
-            CommitScope::Paths { chosen, sources }
+            // A staged deletion is what was chosen, whatever is on disk now.
+            let untracked = files
+                .iter()
+                .filter(|file| file.staged_status == "D")
+                .map(|file| file.path.clone())
+                .collect();
+            CommitScope::Paths {
+                chosen,
+                sources,
+                untracked,
+            }
         }
     }
 }
@@ -692,11 +708,41 @@ mod tests {
                     "fresh.rs".into()
                 ],
                 sources: vec!["old.rs".into()],
+                untracked: vec![],
             }
         );
         assert_eq!(
             commit_scope(CommitChoice::All, &chosen, &repository),
             CommitScope::All
+        );
+    }
+
+    #[test]
+    fn a_chosen_staged_deletion_is_committed_as_one() {
+        // `git rm --cached` leaves the file on disk: ignored, it is listed
+        // once as `D `, and otherwise again as `??`. Either way the deletion
+        // is what was chosen; added, the file was committed and tracked again.
+        let repository = GitRepositoryInfo {
+            is_git_repo: true,
+            files: vec![
+                GitFileStatus::new(".env", "D", " "),
+                GitFileStatus::new("both.rs", "D", " "),
+                GitFileStatus::new("both.rs", "?", "?"),
+                GitFileStatus::new("gone.rs", " ", "D"),
+            ],
+            ..Default::default()
+        };
+        let chosen: BTreeSet<String> = [".env", "both.rs", "gone.rs"]
+            .into_iter()
+            .map(String::from)
+            .collect();
+        assert_eq!(
+            commit_scope(CommitChoice::Chosen, &chosen, &repository),
+            CommitScope::Paths {
+                chosen: vec![".env".into(), "both.rs".into(), "gone.rs".into()],
+                sources: vec![],
+                untracked: vec![".env".into(), "both.rs".into()],
+            }
         );
     }
 }

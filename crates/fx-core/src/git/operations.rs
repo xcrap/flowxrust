@@ -43,6 +43,11 @@ pub enum CommitScope {
         /// The sources of chosen renames, committed as removed. Whatever sits
         /// at that path now is a different file, and it was not chosen.
         sources: Vec<String>,
+        /// Chosen paths the index no longer tracks, as `git rm --cached`
+        /// leaves one: committed as removed. A file still on disk there stays
+        /// untracked; added as a chosen file is, it was committed and the
+        /// reset tracked it again.
+        untracked: Vec<String>,
     },
 }
 
@@ -76,23 +81,36 @@ impl CommitPlan {
         let (stage, chosen) = match scope {
             CommitScope::All => (Some(vec!["add".into(), "-A".into()]), None),
             CommitScope::Staged => (None, None),
-            CommitScope::Paths { chosen, sources } => {
+            CommitScope::Paths {
+                chosen,
+                sources,
+                untracked,
+            } => {
                 if chosen.is_empty() {
                     return Err("Choose at least one file to commit.".into());
                 }
-                for path in chosen.iter().chain(sources) {
+                for path in chosen.iter().chain(sources).chain(untracked) {
                     validate_relative_path(path)?;
                 }
                 // A source that was chosen as well is a file of its own now,
                 // and is committed as one.
-                let sources = sources
+                let mut removed: Vec<String> = sources
                     .iter()
                     .filter(|source| !chosen.contains(source))
                     .cloned()
                     .collect();
+                for path in untracked {
+                    if !removed.contains(path) {
+                        removed.push(path.clone());
+                    }
+                }
                 let chosen = ChosenFiles {
-                    paths: chosen.clone(),
-                    sources,
+                    paths: chosen
+                        .iter()
+                        .filter(|path| !untracked.contains(path))
+                        .cloned()
+                        .collect(),
+                    sources: removed,
                 };
                 (None, Some(chosen))
             }
@@ -165,12 +183,10 @@ async fn commit_chosen(
         .paths
         .iter()
         .cloned()
-        .partition(|path| root.join(path).symlink_metadata().is_ok());
-    if !present.is_empty() {
-        let mut add = vec!["add".to_string(), "-A".into(), "--".into()];
-        add.extend(present);
-        write_in(root, index_path, &add, "Staging failed.").await?;
-    }
+        .partition(|path| still_there(root, path));
+    // Removed first. With `core.ignorecase`, macOS's default, `add --
+    // README.md` updated the index's `Readme.md` in place, and removing the
+    // source after it removed the rename's only entry.
     let removed: Vec<String> = missing
         .into_iter()
         .chain(chosen.sources.iter().cloned())
@@ -186,6 +202,20 @@ async fn commit_chosen(
         remove.extend(removed);
         write_in(root, index_path, &remove, "Staging failed.").await?;
     }
+    if !present.is_empty() {
+        // `--force`: the index starts from `HEAD`, where a file added with
+        // `add -f`, or moved into an ignored folder, is new, and `add` refuses
+        // an ignored path. Only paths status listed get here, and never a
+        // plain folder, so nothing else ignored comes with them.
+        let mut add = vec![
+            "add".to_string(),
+            "-A".into(),
+            "--force".into(),
+            "--".into(),
+        ];
+        add.extend(present);
+        write_in(root, index_path, &add, "Staging failed.").await?;
+    }
 
     let output = write_in(root, index_path, commit, "Commit failed.").await?;
     let summary = first_line(&output).unwrap_or_else(|| "Committed.".into());
@@ -197,6 +227,23 @@ async fn commit_chosen(
         ));
     }
     Ok(summary)
+}
+
+/// Whether a chosen path is still in the working tree as what was chosen.
+///
+/// A file replaced by a folder of new files is a deletion: `add -- path`
+/// read the path as the folder and committed everything in it. A folder that
+/// is a repository is a gitlink, as a submodule or a nested repository's
+/// `vendor/lib/` is, and is added as one. A link is not followed.
+fn still_there(root: &Path, path: &str) -> bool {
+    let full = root.join(path);
+    match full.symlink_metadata() {
+        Ok(metadata) if metadata.is_dir() => {
+            path.ends_with('/') || full.join(".git").symlink_metadata().is_ok()
+        }
+        Ok(_) => true,
+        Err(_) => false,
+    }
 }
 
 /// Why a chosen-files commit cannot be made now, in git's words.
@@ -595,11 +642,13 @@ mod tests {
             let scope = CommitScope::Paths {
                 chosen: vec![path.into()],
                 sources: vec![],
+                untracked: vec![],
             };
             assert!(CommitPlan::new("message", &scope).is_err(), "{path:?}");
             let scope = CommitScope::Paths {
                 chosen: vec!["inside".into()],
                 sources: vec![path.into()],
+                untracked: vec![],
             };
             assert!(CommitPlan::new("message", &scope).is_err(), "{path:?}");
         }
@@ -608,6 +657,7 @@ mod tests {
             &CommitScope::Paths {
                 chosen: vec!["-f".into(), "new".into()],
                 sources: vec!["old".into(), "new".into()],
+                untracked: vec![],
             },
         )
         .unwrap();
@@ -621,6 +671,29 @@ mod tests {
             },
             "a source that was chosen too is committed as a file"
         );
+        let plan = CommitPlan::new(
+            "Untrack",
+            &CommitScope::Paths {
+                chosen: vec!["new".into(), ".env".into()],
+                sources: vec!["old".into()],
+                untracked: vec![".env".into()],
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            plan.chosen.unwrap(),
+            ChosenFiles {
+                paths: vec!["new".into()],
+                sources: vec!["old".into(), ".env".into()],
+            },
+            "a path the index no longer tracks is committed as removed"
+        );
+        let scope = CommitScope::Paths {
+            chosen: vec!["inside".into()],
+            sources: vec![],
+            untracked: vec!["../outside".into()],
+        };
+        assert!(CommitPlan::new("message", &scope).is_err());
     }
 
     #[test]
@@ -663,6 +736,7 @@ mod tests {
             &CommitScope::Paths {
                 chosen: vec!["renamed.txt".into(), "chosen.txt".into()],
                 sources: vec!["old.txt".into()],
+                untracked: vec![],
             },
         )
         .unwrap();
@@ -695,6 +769,7 @@ mod tests {
             &CommitScope::Paths {
                 chosen: vec!["new.txt".into()],
                 sources: vec!["old.txt".into()],
+                untracked: vec![],
             },
         )
         .unwrap();
@@ -734,6 +809,7 @@ mod tests {
             &CommitScope::Paths {
                 chosen: vec!["old.txt".into(), "tracked.txt".into(), "brief.txt".into()],
                 sources: vec![],
+                untracked: vec![],
             },
         )
         .unwrap();
@@ -766,6 +842,7 @@ mod tests {
             &CommitScope::Paths {
                 chosen: vec!["tracked.txt".into(), "new.txt".into()],
                 sources: vec![],
+                untracked: vec![],
             },
         )
         .unwrap();
@@ -788,6 +865,7 @@ mod tests {
             &CommitScope::Paths {
                 chosen: vec!["first.txt".into()],
                 sources: vec![],
+                untracked: vec![],
             },
         )
         .unwrap();
@@ -797,6 +875,124 @@ mod tests {
             "first.txt\n"
         );
         assert_eq!(status(root), "?? later.txt\n");
+    }
+
+    #[test]
+    fn a_rename_that_only_changes_case_commits_the_new_name() {
+        // With `core.ignorecase`, macOS's default, `add -- README.md` updated
+        // HEAD's `Readme.md` entry in place, and removing the source then
+        // removed it: the commit deleted the file and added nothing.
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        git(root, &["init", "-q", "-b", "main"]);
+        identify(root);
+        git(root, &["config", "core.ignorecase", "true"]);
+        std::fs::write(root.join("Readme.md"), "read me\n").unwrap();
+        git(root, &["add", "."]);
+        git(root, &["commit", "-qm", "initial"]);
+        git(root, &["mv", "Readme.md", "README.md"]);
+        let plan = CommitPlan::new(
+            "Case",
+            &CommitScope::Paths {
+                chosen: vec!["README.md".into()],
+                sources: vec!["Readme.md".into()],
+                untracked: vec![],
+            },
+        )
+        .unwrap();
+        run(commit(root, &plan)).unwrap();
+        assert_eq!(
+            git(root, &["ls-tree", "--name-only", "HEAD"]),
+            "README.md\n"
+        );
+        assert_eq!(git(root, &["show", "HEAD:README.md"]), "read me\n");
+        assert_eq!(status(root), "");
+    }
+
+    #[test]
+    fn a_chosen_untracking_stays_untracked() {
+        // After `git rm --cached .env`, choosing the `D .env` row committed
+        // the file's current contents, and the reset tracked it again.
+        let temp = repository();
+        let root = temp.path();
+        std::fs::write(root.join(".env"), "SECRET=1\n").unwrap();
+        git(root, &["add", ".env"]);
+        git(root, &["commit", "-qm", "env"]);
+        std::fs::write(root.join(".git/info/exclude"), ".env\n").unwrap();
+        git(root, &["rm", "--cached", "-q", ".env"]);
+        std::fs::write(root.join(".env"), "SECRET=2\n").unwrap();
+        assert_eq!(status(root), "D  .env\n");
+        let plan = CommitPlan::new(
+            "Untrack",
+            &CommitScope::Paths {
+                chosen: vec![".env".into()],
+                sources: vec![],
+                untracked: vec![".env".into()],
+            },
+        )
+        .unwrap();
+        run(commit(root, &plan)).unwrap();
+        assert_eq!(
+            git(root, &["show", "--name-status", "--format=", "HEAD"]),
+            "D\t.env\n"
+        );
+        assert_eq!(git(root, &["ls-files", "--", ".env"]), "");
+        assert_eq!(
+            std::fs::read_to_string(root.join(".env")).unwrap(),
+            "SECRET=2\n"
+        );
+        assert_eq!(status(root), "");
+    }
+
+    #[test]
+    fn a_file_replaced_by_a_folder_commits_only_its_deletion() {
+        // `add -A -- old.txt` read the path as the folder now there, and
+        // committed every file in it.
+        let temp = repository();
+        let root = temp.path();
+        std::fs::remove_file(root.join("old.txt")).unwrap();
+        std::fs::create_dir(root.join("old.txt")).unwrap();
+        std::fs::write(root.join("old.txt/inner.txt"), "not chosen\n").unwrap();
+        // As the inspector lists it: `-unormal` shows no row for the folder.
+        let listed = |root: &Path| git(root, &["status", "--porcelain=v1", "-uall"]);
+        assert_eq!(listed(root), " D old.txt\n?? old.txt/inner.txt\n");
+        run(commit(root, &chosen("old.txt"))).unwrap();
+        assert_eq!(
+            git(root, &["show", "--name-status", "--format=", "HEAD"]),
+            "D\told.txt\n"
+        );
+        assert_eq!(listed(root), "?? old.txt/inner.txt\n");
+    }
+
+    #[test]
+    fn a_chosen_file_git_ignores_is_still_committed() {
+        // The temporary index starts from `HEAD`, so a force-added file, or a
+        // rename into an ignored folder, is new to it, and `add` refused it:
+        // "The following paths are ignored".
+        let temp = repository();
+        let root = temp.path();
+        std::fs::write(root.join(".gitignore"), "*.log\nbuild/\n").unwrap();
+        git(root, &["add", ".gitignore"]);
+        git(root, &["commit", "-qm", "ignore"]);
+        std::fs::write(root.join("debug.log"), "kept on purpose\n").unwrap();
+        git(root, &["add", "-f", "debug.log"]);
+        std::fs::create_dir(root.join("build")).unwrap();
+        git(root, &["mv", "old.txt", "build/old.txt"]);
+        assert_eq!(status(root), "R  old.txt -> build/old.txt\nA  debug.log\n");
+        let plan = CommitPlan::new(
+            "Ignored",
+            &CommitScope::Paths {
+                chosen: vec!["debug.log".into(), "build/old.txt".into()],
+                sources: vec!["old.txt".into()],
+                untracked: vec![],
+            },
+        )
+        .unwrap();
+        run(commit(root, &plan)).unwrap();
+        assert_eq!(git(root, &["show", "HEAD:debug.log"]), "kept on purpose\n");
+        assert_eq!(git(root, &["show", "HEAD:build/old.txt"]), "moving\n");
+        assert_eq!(status(root), "");
+        assert_no_temporary_index(root);
     }
 
     /// Set a file's modification time `seconds` back.
@@ -816,6 +1012,7 @@ mod tests {
             &CommitScope::Paths {
                 chosen: vec![path.into()],
                 sources: vec![],
+                untracked: vec![],
             },
         )
         .unwrap()
@@ -938,6 +1135,7 @@ mod tests {
             &CommitScope::Paths {
                 chosen: vec!["old.txt".into()],
                 sources: vec![],
+                untracked: vec![],
             },
         )
         .unwrap()
@@ -1027,6 +1225,7 @@ mod tests {
             &CommitScope::Paths {
                 chosen: vec!["tracked.txt".into()],
                 sources: vec![],
+                untracked: vec![],
             },
         )
         .unwrap();
