@@ -677,12 +677,27 @@ impl CommandPalette {
     /// Run the highlighted row, if there is one.
     pub fn run_highlighted(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(index) = self.highlighted_index() {
-            self.run(self.results[index], window, cx);
+            let id = self.commands[self.results[index]].id.clone();
+            self.run(&id, window, cx);
         }
     }
 
-    fn run(&mut self, command: usize, window: &mut Window, cx: &mut Context<Self>) {
-        let target = self.commands[command].target.clone();
+    /// Run the command with `id`, or nothing when the listing no longer has
+    /// it.
+    ///
+    /// By id rather than by position, because a row's press is the handler
+    /// of the frame that drew it: a refilter or a search that finished since
+    /// had truncated or re-pushed the list, and the row's position then held
+    /// another command, or none, which panicked.
+    fn run(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(target) = self
+            .commands
+            .iter()
+            .find(|command| command.id == id)
+            .map(|command| command.target.clone())
+        else {
+            return;
+        };
         self.dismiss(window, cx);
         match target {
             PaletteTarget::Action(action) => window.dispatch_action(action, cx),
@@ -782,6 +797,7 @@ impl CommandPalette {
         let for_hover = this.clone();
         let for_choose = this.clone();
         let hover_key = key.clone();
+        let id = command.id.clone();
         div()
             .w_full()
             .pb(px_len(Spacing::XXS))
@@ -803,7 +819,7 @@ impl CommandPalette {
                     });
                 },
                 move |window, cx| {
-                    for_choose.update(cx, |palette, cx| palette.run(index, window, cx));
+                    for_choose.update(cx, |palette, cx| palette.run(&id, window, cx));
                 },
             ))
             .into_any_element()
@@ -1640,5 +1656,86 @@ mod tests {
         shell.keys("cmd-k");
         assert!(shell.palette().is_none());
         assert!(request(&shell));
+    }
+
+    #[test]
+    fn a_row_runs_the_command_it_drew_after_the_list_under_it_moved() {
+        // A row's press is the handler of the frame that drew it. It held a
+        // position in the listing, so a search that re-pushed its hits since
+        // ran another row, and one that found fewer panicked.
+        let mut shell = shell();
+        let [first, second] = shell.threads;
+        let (in_first, in_second) = (Uuid::new_v4(), Uuid::new_v4());
+        let hit = |agent: Uuid, message: Uuid, title: &str| PaletteCommand {
+            id: format!("message:{agent}:{message}"),
+            title: title.into(),
+            subtitle: String::new(),
+            icon: Icon::BUBBLE_LEFT_AND_BUBBLE_RIGHT,
+            keywords: Vec::new(),
+            shortcut: None,
+            target: PaletteTarget::Message { agent, message },
+        };
+        let hits = [
+            hit(first, in_first, "In First"),
+            hit(second, in_second, "In Second"),
+        ];
+        // As a search's completion lists them: after the commands, in order.
+        fn list(palette: &mut CommandPalette, hits: &[PaletteCommand]) {
+            palette.search_task = None;
+            palette.commands.truncate(palette.command_count);
+            palette.commands.extend(hits.iter().cloned());
+            palette.rank_against(palette.ranked_query.clone());
+        }
+        // Press the row drawn as `title` once the list has moved to `hits`
+        // with no frame drawn since, as a press lands between a search's
+        // completion and the frame that shows it: on the handler of the
+        // listing before.
+        let press_after = |shell: &mut Shell, title: &str, hits: &[PaletteCommand]| {
+            let palette = shell.palette().unwrap();
+            let mut visual = gpui::VisualTestContext::from_window(shell.window.into(), &shell.test);
+            // Read in an update of its own, which draws any frame still
+            // owed, so the move below is the only change nothing has drawn.
+            let at = visual.debug_bounds(row(title)).unwrap().center();
+            visual.run_until_parked();
+            // Unnotified, so nothing draws it.
+            visual.update(|_, cx| palette.update(cx, |palette, _| list(palette, hits)));
+            visual.simulate_mouse_down(at, gpui::MouseButton::Left, Default::default());
+            visual.simulate_mouse_up(at, gpui::MouseButton::Left, Default::default());
+        };
+        let shown = |shell: &mut Shell, hits: &[PaletteCommand]| {
+            let palette = shell.palette().unwrap();
+            shell.test.update(|cx| {
+                palette.update(cx, |palette, cx| {
+                    list(palette, hits);
+                    cx.notify();
+                })
+            });
+            shell.test.refresh().unwrap();
+        };
+
+        shell.keys("cmd-k");
+        shell.type_text("nothing matches this");
+        shown(&mut shell, &hits);
+        assert_eq!(shell.titles(), ["In First", "In Second"]);
+        // The search runs again and finds nothing.
+        press_after(&mut shell, "In Second", &[]);
+        assert!(
+            shell.palette().is_some(),
+            "a row that is gone ran something"
+        );
+
+        shown(&mut shell, &hits);
+        // It finds both again, the other way round.
+        press_after(&mut shell, "In First", &[hits[1].clone(), hits[0].clone()]);
+        assert!(shell.palette().is_none());
+        shell.test.read(|cx| {
+            let state = shell.state.read(cx);
+            assert_eq!(state.snapshot.active_agent_id, Some(first));
+            assert_eq!(
+                state.search_target.as_ref().map(|target| target.message),
+                Some(in_first),
+                "the press ran the row drawn in its place"
+            );
+        });
     }
 }
