@@ -972,6 +972,7 @@ fn parse_file(
         let modified = DateTime::<Utc>::from(modified);
         parsed.updated_at = Some(parsed.updated_at.map_or(modified, |old| old.max(modified)));
     }
+    fold_desktop_plans(&mut messages);
     // A concurrent append, replacement, or rewrite must be retried instead of
     // publishing an older prefix as the history for a newer fingerprint.
     let after = regular_fingerprint(path)?;
@@ -981,6 +982,29 @@ fn parse_file(
         ));
     }
     Ok((parsed, messages))
+}
+
+/// Record each of the Claude desktop app's plan calls as the whole list it
+/// left. Its calls are mostly steps on from the last list (`advance`,
+/// `done`/`start`), which say nothing read alone; folded in order, every call
+/// is a plan the transcript's plan card can draw, as the app drew it. A step
+/// on with no list before it is left as it was, an ordinary call.
+fn fold_desktop_plans(messages: &mut [ConversationMessage]) {
+    use fx_core::policy::{TurnPlan, turn_plan::DESKTOP_PLAN_TOOL_NAME};
+    let mut plan: Option<TurnPlan> = None;
+    for content in messages
+        .iter_mut()
+        .flat_map(|message| message.content.iter_mut())
+    {
+        if let MessageContent::ToolUse { name, input, .. } = content
+            && name == DESKTOP_PLAN_TOOL_NAME
+            && let Ok(value) = serde_json::from_str::<Value>(input)
+            && let Some(next) = TurnPlan::apply_desktop_update(plan.as_ref(), &value)
+        {
+            *input = next.to_tool_input();
+            plan = Some(next);
+        }
+    }
 }
 
 fn contents(value: &Value, assistant: bool) -> Result<Vec<MessageContent>, ProviderError> {
@@ -1590,6 +1614,57 @@ mod tests {
             self.desktop
                 .join("account/organization/local_desktop-id.json")
         }
+    }
+
+    #[test]
+    fn the_desktop_apps_plan_calls_read_as_the_whole_list_each_left() {
+        // A Claude desktop session keeps its plan with the app's own tool: the
+        // whole list once, then steps on from it, which read alone say
+        // nothing. Folded, every call is a plan the card can draw.
+        let fixture = Fixture::new();
+        let call = |n: usize, input: Value| {
+            let mut record = fixture.record("assistant", "", Uuid::new_v4());
+            record["message"]["id"] = json!(format!("message-{n}"));
+            record["message"]["content"] = json!([{
+                "type": "tool_use", "id": format!("plan-{n}"),
+                "name": "mcp__ccd_turn__update_plan", "input": input
+            }]);
+            record
+        };
+        fixture.write(&[
+            fixture.record("user", "Ship it", Uuid::new_v4()),
+            call(
+                1,
+                json!({"items": [
+                {"content": "Build", "status": "in_progress"},
+                {"content": "Test", "status": "pending"}
+            ], "scope": "first_task"}),
+            ),
+            call(2, json!({"advance": true})),
+        ]);
+        let thread = fixture.store().read(fixture.root(), SESSION).unwrap();
+        let plans: Vec<_> = thread
+            .messages
+            .iter()
+            .flat_map(|message| &message.content)
+            .filter_map(|content| match content {
+                MessageContent::ToolUse { name, input, .. } => {
+                    fx_core::policy::TurnPlan::from_tool_call(name, input)
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(plans.len(), 2, "{:#?}", thread.messages);
+        let statuses = |plan: &fx_core::policy::TurnPlan| {
+            plan.steps
+                .iter()
+                .map(|step| step.status)
+                .collect::<Vec<_>>()
+        };
+        use fx_core::policy::PlanStatus::{Completed, InProgress, Pending};
+        assert_eq!(statuses(&plans[0]), [InProgress, Pending]);
+        assert_eq!(statuses(&plans[1]), [Completed, InProgress]);
+        assert_eq!(plans[1].steps[1].text, "Test");
     }
 
     #[test]

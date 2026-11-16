@@ -369,6 +369,30 @@ fn push_permission_mode(arguments: &mut Vec<String>, mode: &str) {
     arguments.push(mode.into());
 }
 
+/// Asks Claude Code for the task list FlowX draws as a turn's plan.
+///
+/// Claude Code 2.1.325 offers a task list only to older models unless
+/// `CLAUDE_CODE_ENABLE_TODO_TOOLS` is set, and then as the `Task*` tools,
+/// which change one task at a time by an id their results carry, unless
+/// `CLAUDE_CODE_ENABLE_TASKS` is off. FlowX reads `TodoWrite`, the whole list
+/// every call, so it asks for that one. Without either, a Claude turn had no
+/// plan at all to show, where Codex's always has one. A value the user set is
+/// theirs and is kept.
+pub const PLAN_TOOL_ENVIRONMENT: [(&str, &str); 2] = [
+    ("CLAUDE_CODE_ENABLE_TODO_TOOLS", "1"),
+    ("CLAUDE_CODE_ENABLE_TASKS", "0"),
+];
+
+fn with_plan_tool(environment: &[(String, String)]) -> Vec<(String, String)> {
+    let mut environment = environment.to_vec();
+    for (key, value) in PLAN_TOOL_ENVIRONMENT {
+        if !environment.iter().any(|(set, _)| set == key) {
+            environment.push((key.into(), value.into()));
+        }
+    }
+    environment
+}
+
 /// How to launch one Claude turn.
 #[derive(Debug, Clone)]
 pub struct Launch {
@@ -619,7 +643,7 @@ impl ClaudeTransport {
             command.current_dir(directory);
         }
         command.env_clear();
-        for (key, value) in &launch.environment {
+        for (key, value) in with_plan_tool(&launch.environment) {
             command.env(key, value);
         }
 
@@ -3165,5 +3189,28 @@ mod process {
             .await
             .expect_err("the transport is closed");
         assert!(matches!(error, TransportError::InputClosed), "{error:?}");
+    }
+
+    #[test]
+    fn claude_is_asked_for_the_todo_list_unless_the_user_chose_otherwise() {
+        let environment = with_plan_tool(&[("PATH".into(), "/bin".into())]);
+        for (key, value) in PLAN_TOOL_ENVIRONMENT {
+            assert!(
+                environment
+                    .iter()
+                    .any(|(set, given)| set == key && given == value),
+                "{environment:?}"
+            );
+        }
+        // The user's own value wins, and is not doubled.
+        let chosen = with_plan_tool(&[("CLAUDE_CODE_ENABLE_TASKS".into(), "1".into())]);
+        let tasks: Vec<_> = chosen
+            .iter()
+            .filter(|(key, _)| key == "CLAUDE_CODE_ENABLE_TASKS")
+            .collect();
+        assert_eq!(
+            tasks,
+            [&("CLAUDE_CODE_ENABLE_TASKS".to_string(), "1".to_string())]
+        );
     }
 }
