@@ -207,6 +207,8 @@ icons! {
     PERSON_CROP_CIRCLE => "person.crop.circle",
     BUBBLE_LEFT_AND_BUBBLE_RIGHT => "bubble.left.and.bubble.right",
     ARROW_TRIANGLE_BRANCH => "arrow.triangle.branch",
+    // A thread another thread started: a space lead's worker.
+    ARROW_TURN_DOWN_RIGHT => "arrow.turn.down.right",
 }
 
 /// An icon painted in `color`, sized from the active theme.
