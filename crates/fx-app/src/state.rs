@@ -27,6 +27,11 @@ use crate::text_field::TextField;
 use gpui::{App, AppContext, Context, Entity};
 use uuid::Uuid;
 
+/// A space's orchestrator and the threads it runs: its own file, and a child
+/// of this module so it reads the state as the rest of it does.
+#[path = "orchestration.rs"]
+pub(crate) mod orchestration;
+
 /// Store failures, as the shell sees them.
 ///
 /// I/O problems are not fatal to the session: the app keeps running with an
@@ -374,7 +379,7 @@ impl AppState {
         let mut agent = Agent::with_id(id, "Untitled thread");
         agent.configuration = configuration;
         agent.workspace = workspace;
-        self.insert_thread(project_id, agent, true)
+        self.insert_thread(project_id, agent, true, true)
     }
 
     /// Start a review of the active thread's checkout by `provider`: a new
@@ -407,7 +412,7 @@ impl AppState {
         agent.configuration = self.default_configuration(provider);
         agent.configuration.agent_access = Some(AgentAccess::ReadOnly);
         agent.configuration.system_prompt = Some(review::BRIEF.into());
-        self.insert_thread(project_id, agent, false)
+        self.insert_thread(project_id, agent, false, true)
     }
 
     /// Whether a review has findings to send, and where: the thread it
@@ -487,13 +492,16 @@ impl AppState {
     }
 
     /// Add a thread to a project, saved before it exists in memory, and
-    /// select it. `auto_title` queues it for naming after its first prompt;
-    /// otherwise its title is the one it was given, and a sync pass keeps it.
+    /// select it when `select` says so. `auto_title` queues it for naming
+    /// after its first prompt; otherwise its title is the one it was given,
+    /// and a sync pass keeps it. A thread an orchestrator starts is not
+    /// selected: the reader is watching the orchestrator.
     fn insert_thread(
         &mut self,
         project_id: Uuid,
         agent: Agent,
         auto_title: bool,
+        select: bool,
     ) -> Result<Uuid, String> {
         if !self.snapshot_writable {
             return Err("Restore the saved workspace before creating a chat.".into());
@@ -529,9 +537,11 @@ impl AppState {
             local_override(record, id).title = Some(title);
         }
         record.is_expanded = true;
-        record.last_selected_agent_id = Some(id);
-        next.active_project_id = Some(project_id);
-        next.active_agent_id = Some(id);
+        if select {
+            record.last_selected_agent_id = Some(id);
+            next.active_project_id = Some(project_id);
+            next.active_agent_id = Some(id);
+        }
         if !self.commit_thread_change(next, "save this new chat") {
             return Err(self
                 .last_error

@@ -295,27 +295,25 @@ impl TurnRunner {
         approvals: ApprovalPolicy,
         on_update: impl Fn(SessionUpdate) + Send + 'static,
     ) -> Self {
-        // The only thing this runner takes from the app: where FlowX's own
-        // tools are listening, for a thread that opted in to them.
+        // All this runner takes from the app: where FlowX's own tools are
+        // listening, for a thread that has them, and in a test the fake CLI
+        // it runs instead of the user's.
         let bridge = crate::bridge::BridgeHandle::access(cx);
-        let discovery = || {
-            RuntimeDiscovery::new(launch_environment(
-                agent.configuration.resolved_access(AgentAccess::default()),
-                std::env::vars().collect(),
-            ))
-        };
-        let provider = match agent
+        let environment = launch_environment(
+            agent.configuration.resolved_access(AgentAccess::default()),
+            std::env::vars().collect(),
+        );
+        let provider_id = agent
             .configuration
             .provider_id
             .as_deref()
-            .unwrap_or("codex")
-        {
-            "codex" => RuntimeProvider::Codex(CodexProvider::new(discovery())),
-            "claude" => RuntimeProvider::Claude {
-                discovery: discovery(),
-                spec: claude_spec(),
-            },
-            other => RuntimeProvider::Unsupported(other.to_owned()),
+            .unwrap_or("codex");
+        let provider = match provider_runtime(provider_id, environment, cx) {
+            Some((discovery, spec)) if provider_id == "codex" => {
+                RuntimeProvider::Codex(CodexProvider::with_spec(discovery, spec))
+            }
+            Some((discovery, spec)) => RuntimeProvider::Claude { discovery, spec },
+            None => RuntimeProvider::Unsupported(provider_id.to_owned()),
         };
         Self::launch(
             conversation,
@@ -356,6 +354,18 @@ impl TurnRunner {
             steers: tokio::sync::mpsc::unbounded_channel().0,
         };
         (runner, received)
+    }
+
+    /// A runner with no turn behind it, and the receiver its Stop reaches.
+    #[cfg(test)]
+    pub(crate) fn detached_stop() -> (Self, tokio::sync::mpsc::UnboundedReceiver<()>) {
+        let (interrupt, stopped) = tokio::sync::mpsc::unbounded_channel();
+        let runner = Self {
+            interrupt,
+            responses: tokio::sync::mpsc::unbounded_channel().0,
+            steers: tokio::sync::mpsc::unbounded_channel().0,
+        };
+        (runner, stopped)
     }
 
     /// Send guidance into the running turn. `false` once the runner has gone.
@@ -562,6 +572,44 @@ fn launch_environment(
     }
     environment
 }
+
+/// Where a provider's CLI is looked for, and how it is described: the user's
+/// own install, searched in `environment`. `None` for a provider FlowX does
+/// not run.
+///
+/// In a test, a fake installed with [`TestRuntimes`] instead, so an app-level
+/// test can run a whole turn without ever reaching the user's CLI.
+pub(crate) fn provider_runtime(
+    provider: &str,
+    environment: std::collections::BTreeMap<String, String>,
+    cx: &gpui::App,
+) -> Option<(RuntimeDiscovery, BinarySpec)> {
+    #[cfg(test)]
+    if let Some(fake) = cx
+        .try_global::<TestRuntimes>()
+        .and_then(|fakes| fakes.0.get(provider))
+    {
+        return Some(fake.clone());
+    }
+    #[cfg(not(test))]
+    let _ = cx;
+    let spec = match provider {
+        "codex" => fx_core::services::runtime::codex_spec(),
+        "claude" => claude_spec(),
+        _ => return None,
+    };
+    Some((RuntimeDiscovery::new(environment), spec))
+}
+
+/// The fake CLIs a test runs turns with, by provider.
+#[cfg(test)]
+#[derive(Default)]
+pub(crate) struct TestRuntimes(
+    pub(crate) std::collections::HashMap<String, (RuntimeDiscovery, BinarySpec)>,
+);
+
+#[cfg(test)]
+impl gpui::Global for TestRuntimes {}
 
 enum RuntimeProvider {
     Codex(CodexProvider),
@@ -3572,12 +3620,15 @@ for worker in workers: worker.join()
     fn claude_is_given_flowx_s_tools_only_for_a_thread_that_opted_in() {
         let bridge_dir = tempfile::tempdir().unwrap();
         let bridge = crate::bridge::test_access(bridge_dir.path());
-        for (opted, access) in [
-            (Some(true), AgentAccess::Supervised),
+        for (opted, access, lead) in [
+            (Some(true), AgentAccess::Supervised, false),
             // Read Only keeps them: `--restricted` still loads `--mcp-config`.
-            (Some(true), AgentAccess::ReadOnly),
-            (None, AgentAccess::Supervised),
-            (Some(false), AgentAccess::FullAccess),
+            (Some(true), AgentAccess::ReadOnly, false),
+            (None, AgentAccess::Supervised, false),
+            (Some(false), AgentAccess::FullAccess, false),
+            // A space's lead has them without opting in, says it leads, and
+            // gives FlowX's server longer than a wait takes.
+            (None, AgentAccess::Supervised, true),
         ] {
             let Some(server) = ClaudeFixture::new() else {
                 return;
@@ -3585,6 +3636,7 @@ for worker in workers: worker.join()
             let mut agent = Agent::new("Claude");
             agent.configuration.flowx_tools = opted;
             agent.configuration.agent_access = Some(access);
+            agent.lead_of = lead.then(uuid::Uuid::new_v4);
             let thread = agent.id;
             let conversation = conversation();
             let (_runner, recorder) = server.start_agent(
@@ -3608,7 +3660,7 @@ for worker in workers: worker.join()
                 .iter()
                 .filter(|argument| argument.starts_with("--mcp-config"))
                 .collect();
-            if opted != Some(true) {
+            if opted != Some(true) && !lead {
                 assert!(configs.is_empty(), "{opted:?}: {arguments:?}");
                 continue;
             }
@@ -3618,6 +3670,22 @@ for worker in workers: worker.join()
             let entry = &config["mcpServers"]["flowx"];
             assert_eq!(entry["args"], serde_json::json!(["--mcp-server"]));
             assert_eq!(entry["env"][fx_bridge::ENV_THREAD], thread.to_string());
+            assert_eq!(
+                entry["env"]
+                    .get(fx_bridge::ENV_ROLE)
+                    .and_then(Value::as_str),
+                lead.then_some(fx_bridge::ROLE_LEAD),
+                "{entry}"
+            );
+            assert_eq!(
+                entry["timeout"],
+                if lead {
+                    serde_json::json!(600_000)
+                } else {
+                    Value::Null
+                },
+                "{entry}"
+            );
             if access == AgentAccess::ReadOnly {
                 assert!(arguments.contains(&"--restricted".to_string()));
             }
@@ -3628,7 +3696,7 @@ for worker in workers: worker.join()
     fn codex_opens_its_thread_with_flowx_s_tools_only_for_a_thread_that_opted_in() {
         let bridge_dir = tempfile::tempdir().unwrap();
         let bridge = crate::bridge::test_access(bridge_dir.path());
-        for opted in [Some(true), None] {
+        for (opted, lead) in [(Some(true), false), (None, false), (None, true)] {
             let Some(server) = FakeServer::new() else {
                 return;
             };
@@ -3637,6 +3705,7 @@ for worker in workers: worker.join()
             };
             let mut agent = Agent::new("Codex");
             agent.configuration.flowx_tools = opted;
+            agent.lead_of = lead.then(uuid::Uuid::new_v4);
             let thread = agent.id;
             let recorder = Recorder::default();
             let sink = recorder.clone();
@@ -3657,11 +3726,28 @@ for worker in workers: worker.join()
                 .find(|(method, _)| method == "thread/start")
                 .expect("the thread was opened");
             let config = &opened["config"];
-            if opted.is_none() {
+            if opted.is_none() && !lead {
                 assert!(config.is_null(), "{opened}");
                 continue;
             }
             let entry = &config["mcp_servers.flowx"];
+            // A lead's server says it leads, and has longer than a wait.
+            assert_eq!(
+                entry["env"]
+                    .get(fx_bridge::ENV_ROLE)
+                    .and_then(Value::as_str),
+                lead.then_some(fx_bridge::ROLE_LEAD),
+                "{entry}"
+            );
+            assert_eq!(
+                entry["tool_timeout_sec"],
+                if lead {
+                    serde_json::json!(600.0)
+                } else {
+                    Value::Null
+                },
+                "{entry}"
+            );
             assert_eq!(
                 entry["args"],
                 serde_json::json!(["--mcp-server"]),
@@ -3674,6 +3760,7 @@ for worker in workers: worker.join()
                     .server_for(&{
                         let mut agent = Agent::with_id(thread, "Codex");
                         agent.configuration.flowx_tools = Some(true);
+                        agent.lead_of = lead.then(uuid::Uuid::new_v4);
                         agent
                     })
                     .unwrap()

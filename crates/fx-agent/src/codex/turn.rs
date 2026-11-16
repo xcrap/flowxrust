@@ -2279,9 +2279,35 @@ mod tests {
         // Both providers name an MCP call `mcp__<server>__<tool>`: Claude in
         // `can_use_tool`, and FlowX for Codex's approval elicitation.
         let policy = ApprovalPolicy::DenyUnlessReadOnly;
-        for tool in ["mcp__flowx__list_threads", "mcp__flowx__read_thread"] {
+        // Waiting only watches, so a Read Only orchestrator waits too.
+        for tool in [
+            "mcp__flowx__list_threads",
+            "mcp__flowx__read_thread",
+            "mcp__flowx__wait_for_threads",
+        ] {
             assert!(policy.allows(tool, &json!({})), "codex {tool}");
             assert!(policy.allows_claude_tool(tool, &json!({})), "claude {tool}");
+        }
+        // Starting, sending and stopping act on other threads: under an
+        // access level that asks, each is a card, and Read Only refuses it.
+        for tool in [
+            "mcp__flowx__start_thread",
+            "mcp__flowx__send_to_thread",
+            "mcp__flowx__stop_thread",
+        ] {
+            assert!(!policy.allows(tool, &json!({})), "codex {tool}");
+            assert!(
+                !policy.allows_claude_tool(tool, &json!({})),
+                "claude {tool}"
+            );
+            assert!(
+                !ApprovalPolicy::Ask.allows(tool, &json!({})),
+                "codex {tool}"
+            );
+            assert!(
+                !ApprovalPolicy::Ask.allows_claude_tool(tool, &json!({})),
+                "claude {tool}"
+            );
         }
         for tool in [
             "mcp__probe__ask_name",

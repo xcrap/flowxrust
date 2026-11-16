@@ -9,17 +9,29 @@
 //! thread FlowX has not loaded is read from its saved transcript there, never
 //! on the UI thread.
 //!
-//! Three rules:
+//! A space's orchestrator has four more tools, which act on other threads;
+//! what they do is `state::orchestration`, and this routes them. A call that
+//! needs slow work in the middle (a start finds the provider and may make a
+//! worktree) or waits (a wait, a stop settling) is answered in steps: the UI
+//! thread decides, the bridge's thread does the slow part or sleeps, and the
+//! UI thread is asked again for the rest.
+//!
+//! Four rules:
 //!
 //! - **A thread asks about its own project.** The listener has proved which
 //!   thread is asking; `list_threads` lists that thread's project, and
 //!   `read_thread` refuses a thread from any other.
 //! - **The opt-in is read on every call.** A thread whose tools were turned
 //!   off since its provider started is refused, though its server still runs
-//!   and its token is still valid.
-//! - **Only a thread that opted in is launched with the server**
+//!   and its token is still valid. A space's orchestrator needs no opt-in:
+//!   leading a space is what its tools are for.
+//! - **Only a thread that opted in, or a lead, is launched with the server**
 //!   ([`BridgeAccess::server_for`]); for every other thread a turn launches
 //!   exactly as it did before the bridge.
+//! - **A lead's server says it is one**, in its environment, so it lists the
+//!   orchestration tools, and is given longer for each call than a provider
+//!   gives by default ([`fx_bridge::tools::LEAD_TOOL_TIMEOUT`]). The hint
+//!   proves nothing: every orchestration call is checked again here.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -37,6 +49,7 @@ use gpui::{App, Entity};
 use uuid::Uuid;
 
 use crate::AppState;
+use crate::state::orchestration::{self, Launch, Poll, Polled, StartPlan, WaitPlan};
 
 /// What a turn needs to give its provider the bridge.
 #[derive(Clone, Debug)]
@@ -46,27 +59,39 @@ pub struct BridgeAccess {
     executable: PathBuf,
 }
 
+/// Whether a thread is given FlowX's tools: it opted in, or it leads a
+/// space, whose orchestrator runs other threads only through them.
+pub(crate) fn has_tools(agent: &Agent) -> bool {
+    agent.configuration.uses_flowx_tools() || agent.lead_of.is_some()
+}
+
 impl BridgeAccess {
     /// The server a thread's provider is launched with, or `None` for a
-    /// thread that has not opted in.
+    /// thread that has not opted in and leads no space.
     pub fn server_for(&self, agent: &Agent) -> Option<McpServer> {
-        if !agent.configuration.uses_flowx_tools() {
+        if !has_tools(agent) {
             return None;
         }
+        let lead = agent.lead_of.is_some();
         let thread = agent.id.to_string();
+        let mut env = BTreeMap::from([
+            (
+                fx_bridge::ENV_SOCKET.into(),
+                self.bridge.socket().to_string_lossy().into_owned(),
+            ),
+            (fx_bridge::ENV_TOKEN.into(), self.bridge.token_for(&thread)),
+            (fx_bridge::ENV_THREAD.into(), thread),
+        ]);
+        if lead {
+            env.insert(fx_bridge::ENV_ROLE.into(), fx_bridge::ROLE_LEAD.into());
+        }
         Some(McpServer {
             name: fx_core::policy::flowx_tools::SERVER.into(),
             command: self.executable.to_string_lossy().into_owned(),
             args: vec![fx_bridge::SERVER_FLAG.into()],
-            env: BTreeMap::from([
-                (
-                    fx_bridge::ENV_SOCKET.into(),
-                    self.bridge.socket().to_string_lossy().into_owned(),
-                ),
-                (fx_bridge::ENV_TOKEN.into(), self.bridge.token_for(&thread)),
-                (fx_bridge::ENV_THREAD.into(), thread),
-            ]),
-            tool_timeout: None,
+            env,
+            // Only a lead waits, and a wait holds a call for minutes.
+            tool_timeout: lead.then_some(fx_bridge::tools::LEAD_TOOL_TIMEOUT),
         })
     }
 
@@ -127,7 +152,7 @@ pub fn start_in(
     cx.spawn(async move |cx| {
         while let Some(job) = queue.next().await {
             let answer = cx
-                .update(|cx| answer(state.read(cx), &job.call))
+                .update(|cx| respond(&state, job.work, cx))
                 .unwrap_or_else(|_| Answer::Ready(Reply::refused(QUITTING)));
             let _ = job.reply.send(answer);
         }
@@ -144,10 +169,20 @@ pub fn start_in(
 
 const QUITTING: &str = "FlowX is quitting, so it cannot answer.";
 
-/// One call waiting for the UI thread.
+/// One step of a call, waiting for the UI thread.
 struct Job {
-    call: Call,
+    work: Work,
     reply: futures::channel::oneshot::Sender<Answer>,
+}
+
+/// What the UI thread is asked to do.
+pub(crate) enum Work {
+    /// Answer a call, or decide what to do off the UI thread first.
+    Call(Call),
+    /// Finish a start whose slow half is done.
+    Launch(Box<Launch>),
+    /// Read the threads a wait waits for.
+    Poll(Poll),
 }
 
 /// What the UI thread decided.
@@ -155,6 +190,23 @@ pub(crate) enum Answer {
     Ready(Reply),
     /// The thread is not loaded: read its saved transcript off the UI thread.
     FromDisk(DiskRead),
+    /// Find the provider and make the worktree off the UI thread, then
+    /// launch.
+    Start(Box<StartPlan>),
+    /// Poll off the UI thread until the threads settle or the time is up.
+    Wait(WaitPlan),
+    /// One poll's reading.
+    Polled(Result<Vec<Polled>, String>),
+}
+
+/// Do one step on the UI thread.
+pub(crate) fn respond(state: &Entity<AppState>, work: Work, cx: &mut App) -> Answer {
+    match work {
+        Work::Call(call) if call.call.is_orchestration() => orchestration::answer(state, &call, cx),
+        Work::Call(call) => answer(state.read(cx), &call),
+        Work::Launch(launch) => Answer::Ready(orchestration::launch(state, *launch, cx)),
+        Work::Poll(poll) => Answer::Polled(state.read(cx).poll_workers(&poll)),
+    }
 }
 
 /// A saved transcript to read, and what to say about it.
@@ -183,17 +235,32 @@ impl DiskRead {
 
 /// Ask the UI thread, and finish off it whatever it hands back.
 async fn ask(jobs: &futures::channel::mpsc::UnboundedSender<Job>, call: Call) -> Reply {
-    let (reply, answered) = futures::channel::oneshot::channel();
-    if jobs.unbounded_send(Job { call, reply }).is_err() {
-        return Reply::refused(QUITTING);
-    }
-    match answered.await {
-        Ok(Answer::Ready(reply)) => reply,
-        Ok(Answer::FromDisk(read)) => tokio::task::spawn_blocking(move || read.run())
+    match step(jobs, Work::Call(call)).await {
+        Answer::Ready(reply) => reply,
+        Answer::FromDisk(read) => tokio::task::spawn_blocking(move || read.run())
             .await
             .unwrap_or_else(|_| Reply::refused("FlowX could not read this thread.")),
-        Err(_) => Reply::refused(QUITTING),
+        Answer::Start(plan) => match plan.prepare().await {
+            Ok(launch) => match step(jobs, Work::Launch(Box::new(launch))).await {
+                Answer::Ready(reply) => reply,
+                _ => Reply::refused(QUITTING),
+            },
+            Err(refused) => refused,
+        },
+        Answer::Wait(wait) => wait.run(|poll| step(jobs, Work::Poll(poll))).await,
+        Answer::Polled(_) => Reply::refused("FlowX answered a call with a poll."),
     }
+}
+
+/// One step on the UI thread, waited for.
+async fn step(jobs: &futures::channel::mpsc::UnboundedSender<Job>, work: Work) -> Answer {
+    let (reply, answered) = futures::channel::oneshot::channel();
+    if jobs.unbounded_send(Job { work, reply }).is_err() {
+        return Answer::Ready(Reply::refused(QUITTING));
+    }
+    answered
+        .await
+        .unwrap_or_else(|_| Answer::Ready(Reply::refused(QUITTING)))
 }
 
 /// Answer a call from app state. Reads only.
@@ -209,7 +276,7 @@ pub(crate) fn answer(state: &AppState, call: &Call) -> Answer {
             "FlowX no longer has the thread these tools were started for.",
         ));
     };
-    if !asking.configuration.uses_flowx_tools() {
+    if !has_tools(asking) {
         return Answer::Ready(Reply::refused(
             "FlowX's tools are turned off for this thread. The user can turn them on from \
              the thread's access menu.",
@@ -222,7 +289,7 @@ pub(crate) fn answer(state: &AppState, call: &Call) -> Answer {
                 .agents
                 .iter()
                 .filter(|agent| !record.missing_native_agent_ids.contains(&agent.id))
-                .map(|agent| entry(state, record, agent, call.thread))
+                .map(|agent| entry(state, record, agent, asking))
                 .collect();
             Answer::Ready(Reply::ok(answers::thread_list(
                 &project.name,
@@ -237,7 +304,7 @@ pub(crate) fn answer(state: &AppState, call: &Call) -> Answer {
                      ids it has.",
                 ));
             };
-            let entry = entry(state, record, agent, call.thread);
+            let entry = entry(state, record, agent, asking);
             if let Some(conversation) = state.conversation_by_agent(thread) {
                 let conversation = conversation
                     .lock()
@@ -269,11 +336,12 @@ pub(crate) fn answer(state: &AppState, call: &Call) -> Answer {
             }
             Answer::Ready(Reply::ok(answers::thread_excerpt(&entry, &[], 0, None)))
         }
+        // They act, and [`respond`] gives them to `orchestration`.
         ToolCall::StartThread { .. }
         | ToolCall::SendToThread { .. }
         | ToolCall::WaitForThreads { .. }
         | ToolCall::StopThread { .. } => Answer::Ready(Reply::refused(
-            "FlowX does not run a space's threads from its orchestrator yet.",
+            "FlowX routed an orchestration call to its reads. Try again.",
         )),
     }
 }
@@ -291,7 +359,7 @@ fn entry(
     state: &AppState,
     record: &fx_store::PersistedProject,
     agent: &Agent,
-    asking: Uuid,
+    asking: &Agent,
 ) -> ThreadEntry {
     // Read before the conversation is locked: both of these lock it too,
     // and the lock is not reentrant.
@@ -327,9 +395,12 @@ fn entry(
             ActivityState::Idle | ActivityState::Completed | ActivityState::Error => Status::Idle,
         },
         archived: record.archived_agent_ids.contains(&agent.id),
-        current: agent.id == asking,
-        in_space: None,
-        spawned_by_you: None,
+        current: agent.id == asking.id,
+        // Said only to a lead, which is what it can act on.
+        in_space: asking
+            .lead_of
+            .map(|space| agent.id != asking.id && agent.space == Some(space)),
+        spawned_by_you: asking.lead_of.map(|_| agent.spawned_by == Some(asking.id)),
     }
 }
 
@@ -451,6 +522,7 @@ mod tests {
         match answer {
             Answer::Ready(reply) => reply,
             Answer::FromDisk(read) => read.run(),
+            _ => panic!("a read was answered in steps"),
         }
     }
 
@@ -689,6 +761,36 @@ mod tests {
             server.env[fx_bridge::ENV_TOKEN],
             access.bridge.token_for(&Uuid::new_v4().to_string())
         );
+        // An ordinary thread's server lists the reads, at the provider's own
+        // timeout.
+        assert!(!server.env.contains_key(fx_bridge::ENV_ROLE));
+        assert_eq!(server.tool_timeout, None);
+    }
+
+    #[test]
+    fn a_lead_is_given_the_server_without_opting_in_and_told_it_leads() {
+        // Leading a space is what the tools are for, so no opt-in is asked;
+        // its server lists the orchestration tools and is given longer per
+        // call than a wait takes.
+        let parent = tempfile::tempdir().unwrap();
+        let access = test_access(parent.path());
+        let mut lead = Agent::new("Orchestrator");
+        lead.lead_of = Some(Uuid::new_v4());
+        assert_eq!(lead.configuration.flowx_tools, None);
+        let server = access.server_for(&lead).unwrap();
+        assert_eq!(server.env[fx_bridge::ENV_ROLE], fx_bridge::ROLE_LEAD);
+        assert_eq!(server.env[fx_bridge::ENV_THREAD], lead.id.to_string());
+        assert_eq!(
+            server.tool_timeout,
+            Some(fx_bridge::tools::LEAD_TOOL_TIMEOUT)
+        );
+        assert!(
+            server.tool_timeout.unwrap()
+                > std::time::Duration::from_secs(fx_bridge::tools::MAX_WAIT_SECONDS)
+        );
+        // Turned off, it is still a lead's.
+        lead.configuration.flowx_tools = Some(false);
+        assert!(access.server_for(&lead).is_some());
     }
 
     #[test]
