@@ -44,6 +44,11 @@ pub struct MenuItem {
     pub enabled: bool,
     #[serde(default)]
     pub tone: MenuItemTone,
+    /// Choosing it opens another menu in its place, the way a `▸` row does:
+    /// drawn with a trailing chevron. The menu it opens is the owner's to
+    /// build, since only one menu is open at a time.
+    #[serde(default)]
+    pub submenu: bool,
 }
 
 fn default_true() -> bool {
@@ -59,7 +64,14 @@ impl MenuItem {
             selected: false,
             enabled: true,
             tone: MenuItemTone::default(),
+            submenu: false,
         }
+    }
+
+    /// Mark the row as opening another menu.
+    pub fn submenu(mut self) -> Self {
+        self.submenu = true;
+        self
     }
 
     pub fn subtitle(mut self, subtitle: impl Into<String>) -> Self {
@@ -240,6 +252,17 @@ impl MenuModel {
         exists
     }
 
+    /// The highlighted item, if it is still in the menu.
+    pub fn highlighted_item(&self) -> Option<&MenuItem> {
+        let key = self.highlighted.as_deref()?;
+        self.sections.iter().find_map(|section| {
+            section
+                .items
+                .iter()
+                .find(|item| Self::key_for(&section.id, &item.id) == key)
+        })
+    }
+
     /// Choose the highlighted item.
     ///
     /// Returns the chosen item's id, or `None` when nothing is highlighted or
@@ -358,6 +381,23 @@ mod tests {
 
     fn disabled_item() -> MenuItem {
         MenuItem::new("x", "X").enabled(false)
+    }
+
+    #[test]
+    fn a_submenu_row_is_marked_and_found_by_its_highlight() {
+        let mut m = MenuModel::new(vec![MenuSection::new(
+            "s",
+            vec![
+                MenuItem::new("plain", "Plain"),
+                MenuItem::new("more", "More").submenu(),
+            ],
+        )]);
+        assert_eq!(m.highlighted_item(), None);
+        m.highlight_last();
+        assert!(m.highlighted_item().is_some_and(|item| item.submenu));
+        m.highlight_first();
+        assert!(m.highlighted_item().is_some_and(|item| !item.submenu));
+        assert!(!MenuItem::new("x", "X").submenu);
     }
 
     #[test]

@@ -1019,6 +1019,18 @@ impl Colors {
     ///
     /// Resolved once per tone, appearance and accent.
     pub fn accent_ink(t: &Theme) -> Rgba {
+        Self::ink_of(t, t.accent_color)
+    }
+
+    /// A space's colour mark: the accent the reader gave it, not the
+    /// theme's, drawn as [`Self::accent_ink`] draws the theme's, so it
+    /// clears 3:1 on the sidebar under the hover and selection washes and
+    /// keeps its hue wherever mixing toward `fg` can.
+    pub fn space_mark(t: &Theme, accent: AccentColor) -> Rgba {
+        Self::ink_of(t, accent)
+    }
+
+    fn ink_of(t: &Theme, accent: AccentColor) -> Rgba {
         static INKS: std::sync::OnceLock<[Rgba; 40]> = std::sync::OnceLock::new();
         let table = INKS.get_or_init(|| {
             std::array::from_fn(|i| {
@@ -1030,7 +1042,7 @@ impl Colors {
         });
         let accent = AccentColor::ALL
             .iter()
-            .position(|a| *a == t.accent_color)
+            .position(|a| *a == accent)
             .unwrap_or(0);
         let palette = t.base_tone.index() * 2 + usize::from(t.is_dark());
         table[palette * AccentColor::ALL.len() + accent]

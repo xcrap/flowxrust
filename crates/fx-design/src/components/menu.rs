@@ -48,6 +48,9 @@ pub struct MenuLayer {
     open: Option<OpenMenu>,
     /// Monotonic counter, so successive opens get distinct element ids.
     generation: u64,
+    /// Where the latest menu was opened, kept after it closes, so a row
+    /// that opens another menu can open it in the same place.
+    last_position: Option<Point<Pixels>>,
 }
 
 struct OpenMenu {
@@ -99,6 +102,12 @@ impl MenuLayer {
         self.open.as_ref().and_then(|open| open.position)
     }
 
+    /// Where the most recent menu was anchored, open or not: where a menu
+    /// chosen from it opens.
+    pub fn last_position(&self) -> Option<Point<Pixels>> {
+        self.last_position
+    }
+
     /// Open a menu, replacing whatever was open.
     pub fn open(&mut self, model: MenuModel, owner: impl Into<SharedString>) {
         self.open_positioned(model, owner.into(), None);
@@ -121,6 +130,7 @@ impl MenuLayer {
         position: Option<Point<Pixels>>,
     ) {
         self.generation += 1;
+        self.last_position = position;
         self.open = Some(OpenMenu {
             model,
             owner,
@@ -349,6 +359,18 @@ fn row(
         );
     }
     content = content.child(labels);
+    if item.submenu {
+        content = content.child(
+            div()
+                .debug_selector(|| "menu-submenu".into())
+                .flex_shrink_0()
+                .child(Icon::CHEVRON_RIGHT.render(
+                    crate::theme::IconSize::Micro,
+                    palette.subtitle,
+                    &theme,
+                )),
+        );
+    }
 
     content
         // `.id` upgrades to `Stateful<Div>`, which is what carries `on_click`
@@ -774,6 +796,24 @@ mod tests {
     }
 
     // ── The layer ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn a_closed_menu_leaves_its_anchor_for_the_menu_chosen_from_it() {
+        let mut layer = MenuLayer::default();
+        assert_eq!(layer.last_position(), None);
+        let at = gpui::point(px(40.0), px(90.0));
+        layer.open_at(model(), "first", at);
+        layer.highlight_first();
+        layer.activate();
+        assert!(!layer.is_open());
+        assert_eq!(layer.last_position(), Some(at));
+        layer.open(model(), "keyboard");
+        assert_eq!(
+            layer.last_position(),
+            None,
+            "a menu with no anchor has none"
+        );
+    }
 
     #[test]
     fn a_layer_starts_closed() {

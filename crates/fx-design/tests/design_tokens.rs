@@ -78,6 +78,35 @@ fn sidebar_row_surfaces(t: &Theme) -> [(&'static str, Rgba); 3] {
 }
 
 #[test]
+fn every_space_mark_clears_non_text_contrast_on_every_sidebar_row_and_keeps_its_hue() {
+    // A space's colour is the reader's own pick, whatever the theme's
+    // accent is, and the dot is drawn on a row that can be hovered or
+    // selected.
+    for (tone, mode) in all_theme_combinations() {
+        let t = theme_for(tone, mode);
+        let mut marks = Vec::new();
+        for accent in AccentColor::ALL {
+            let mark = Colors::space_mark(&t, accent);
+            for (surface_name, surface) in sidebar_row_surfaces(&t) {
+                let ratio = contrast(mark, surface);
+                assert!(
+                    ratio >= 3.0,
+                    "{tone:?} {mode:?} {accent:?} on {surface_name} is {ratio}:1"
+                );
+            }
+            marks.push(mark);
+        }
+        // Mixed toward `fg` only as far as it needs: no two accents land on
+        // the same mark, so a colour still tells two spaces apart.
+        for (i, a) in marks.iter().enumerate() {
+            for b in &marks[i + 1..] {
+                assert_ne!(a, b, "{tone:?} {mode:?}: two accents drew one mark");
+            }
+        }
+    }
+}
+
+#[test]
 fn every_provider_status_glyph_clears_non_text_contrast_on_its_own_tile() {
     // Read from the tile's own palette rather than a copy of its alpha: the
     // copy could only drift. The pulse is swept because its brightest point,
