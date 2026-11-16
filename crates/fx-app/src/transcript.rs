@@ -388,14 +388,14 @@ impl ThreadMemory {
     /// This pass's rows, from the plan when the messages have not changed.
     fn plan(&mut self, snapshot: &Snapshot) -> (Rc<[RowPlan]>, Rc<HashMap<Uuid, usize>>) {
         if let Some(plan) = self.plan.as_ref().filter(|plan| {
-            plan.message_revision == snapshot.message_revision && plan.busy == snapshot.busy
+            plan.message_revision == snapshot.message_revision && plan.busy == snapshot.is_live()
         }) {
             return (plan.rows.clone(), plan.heads.clone());
         }
         let messages: Vec<&ConversationMessage> =
             snapshot.messages.iter().map(|message| &**message).collect();
         let rows: Rc<[RowPlan]> =
-            plan_rows(&messages, snapshot.busy, &snapshot.landed_steers).into();
+            plan_rows(&messages, snapshot.is_live(), &snapshot.landed_steers).into();
         let heads: Rc<HashMap<Uuid, usize>> = Rc::new(
             rows.iter()
                 .enumerate()
@@ -419,7 +419,7 @@ impl ThreadMemory {
         );
         self.plan = Some(Plan {
             message_revision: snapshot.message_revision,
-            busy: snapshot.busy,
+            busy: snapshot.is_live(),
             rows: rows.clone(),
             heads: heads.clone(),
         });
@@ -1483,6 +1483,11 @@ pub(crate) struct Snapshot {
     landed_steers: Rc<[Uuid]>,
     phase: Phase,
     busy: bool,
+    /// A turn the provider's own app is running on this thread, as its
+    /// provider reports it. Never FlowX's turn: nothing here can be stopped
+    /// or steered. Its last group is live all the same, or every call still
+    /// running there was drawn with a finished check.
+    elsewhere: bool,
     waiting_for_user: bool,
     error: Option<String>,
     approvals: Vec<PendingApproval>,
@@ -1532,6 +1537,12 @@ impl Snapshot {
     }
 
     /// Whole seconds the running turn has taken so far.
+    /// Whether the thread's latest turn is still going, here or in another
+    /// app: what decides which group and plan are live.
+    fn is_live(&self) -> bool {
+        self.busy || self.elsewhere
+    }
+
     fn turn_seconds(&self) -> Option<u64> {
         self.turn_started_at
             .map(|start| self.clock.seconds_since(start))
@@ -1710,6 +1721,7 @@ pub(crate) fn snapshot(conversation: &crate::Conversation) -> Snapshot {
         },
         phase: conversation.phase(),
         busy,
+        elsewhere: false,
         waiting_for_user: conversation.is_waiting_for_user(),
         error,
         approvals: conversation.pending_approvals().to_vec(),
@@ -1756,6 +1768,8 @@ fn render(mut snapshot: Snapshot, window: &mut Window, cx: &mut App) -> AnyEleme
     release_hidden_messages(snapshot.id);
     crate::markdown::begin_pass();
     snapshot.clock = Clock::read(cx);
+    snapshot.elsewhere = crate::AppHandle::get(cx)
+        .is_some_and(|handle| handle.0.read(cx).running_elsewhere(snapshot.agent_id));
     schedule_tick(&snapshot, window, cx);
     // Shared with the list, which asks for rows after this function returns.
     let snapshot = Rc::new(snapshot);
@@ -1773,7 +1787,7 @@ fn render(mut snapshot: Snapshot, window: &mut Window, cx: &mut App) -> AnyEleme
     prune_disclosures(
         snapshot.id,
         snapshot.message_revision,
-        snapshot.busy,
+        snapshot.is_live(),
         || live_groups(&rows.plan, &snapshot),
     );
 
@@ -2120,7 +2134,7 @@ fn page_with_keyboard(list: &ListState, event: &KeyDownEvent) -> bool {
 /// so while a spinner turns beside the clock the two share one frame rather
 /// than costing a thirteenth.
 fn schedule_tick(snapshot: &Snapshot, window: &mut Window, cx: &mut App) {
-    if !snapshot.busy {
+    if !snapshot.is_live() {
         return;
     }
     let due = with_thread(snapshot.id, |thread| {
@@ -4199,7 +4213,11 @@ fn activity_group(
 
     let title = group_title(
         group,
-        snapshot.phase.label(),
+        if snapshot.elsewhere {
+            "Working"
+        } else {
+            snapshot.phase.label()
+        },
         group.is_active.then(|| snapshot.turn_seconds()).flatten(),
     );
     let header = div()
@@ -4915,6 +4933,15 @@ fn live_step<'a>(
             title: tool_title(call, Tense::Present),
             detail,
             started: call.started,
+        };
+    }
+    // Between calls in another app: FlowX hears nothing of its thinking or
+    // writing, and its own phase is idle.
+    if snapshot.elsewhere {
+        return LiveStep::Between {
+            label: "Working in another app…".into(),
+            detail: None,
+            since: None,
         };
     }
     let (label, detail) = match snapshot.phase {

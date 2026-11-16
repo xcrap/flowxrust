@@ -2641,22 +2641,31 @@ impl AppState {
                 .is_some_and(|queue| queue.iter().any(|event| interaction_id(event) == Some(id)))
     }
 
-    /// What a thread FlowX does not run is waiting for in another app, as its
-    /// provider reports it. Only the active project polls, so another
-    /// project's mark would be stale and is not reported.
     /// Every thread a provider reported waiting in another app, whichever
     /// project it is in: what a folded space's header asks about.
     pub(crate) fn waiting_elsewhere_threads(&self) -> impl Iterator<Item = &Uuid> {
         self.waiting_elsewhere.keys()
     }
 
+    /// Whether a thread's project is read for what other apps are doing: the
+    /// active project every few seconds and an expanded one every 30. A
+    /// collapsed project's marks are as old as the pass that last read it,
+    /// so they are not reported. Gated on the active project alone, a
+    /// thread in another expanded project never showed Waiting or Working.
+    fn reads_marks_elsewhere(&self, agent_id: Uuid) -> bool {
+        self.project_for_agent(agent_id).is_some_and(|project| {
+            self.snapshot.active_project_id == Some(project) || self.is_expanded(project)
+        })
+    }
+
+    /// What a thread FlowX does not run is waiting for in another app, as its
+    /// provider reports it, for a project that is read for it.
     pub fn waiting_elsewhere(&self, agent_id: Uuid) -> Option<&str> {
-        if self.is_thread_busy(agent_id)
-            || self.project_for_agent(agent_id) != self.snapshot.active_project_id
-        {
+        let mark = self.waiting_elsewhere.get(&agent_id)?;
+        if self.is_thread_busy(agent_id) || !self.reads_marks_elsewhere(agent_id) {
             return None;
         }
-        self.waiting_elsewhere.get(&agent_id).map(String::as_str)
+        Some(mark.as_str())
     }
 
     /// Whether a thread FlowX does not run is running a turn in another app,
@@ -2667,7 +2676,7 @@ impl AppState {
         self.running_elsewhere.contains(&agent_id)
             && !self.is_thread_busy(agent_id)
             && self.waiting_elsewhere(agent_id).is_none()
-            && self.project_for_agent(agent_id) == self.snapshot.active_project_id
+            && self.reads_marks_elsewhere(agent_id)
     }
 
     /// Every thread a provider reported running in another app.
@@ -10865,7 +10874,18 @@ mod native_sync_tests {
                 // Shown, never mistaken for a turn FlowX could stop or steer.
                 assert!(!state.is_busy());
                 assert!(!state.is_thread_busy(agent));
-                state.conversation(project, agent);
+                // A command still running there, its result not yet written.
+                let conversation = state.conversation(project, agent);
+                let mut conversation = conversation.lock().unwrap();
+                conversation.append(ConversationMessage::text(MessageRole::User, "Build it"));
+                conversation.append(ConversationMessage::new(
+                    MessageRole::Assistant,
+                    vec![fx_core::MessageContent::ToolUse {
+                        id: "call-1".into(),
+                        name: "Bash".into(),
+                        input: r#"{"command":"cargo build"}"#.into(),
+                    }],
+                ));
                 agent
             })
         });
@@ -10882,6 +10902,16 @@ mod native_sync_tests {
             "the transcript did not say the thread is working elsewhere"
         );
         assert!(visual.debug_bounds("titlebar-activity:false").is_some());
+        // Its group is live, as a turn here is, and the call still running
+        // there is not drawn as finished.
+        assert!(
+            visual
+                .debug_bounds("transcript.activity-title:Working… · 1 action")
+                .is_some(),
+            "the running group did not read as working"
+        );
+        assert!(visual.debug_bounds("transcript.live-step").is_some());
+        assert!(visual.debug_bounds("status-glyph:done").is_none());
 
         test.update(|cx| {
             state.update(cx, |state, _| {

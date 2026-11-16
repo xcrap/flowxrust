@@ -1006,9 +1006,16 @@ fn space_activity(app: &AppState, listed: &RecordIndex) -> HashMap<Uuid, Activit
         .copied()
         .collect();
     for id in live {
+        let space = listed.space_of[&id];
+        // First, as a thread row reads it: a FlowX turn that failed before
+        // the thread went on in another app is not what it is doing now.
+        if app.running_elsewhere(id) {
+            activity.entry(space).or_insert(ActivityState::Running);
+            continue;
+        }
         // Read before the conversation is locked, as a thread row does: both
         // lock it, and the lock is not reentrant.
-        let busy = app.is_thread_busy(id) || app.running_elsewhere(id);
+        let busy = app.is_thread_busy(id);
         let elsewhere = app.waiting_elsewhere(id).map(str::to_owned);
         let phase = app.conversation_by_agent(id).map(|conversation| {
             conversation
@@ -1022,7 +1029,6 @@ fn space_activity(app: &AppState, listed: &RecordIndex) -> HashMap<Uuid, Activit
             fx_core::AgentExecutionState::Idle,
             elsewhere.as_deref(),
         );
-        let space = listed.space_of[&id];
         match state {
             ActivityState::Waiting => {
                 activity.insert(space, ActivityState::Waiting);

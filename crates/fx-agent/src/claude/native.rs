@@ -304,6 +304,7 @@ impl ClaudeNativeStore {
             if record.get("pid").and_then(Value::as_i64) != Some(i64::from(pid))
                 || !matches!(status, Some("waiting" | "busy"))
                 || !process_alive(pid)
+                || !record_is_its_process(&record, pid)
             {
                 continue;
             }
@@ -1557,6 +1558,53 @@ fn process_alive(pid: i32) -> bool {
     signalled == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
 }
 
+/// When a process started, in whole seconds since the epoch.
+#[cfg(target_os = "macos")]
+fn process_started(pid: i32) -> Option<i64> {
+    let mut info = std::mem::MaybeUninit::<libc::proc_bsdinfo>::zeroed();
+    let size = libc::c_int::try_from(std::mem::size_of::<libc::proc_bsdinfo>()).ok()?;
+    // SAFETY: the buffer is one `proc_bsdinfo`, which is what this flavor
+    // writes, and `size` says so.
+    let read = unsafe {
+        libc::proc_pidinfo(
+            pid,
+            libc::PROC_PIDTBSDINFO,
+            0,
+            info.as_mut_ptr().cast(),
+            size,
+        )
+    };
+    if read != size {
+        return None;
+    }
+    // SAFETY: `proc_pidinfo` filled all `size` bytes.
+    let info = unsafe { info.assume_init() };
+    i64::try_from(info.pbi_start_tvsec).ok()
+}
+
+#[cfg(not(target_os = "macos"))]
+fn process_started(_pid: i32) -> Option<i64> {
+    None
+}
+
+/// Whether the process holding a record's pid is the one that wrote it. A
+/// Claude killed mid-turn leaves its record saying busy, and once macOS gives
+/// the pid to another process, that record marked its thread as working in
+/// another app for as long as the other process lived. A process that started
+/// after the record's own start is not the one it describes.
+fn record_is_its_process(record: &Value, pid: i32) -> bool {
+    let recorded = record
+        .get("startedAt")
+        .and_then(Value::as_i64)
+        .map(|millis| millis / 1000);
+    match (recorded, process_started(pid)) {
+        // A second's slack: the record is written after the process starts,
+        // and the two clocks round apart.
+        (Some(recorded), Some(started)) => started <= recorded + 1,
+        _ => true,
+    }
+}
+
 fn read_metadata(
     path: &Path,
     fingerprint: &Fingerprint,
@@ -1652,6 +1700,20 @@ mod tests {
     }
 
     #[test]
+    fn a_record_left_by_a_process_whose_pid_was_given_to_another_is_not_live() {
+        let pid = std::process::id() as i32;
+        let started = process_started(pid).expect("this process has a start time");
+        let record = |started_at: i64| json!({"pid": pid, "startedAt": started_at});
+        // Written by this process: it started first.
+        assert!(record_is_its_process(&record((started + 5) * 1000), pid));
+        assert!(record_is_its_process(&record(started * 1000 + 400), pid));
+        // Written before this process started: another process had the pid.
+        assert!(!record_is_its_process(&record((started - 60) * 1000), pid));
+        // Nothing to compare: as before.
+        assert!(record_is_its_process(&json!({"pid": pid}), pid));
+    }
+
+    #[test]
     fn the_desktop_apps_plan_calls_read_as_the_whole_list_each_left() {
         // A Claude desktop session keeps its plan with the app's own tool: the
         // whole list once, then steps on from it, which read alone say
@@ -1738,9 +1800,15 @@ mod tests {
     }
 
     /// A `sessions/<pid>.json` record as Claude Code 2.1.283 kept it while a
-    /// live probe session waited on a permission prompt.
+    /// live probe session waited on a permission prompt. This test's own
+    /// process stands in for the live Claude, so the record was written once
+    /// it had started: just now.
     fn session_record(pid: u32, session: &str, status: &str) -> Value {
-        json!({"pid": pid, "sessionId": session, "cwd": "/tmp/probe", "startedAt": 1793135521916_u64,
+        let started_at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        json!({"pid": pid, "sessionId": session, "cwd": "/tmp/probe", "startedAt": started_at,
                "version": "2.1.283", "kind": "interactive", "entrypoint": "claude-desktop",
                "status": status, "waitingFor": "permission prompt",
                "updatedAt": 1793135523000_u64, "statusUpdatedAt": 1793135523000_u64})
