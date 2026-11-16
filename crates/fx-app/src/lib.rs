@@ -111,6 +111,9 @@ pub struct FlowX {
     subscriptions: Vec<gpui::Subscription>,
     draft_values: std::collections::HashMap<uuid::Uuid, String>,
     draft_subscriptions: std::collections::HashMap<uuid::Uuid, gpui::Subscription>,
+    /// The snapshot generation the drafts were last pruned at: a thread can
+    /// go only when it moves.
+    drafts_pruned_at: Option<u64>,
     poller: Option<gpui::Task<()>>,
     native_poller: Option<gpui::Task<()>>,
     polling: bool,
@@ -147,6 +150,7 @@ impl FlowX {
             subscriptions: Vec::new(),
             draft_values: Default::default(),
             draft_subscriptions: Default::default(),
+            drafts_pruned_at: None,
             poller: None,
             native_poller: None,
             polling: false,
@@ -253,17 +257,23 @@ impl FlowX {
         {
             focus.focus(window);
         }
-        let thread_ids: std::collections::HashSet<_> = self
-            .state
-            .read(cx)
-            .snapshot
-            .projects
-            .iter()
-            .flat_map(|record| record.agents.iter().map(|agent| agent.id))
-            .collect();
-        self.draft_values.retain(|id, _| thread_ids.contains(id));
-        self.draft_subscriptions
-            .retain(|id, _| thread_ids.contains(id));
+        // Every thread, collected on every frame, was work that grew with
+        // the threads on a pass that changed none of them.
+        let generation = self.state.read(cx).snapshot.generation();
+        if self.drafts_pruned_at != Some(generation) {
+            self.drafts_pruned_at = Some(generation);
+            let thread_ids: std::collections::HashSet<_> = self
+                .state
+                .read(cx)
+                .snapshot
+                .projects
+                .iter()
+                .flat_map(|record| record.agents.iter().map(|agent| agent.id))
+                .collect();
+            self.draft_values.retain(|id, _| thread_ids.contains(id));
+            self.draft_subscriptions
+                .retain(|id, _| thread_ids.contains(id));
+        }
         let active_agent = self.state.read(cx).active_agent();
         let active_id = active_agent.as_ref().map(|agent| agent.id);
         let selection_changed = self.focused_thread != active_id;

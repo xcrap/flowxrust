@@ -508,7 +508,6 @@ struct Rows<'a> {
     app: &'a AppState,
     record: &'a PersistedProject,
     listed: &'a RecordIndex,
-    project_id: Uuid,
     query: &'a ThreadQuery,
     open_menu: Option<&'a str>,
 }
@@ -539,7 +538,6 @@ fn threads(
         app,
         record,
         listed,
-        project_id,
         query,
         open_menu,
     };
@@ -576,19 +574,25 @@ fn threads(
         // worked on there for months opened as "No threads yet" with nothing
         // to say where its history was.
         let archived = listed.archived.len();
-        let column = column.child(
-            utility_row(None)
-                .debug_selector(move || format!("sidebar-no-threads:{project_id}"))
-                .h(px(THREAD_ROW_HEIGHT))
-                .child(utility_label(
-                    if archived == 0 {
-                        "No threads yet"
-                    } else {
-                        "No open threads"
-                    },
-                    Colors::fg_tertiary(&theme),
-                )),
-        );
+        // A space's lead is a thread its header stands for, so a project
+        // whose only open thread leads a space has threads.
+        let column = if grouped && !listed.listed.is_empty() {
+            column
+        } else {
+            column.child(
+                utility_row(None)
+                    .debug_selector(move || format!("sidebar-no-threads:{project_id}"))
+                    .h(px(THREAD_ROW_HEIGHT))
+                    .child(utility_label(
+                        if archived == 0 {
+                            "No threads yet"
+                        } else {
+                            "No open threads"
+                        },
+                        Colors::fg_tertiary(&theme),
+                    )),
+            )
+        };
         if archived == 0 {
             return column.into_any_element();
         }
@@ -651,7 +655,6 @@ fn thread_rows(
         column = column.child(thread_row(
             rows.state,
             rows.app,
-            rows.project_id,
             agent,
             Some(agent.id) == active_agent,
             rows.listed.unseen.contains(&agent.id),
@@ -1360,7 +1363,6 @@ fn show_more_row(
 fn thread_row(
     state: &Entity<AppState>,
     app: &AppState,
-    project_id: Uuid,
     agent: &Agent,
     selected: bool,
     unseen: bool,
@@ -1409,11 +1411,12 @@ fn thread_row(
                 state.update(cx, |state, cx| {
                     // Straight to the thread. Selecting its project first
                     // opened the thread that project was left on, and marked
-                    // it seen though it was never drawn.
-                    state.select_agent(agent_id);
-                    // Read the transcript on first selection rather than at
-                    // launch, and in the background rather than in the click.
-                    state.request_conversation(project_id, agent_id, cx);
+                    // it seen though it was never drawn. Opened as ⌘1–9
+                    // opens it: a search's match in a closed space or
+                    // project otherwise had no row once the search was
+                    // cleared. Its transcript is read on first selection,
+                    // in the background rather than in the click.
+                    state.open_thread(agent_id, cx);
                     cx.notify();
                 });
             }

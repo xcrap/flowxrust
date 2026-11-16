@@ -1217,6 +1217,10 @@ impl AppState {
         if archived {
             self.pending_interactions.remove(&agent_id);
             self.title_jobs.remove(&agent_id);
+            // The thread opened in its place may be in a closed space.
+            if let Some(next) = self.snapshot.active_agent_id {
+                self.reveal_in_space(next);
+            }
         }
         true
     }
@@ -1279,6 +1283,10 @@ impl AppState {
         }
         if !self.commit_thread_change(next, "delete this thread") {
             return false;
+        }
+        // The thread opened in its place may be in a closed space.
+        if let Some(next) = self.snapshot.active_agent_id {
+            self.reveal_in_space(next);
         }
         self.deleted_agents.insert(agent_id);
         self.release_composer(agent_id);
@@ -3555,6 +3563,16 @@ impl AppState {
                 for (slot, agent) in record.agents.iter().enumerate() {
                     slots.entry(agent.id).or_insert(slot);
                 }
+                // A thread this build cannot read is carried as written. Its
+                // session listed again is still that thread: made anew here,
+                // it was listed twice, and the stub was saved ahead of the
+                // newer build's record, which then read the stub.
+                let unreadable_agents: HashSet<Uuid> = record
+                    .unreadable
+                    .elements("agents")
+                    .iter()
+                    .filter_map(|agent| agent.get("id")?.as_str()?.parse().ok())
+                    .collect();
                 let mut archived_ids: HashSet<Uuid> =
                     record.archived_agent_ids.iter().copied().collect();
                 // The space here that mirrors each Codex section, the first
@@ -3643,6 +3661,7 @@ impl AppState {
                     }
                     let slot = match slots.get(&id) {
                         Some(slot) => *slot,
+                        None if unreadable_agents.contains(&id) => continue,
                         None => {
                             let mut agent = Agent::with_id(id, &entry.summary.title);
                             agent.configuration.provider_id = Some(identity.provider_id.clone());
@@ -3731,6 +3750,15 @@ impl AppState {
                                 .space
                                 .filter(|space| !mirrored.contains(space)),
                         };
+                        // As a move made here does: the open thread filed
+                        // in a closed space would have no row.
+                        if self.snapshot.active_agent_id == Some(id)
+                            && let Some(space) = record.agents[slot].space
+                            && let Some(held) =
+                                record.spaces.iter_mut().find(|held| held.space.id == space)
+                        {
+                            held.is_expanded = true;
+                        }
                     }
                     let agent = &mut record.agents[slot];
                     agent.title = title;
@@ -9903,6 +9931,111 @@ mod native_sync_tests {
     }
 
     #[test]
+    fn a_section_filing_the_open_thread_opens_its_space_and_never_moves_a_lead() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().to_string_lossy().to_string();
+        let test = gpui::TestAppContext::single();
+        let (state, project) =
+            test.update(|cx| setup(cx, AppPaths::at(temp.path().join("store")), &root));
+        test.update(|cx| {
+            state.update(cx, |state, _| {
+                let one = entry(&root, "codex", "one", "One");
+                let two = entry(&root, "codex", "two", "Two");
+                index(
+                    state,
+                    project,
+                    "codex",
+                    vec![filed(one.clone(), "pinned", "Pinned"), two.clone()],
+                    Vec::new(),
+                );
+                let id = |state: &AppState, session: &str| {
+                    state.snapshot.projects[0]
+                        .native_bindings
+                        .iter()
+                        .find(|binding| binding.session_id == session)
+                        .unwrap()
+                        .agent_id
+                };
+                let (first, second) = (id(state, "one"), id(state, "two"));
+                let pinned = space_of(state, first).unwrap();
+                state.toggle_space_expansion(pinned);
+                assert!(!state.space(pinned).unwrap().1.is_expanded);
+                // Filed in the closed space while it is open: as a move made
+                // here, its space opens, or it had no row.
+                state.select_agent(second);
+                index(
+                    state,
+                    project,
+                    "codex",
+                    vec![
+                        filed(one.clone(), "pinned", "Pinned"),
+                        filed(two.clone(), "pinned", "Pinned"),
+                    ],
+                    Vec::new(),
+                );
+                assert_eq!(space_of(state, second), Some(pinned));
+                assert!(state.space(pinned).unwrap().1.is_expanded);
+                // A lead stays in the space it leads, whatever Codex files.
+                let own = state.create_space(project, "Mine", None).unwrap();
+                {
+                    let record = &mut state.snapshot.projects[0];
+                    let agent = record.agents.iter_mut().find(|a| a.id == second).unwrap();
+                    agent.space = Some(own);
+                    agent.lead_of = Some(own);
+                }
+                assert_eq!(state.space_lead(own), Some(second));
+                index(
+                    state,
+                    project,
+                    "codex",
+                    vec![
+                        filed(one.clone(), "pinned", "Pinned"),
+                        filed(two, "review", "Review"),
+                    ],
+                    Vec::new(),
+                );
+                assert_eq!(space_of(state, second), Some(own));
+            })
+        });
+    }
+
+    #[test]
+    fn a_session_of_a_thread_this_build_cannot_read_is_not_listed_again() {
+        // Made anew, it was listed twice under one id, and the stub was saved
+        // ahead of the newer build's record, which then read the stub.
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().to_string_lossy().to_string();
+        let test = gpui::TestAppContext::single();
+        let (state, project) =
+            test.update(|cx| setup(cx, AppPaths::at(temp.path().join("store")), &root));
+        test.update(|cx| {
+            state.update(cx, |state, _| {
+                let native = entry(&root, "codex", "native", "Native");
+                index(state, project, "codex", vec![native.clone()], Vec::new());
+                let agent = state.snapshot.projects[0].native_bindings[0].agent_id;
+                // As a newer build might have written it.
+                let mut value = serde_json::to_value(&state.snapshot.projects[0]).unwrap();
+                for written in value["agents"].as_array_mut().unwrap() {
+                    if written["id"] == agent.to_string() {
+                        written["title"] = serde_json::json!(5);
+                    }
+                }
+                let record: fx_store::PersistedProject = serde_json::from_value(value).unwrap();
+                assert!(record.agents.iter().all(|kept| kept.id != agent));
+                assert_eq!(record.unreadable.elements("agents").len(), 1);
+                state.snapshot.projects[0] = record;
+                let before = state.snapshot.projects[0].agents.len();
+                index(state, project, "codex", vec![native], Vec::new());
+                let record = &state.snapshot.projects[0];
+                assert_eq!(record.agents.len(), before);
+                let order = &record.project.as_ref().unwrap().agent_order;
+                let unique: HashSet<&Uuid> = order.iter().collect();
+                assert_eq!(unique.len(), order.len(), "{order:?}");
+            })
+        });
+    }
+
+    #[test]
     fn a_mirrored_space_keeps_its_readers_name_and_its_archived_threads() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().to_string_lossy().to_string();
@@ -12240,6 +12373,62 @@ mod space_tests {
                 assert!(state.open_thread(threads[1], cx));
                 assert!(state.space(space).unwrap().1.is_expanded);
                 assert_eq!(state.snapshot.active_agent_id, Some(threads[1]));
+            })
+        });
+    }
+
+    #[test]
+    fn archiving_or_deleting_the_open_thread_opens_the_space_of_the_one_shown_next() {
+        // The next thread is the first one listed, wherever it is drawn: in a
+        // closed space it was shown with no row in the sidebar.
+        for delete in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let test = gpui::TestAppContext::single();
+            let (state, [project, _], threads) = test.update(|cx| workspace(cx, temp.path()));
+            test.update(|cx| {
+                state.update(cx, |state, _| {
+                    let space = state.create_space(project, "Closed", None).unwrap();
+                    assert!(state.move_thread_to_space(threads[0], Some(space)));
+                    state.toggle_space_expansion(space);
+                    assert!(!state.space(space).unwrap().1.is_expanded);
+                    state.select_agent(threads[1]);
+                    if delete {
+                        assert!(state.delete_thread(threads[1]));
+                    } else {
+                        assert!(state.set_thread_archived(threads[1], true));
+                    }
+                    assert_eq!(state.snapshot.active_agent_id, Some(threads[0]));
+                    assert!(
+                        state.space(space).unwrap().1.is_expanded,
+                        "delete: {delete}"
+                    );
+                })
+            });
+        }
+    }
+
+    #[test]
+    fn a_space_s_lead_is_not_moved_into_a_new_space() {
+        // As a move into an existing one is refused: moved, it was listed in
+        // neither space, and another space's lead could reach it as a worker.
+        let temp = tempfile::tempdir().unwrap();
+        let test = gpui::TestAppContext::single();
+        let (state, [project, _], _) = test.update(|cx| workspace(cx, temp.path()));
+        test.update(|cx| {
+            state.update(cx, |state, _| {
+                let space = state.create_space(project, "Parser", None).unwrap();
+                let lead = state.ensure_space_lead(space).unwrap();
+                let spaces = state.spaces_of(project).len();
+                assert_eq!(state.create_space(project, "Elsewhere", Some(lead)), None);
+                assert!(
+                    state
+                        .last_error
+                        .as_deref()
+                        .unwrap()
+                        .contains("stays in the space")
+                );
+                assert_eq!(state.spaces_of(project).len(), spaces);
+                assert_eq!(state.thread(lead).unwrap().space, Some(space));
             })
         });
     }

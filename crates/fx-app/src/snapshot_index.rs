@@ -289,12 +289,15 @@ pub fn listed_slots(record: &PersistedProject) -> Vec<usize> {
     }
     let archived: HashSet<&Uuid> = record.archived_agent_ids.iter().collect();
     let missing: HashSet<&Uuid> = record.missing_native_agent_ids.iter().collect();
+    // An id the order names twice is one row: two would share an element id
+    // and push every ⌘ number after them one along.
+    let mut seen: HashSet<&Uuid> = HashSet::with_capacity(slots.len());
     record
         .project
         .as_ref()
         .map_or(&[][..], |project| project.agent_order.as_slice())
         .iter()
-        .filter(|id| !archived.contains(id) && !missing.contains(id))
+        .filter(|id| !archived.contains(id) && !missing.contains(id) && seen.insert(id))
         .filter_map(|id| slots.get(id).copied())
         .collect()
 }
@@ -345,6 +348,21 @@ mod tests {
         *value = next;
         assert_eq!(value.generation(), start + 2);
         assert_eq!(*value, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn an_id_the_order_names_twice_is_listed_once() {
+        // Two rows would share an element id and push every ⌘ number after
+        // them one along.
+        let agents: Vec<Agent> = (0..2).map(|i| Agent::new(format!("T{i}"))).collect();
+        let mut project = Project::new("/tmp/twice");
+        project.agent_order = vec![agents[0].id, agents[1].id, agents[0].id];
+        let record = PersistedProject {
+            project: Some(project),
+            agents,
+            ..Default::default()
+        };
+        assert_eq!(listed_slots(&record), vec![0, 1]);
     }
 
     #[test]
