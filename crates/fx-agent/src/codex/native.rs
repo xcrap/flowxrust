@@ -1648,7 +1648,19 @@ for line in sys.stdin:
             matches!(&messages[3].content[0],MessageContent::ToolResult{content,is_error:false,..} if content=="all passed")
         );
         assert!(
-            matches!(&messages[5].content[0],MessageContent::ToolResult{content,is_error:true,..} if content.contains("missing"))
+            matches!(&messages[5].content[0],MessageContent::ToolResult{content,is_error:true,..} if content == "missing")
+        );
+        // An MCP call is named by its server as well as its tool, as Claude
+        // names one, and a dynamic call's content items read as their text.
+        assert!(
+            matches!(&messages[4].content[0],MessageContent::ToolUse{name,..} if name == "mcp__docs__read"),
+            "{:?}",
+            messages[4]
+        );
+        assert!(
+            matches!(&messages[7].content[0],MessageContent::ToolResult{content,..} if content == "saved"),
+            "{:?}",
+            messages[7]
         );
         let again = convert_turns(
             "thread",

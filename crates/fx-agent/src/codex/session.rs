@@ -704,12 +704,13 @@ pub(super) fn tool_outcome(item: &Value) -> (Option<String>, bool) {
         "agentsStates",
     ]
     .iter()
-    .filter_map(|key| item.get(*key))
-    .filter(|value| !value.is_null())
-    .map(|value| {
+    .filter_map(|key| Some((*key, item.get(*key)?)))
+    .filter(|(_, value)| !value.is_null())
+    .map(|(key, value)| {
         value
             .as_str()
             .map(str::to_owned)
+            .or_else(|| envelope_text(key, value))
             .unwrap_or_else(|| value.to_string())
     })
     .find(|text| !text.trim().is_empty());
@@ -722,12 +723,82 @@ pub(super) fn tool_outcome(item: &Value) -> (Option<String>, bool) {
     (output, is_error)
 }
 
+/// The text inside a tool result's envelope, for the three Codex wraps.
+///
+/// An MCP call's `result` is the MCP result itself (`{content: [blocks],
+/// structuredContent, _meta}`), its `error` is `{message}`, and a dynamic
+/// call's `contentItems` are blocks of their own (`inputText`, `inputImage`,
+/// `inputAudio`). Shown as JSON, every MCP row was the envelope around its
+/// answer. `None` is anything else, which is shown as JSON as before.
+fn envelope_text(key: &str, value: &Value) -> Option<String> {
+    match key {
+        "result" => {
+            let text = content_blocks_text(value.get("content")?.as_array()?);
+            if text.trim().is_empty() {
+                // A result with nothing to read but structured data shows
+                // that; one with neither is empty, and trivial.
+                return Some(
+                    value
+                        .get("structuredContent")
+                        .filter(|structured| !structured.is_null())
+                        .map(Value::to_string)
+                        .unwrap_or_default(),
+                );
+            }
+            Some(text)
+        }
+        "error" => value
+            .get("message")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+        "contentItems" => Some(content_blocks_text(value.as_array()?)),
+        _ => None,
+    }
+}
+
+/// Content blocks as the model read them: text whole, media named.
+fn content_blocks_text(blocks: &[Value]) -> String {
+    blocks
+        .iter()
+        .map(|block| {
+            let field = |key: &str| block.get(key).and_then(Value::as_str);
+            match field("type").unwrap_or_default() {
+                "text" | "inputText" => field("text").unwrap_or_default().to_owned(),
+                "image" | "inputImage" => "[image]".into(),
+                "audio" | "inputAudio" => "[audio]".into(),
+                "resource_link" => field("uri").unwrap_or("[resource]").to_owned(),
+                "resource" => block["resource"]
+                    .get("text")
+                    .or_else(|| block["resource"].get("uri"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("[resource]")
+                    .to_owned(),
+                _ => block.to_string(),
+            }
+        })
+        .filter(|text| !text.trim().is_empty())
+        .collect::<Vec<_>>()
+        .join("\n\n")
+}
+
 /// A tool row's name, shared by live items and native history.
 ///
 /// A tool item usually names itself in `name` or `tool`, but a bare
 /// `commandExecution` does neither. Falling back to the type keeps the row
-/// identifiable instead of blank.
+/// identifiable instead of blank. An MCP call names its server beside its
+/// tool, and is named as Claude names one, `mcp__<server>__<tool>`, so its row
+/// reads `server · tool` on both providers rather than a bare tool name.
 pub(super) fn tool_name(item: &Value) -> String {
+    let text = |key: &str| {
+        item.get(key)
+            .and_then(Value::as_str)
+            .filter(|text| !text.is_empty())
+    };
+    if item["type"] == "mcpToolCall"
+        && let (Some(server), Some(tool)) = (text("server"), text("tool"))
+    {
+        return format!("mcp__{server}__{tool}");
+    }
     ["name", "tool", "type"]
         .iter()
         .find_map(|key| item.get(*key).and_then(Value::as_str))
@@ -2180,13 +2251,24 @@ mod tests {
                 other => panic!("{other:?}"),
             };
 
-        // A successful MCP call: `error` is present and null.
+        // A successful MCP call: `error` is present and null, and the row is
+        // the text inside the result, not the envelope around it. The shape
+        // is codex-cli 0.167's for a live call to FlowX's own server.
         let (content, is_error) = result(json!({
             "type": "mcpToolCall", "id": "m1", "status": "completed",
-            "result": {"content": [{"type": "text", "text": "42"}]}, "error": null
+            "server": "flowx", "tool": "read_thread",
+            "result": {"content": [{"type": "text", "text": "42"}, {"type": "image", "data": "x"}],
+                       "structuredContent": null, "_meta": null},
+            "error": null
         }));
         assert!(!is_error, "a null error is not a failure");
-        assert!(content.contains("42"), "{content}");
+        assert_eq!(content, "42\n\n[image]");
+        // Structured data alone is what there is to show.
+        let (content, _) = result(json!({
+            "type": "mcpToolCall", "id": "m3", "status": "completed",
+            "result": {"content": [], "structuredContent": {"n": 1}}, "error": null
+        }));
+        assert_eq!(content, r#"{"n":1}"#);
 
         // A failed MCP call: the leading null `result` must not hide the error.
         let (content, is_error) = result(json!({
@@ -2194,7 +2276,7 @@ mod tests {
             "result": null, "error": {"message": "server unavailable"}
         }));
         assert!(is_error);
-        assert!(content.contains("server unavailable"), "{content}");
+        assert_eq!(content, "server unavailable");
 
         // A command that failed by exit code, with nulls ahead of nothing.
         let (content, is_error) = result(json!({
