@@ -73,6 +73,43 @@ impl McpServer {
     }
 }
 
+/// Whether a turn was launched with FlowX's own MCP server.
+///
+/// A provider names an MCP call by the server's name and the tool's, and the
+/// user's own servers are named by the user. One called `flowx` offers its
+/// tools under the very names FlowX's do, so a call named
+/// `mcp__flowx__read_thread` is FlowX's read only in a turn FlowX gave its
+/// server to. Judged by the name alone, a user's own `read_thread` passed as
+/// FlowX's without a card, Read Only included.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum FlowxServer {
+    /// The turn has no server of FlowX's: no call is one of its tools.
+    #[default]
+    Absent,
+    /// FlowX added its server to the turn, under its own name.
+    Launched,
+}
+
+impl FlowxServer {
+    /// Whether FlowX's server is among the servers it adds to a turn.
+    pub fn among(servers: &[McpServer]) -> Self {
+        if servers
+            .iter()
+            .any(|server| server.name == fx_core::policy::flowx_tools::SERVER)
+        {
+            Self::Launched
+        } else {
+            Self::Absent
+        }
+    }
+
+    /// Whether a call by this name is one of FlowX's own read tools.
+    pub fn reads(self, provider_tool_name: &str) -> bool {
+        self == Self::Launched
+            && fx_core::policy::flowx_tools::is_read_only_call(provider_tool_name)
+    }
+}
+
 /// Claude's `--mcp-config` value for these servers.
 pub fn claude_config(servers: &[McpServer]) -> String {
     let servers: Map<String, Value> = servers
@@ -186,6 +223,28 @@ mod tests {
             "/tmp/flowx-bridge-x/flowx.sock"
         );
         assert!(entry.get("type").is_none(), "{entry}");
+    }
+
+    #[test]
+    fn flowx_s_reads_are_its_own_only_in_a_turn_given_its_server() {
+        let launched = FlowxServer::among(&[fixture()]);
+        assert_eq!(launched, FlowxServer::Launched);
+        assert!(launched.reads("mcp__flowx__read_thread"));
+        assert!(!launched.reads("mcp__flowx__start_thread"));
+        // A turn without FlowX's server, or with only someone else's: a
+        // `flowx` server there is the user's.
+        let other = McpServer {
+            name: "probe".into(),
+            ..fixture()
+        };
+        for servers in [&[][..], std::slice::from_ref(&other)] {
+            let absent = FlowxServer::among(servers);
+            assert_eq!(absent, FlowxServer::Absent);
+            for tool in fx_core::policy::flowx_tools::READ_ONLY {
+                let name = fx_core::policy::flowx_tools::provider_tool_name(tool);
+                assert!(!absent.reads(&name), "{name}");
+            }
+        }
     }
 
     #[test]

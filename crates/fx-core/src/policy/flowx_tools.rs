@@ -41,11 +41,14 @@ pub const READ_ONLY: [&str; 3] = [LIST_THREADS, READ_THREAD, WAIT_FOR_THREADS];
 /// level that asks, each is an approval, and Read Only refuses them.
 pub const ORCHESTRATION: [&str; 4] = [START_THREAD, SEND_TO_THREAD, WAIT_FOR_THREADS, STOP_THREAD];
 
-/// Whether a provider's tool call is one of FlowX's read-only tools, by the
-/// name the provider gives it.
+/// Whether a provider's tool call is named as one of FlowX's read-only tools.
 ///
 /// Exact names only. A tool another server offers under a similar name, or a
 /// later FlowX tool that writes, is not a read because it resembles one.
+///
+/// A name is not proof on its own: a user's own server called `flowx` offers
+/// its tools under these very names. The approval policies grant them only
+/// in a turn FlowX gave its server to (`fx_agent::mcp::FlowxServer`).
 pub fn is_read_only_call(provider_tool_name: &str) -> bool {
     provider_tool_name
         .strip_prefix("mcp__")

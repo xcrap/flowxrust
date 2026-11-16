@@ -1671,8 +1671,10 @@ pub use crate::shell::is_read_only_command;
 /// Whether a Claude tool call only reads, judged by Claude's own tool names.
 ///
 /// The searches and reads are read-only by name; `Bash` is as read-only as its
-/// command; FlowX's own read tools are, by their exact names; everything else,
-/// edits and every other MCP tool included, is not.
+/// command; everything else, edits and every MCP tool included, is not.
+/// FlowX's own read tools are judged by the approval policy, which knows
+/// whether the turn was given FlowX's server: by name alone, a user's own
+/// server called `flowx` passed as FlowX's.
 pub fn is_read_only_tool(tool_name: &str, input: &Value) -> bool {
     match tool_name {
         // `TodoWrite` writes only Claude's own task list, which FlowX draws as
@@ -1682,7 +1684,7 @@ pub fn is_read_only_tool(tool_name: &str, input: &Value) -> bool {
             .get("command")
             .and_then(Value::as_str)
             .is_some_and(is_read_only_command),
-        name => fx_core::policy::flowx_tools::is_read_only_call(name),
+        _ => false,
     }
 }
 
@@ -4110,6 +4112,9 @@ mod tests {
             ("Edit", json!({})),
             ("Write", json!({})),
             ("WebFetch", json!({})),
+            // FlowX's reads are the policy's to judge, by whether the turn
+            // has FlowX's server: by name, any server called `flowx` passed.
+            ("mcp__flowx__read_thread", json!({})),
         ] {
             assert!(!is_read_only_tool(tool, &input), "{tool} {input}");
         }

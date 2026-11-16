@@ -45,6 +45,7 @@ use crate::codex::transport::{
     CONTROL_REQUEST_TIMEOUT, PendingResponse, ServerEvent, Transport, TransportError,
 };
 use crate::elicitation::{Elicitation, Reply};
+use crate::mcp::FlowxServer;
 use crate::provider::{ApprovalRequest, ProviderError, ProviderEvent, RiskLevel, UserResponse};
 use fx_core::models::goal::{ConversationGoal, GoalStatus};
 use tokio::sync::mpsc;
@@ -96,13 +97,17 @@ pub enum ApprovalPolicy {
 }
 
 impl ApprovalPolicy {
-    pub fn allows(&self, tool_name: &str, input: &Value) -> bool {
+    /// Whether a Codex call goes ahead without asking.
+    ///
+    /// `flowx` says whether this turn was given FlowX's own server: only
+    /// then is a call named as one of FlowX's reads one of them.
+    pub fn allows(&self, tool_name: &str, input: &Value, flowx: FlowxServer) -> bool {
         match self {
             Self::AllowAll => true,
             // FlowX's own reads are answered without a card, as a provider's
             // own file reads are under an access level that asks: a lead
             // waits on its workers dozens of times a turn.
-            Self::Ask => fx_core::policy::flowx_tools::is_read_only_call(tool_name),
+            Self::Ask => flowx.reads(tool_name),
             Self::DenyAll => false,
             Self::DenyUnlessReadOnly => {
                 // `risk_for` is not the right question here. It rates even a
@@ -120,7 +125,7 @@ impl ApprovalPolicy {
                         .is_some_and(is_read_only_command_value),
                     // An MCP tool approval is named `mcp__<server>__<tool>`;
                     // only FlowX's own read tools are reads.
-                    name => fx_core::policy::flowx_tools::is_read_only_call(name),
+                    name => flowx.reads(name),
                 }
             }
         }
@@ -131,12 +136,14 @@ impl ApprovalPolicy {
     /// Claude names its tools differently, and `allows` knows only Codex's
     /// names, so under this policy it refused every Claude tool — `Read`
     /// included.
-    pub fn allows_claude_tool(&self, tool_name: &str, input: &Value) -> bool {
+    pub fn allows_claude_tool(&self, tool_name: &str, input: &Value, flowx: FlowxServer) -> bool {
         match self {
             Self::AllowAll => true,
-            Self::Ask => fx_core::policy::flowx_tools::is_read_only_call(tool_name),
+            Self::Ask => flowx.reads(tool_name),
             Self::DenyAll => false,
-            Self::DenyUnlessReadOnly => crate::claude::stream::is_read_only_tool(tool_name, input),
+            Self::DenyUnlessReadOnly => {
+                crate::claude::stream::is_read_only_tool(tool_name, input) || flowx.reads(tool_name)
+            }
         }
     }
 
@@ -172,6 +179,9 @@ pub struct CodexSession {
     /// one sent before Codex acknowledged the turn.
     steer_turn: tokio::sync::watch::Sender<Option<String>>,
     approvals: ApprovalPolicy,
+    /// Whether the thread was opened with FlowX's own server, which is what
+    /// makes a call named as one of its reads one.
+    flowx: FlowxServer,
     /// The thread's `cwd`, which every turn and steer runs in and which a
     /// prompt's `@path` mentions are resolved against.
     working_directory: String,
@@ -254,6 +264,7 @@ impl CodexSession {
             starting: None,
             steer_turn: tokio::sync::watch::Sender::new(None),
             approvals,
+            flowx: FlowxServer::among(mcp_servers),
             working_directory: working_directory.to_string(),
         })
     }
@@ -488,7 +499,7 @@ impl CodexSession {
                         let event = request.event.clone();
                         // An approval the policy grants by itself (FlowX's
                         // own reads, under Ask) needs no card.
-                        let granted = matches!(&event, ProviderEvent::Approval(a) if self.approvals.allows(&a.tool_name, &a.input));
+                        let granted = matches!(&event, ProviderEvent::Approval(a) if self.approvals.allows(&a.tool_name, &a.input, self.flowx));
                         let ask = responses.is_some()
                             && (matches!(event, ProviderEvent::UserInput(_))
                                 || self.approvals == ApprovalPolicy::Ask && !granted);
@@ -496,7 +507,7 @@ impl CodexSession {
                             pending.insert(request_key(&id), request);
                             sink(event);
                         } else {
-                            let approved = matches!(&event, ProviderEvent::Approval(a) if self.approvals.allows(&a.tool_name, &a.input));
+                            let approved = matches!(&event, ProviderEvent::Approval(a) if self.approvals.allows(&a.tool_name, &a.input, self.flowx));
                             if let Some(result) = request.approval_result(approved) {
                                 self.transport.respond(id, result).map_err(map_error)?;
                             } else {
@@ -971,7 +982,7 @@ impl PendingRequest {
     fn call_row(&self) -> ProviderEvent {
         let name = match (&self.event, &self.elicitation) {
             (ProviderEvent::Approval(approval), _) => approval.tool_name.clone(),
-            (_, Some(elicitation)) => format!("mcp__{}", elicitation.server),
+            (_, Some(elicitation)) => elicitation.call_name(),
             _ => "requestUserInput".to_owned(),
         };
         let call = self
@@ -1200,6 +1211,7 @@ mod tests {
     use super::*;
     use crate::codex::fake_server::FakeServer;
     use crate::codex::transport::Launch;
+    use crate::mcp::FlowxServer::{Absent, Launched};
     use fx_core::AgentAccess;
 
     async fn session_with(server: &FakeServer, env: &[(&str, &str)]) -> CodexSession {
@@ -1723,8 +1735,18 @@ mod tests {
         policy: ApprovalPolicy,
         answer: impl Fn(&ProviderEvent) -> Option<UserResponse>,
     ) -> Option<(Vec<ProviderEvent>, Vec<String>)> {
+        answer_first_request_with(prompt, policy, &[], answer).await
+    }
+
+    /// [`answer_first_request`], in a thread opened with these servers.
+    async fn answer_first_request_with(
+        prompt: &str,
+        policy: ApprovalPolicy,
+        servers: &[crate::mcp::McpServer],
+        answer: impl Fn(&ProviderEvent) -> Option<UserResponse>,
+    ) -> Option<(Vec<ProviderEvent>, Vec<String>)> {
         let server = FakeServer::new()?;
-        let mut session = CodexSession::open(
+        let mut session = CodexSession::open_with_servers(
             Transport::start(server.launch(), "FlowX", "test")
                 .await
                 .unwrap(),
@@ -1732,6 +1754,8 @@ mod tests {
             AgentAccess::Supervised,
             "/tmp",
             policy,
+            None,
+            servers,
         )
         .await
         .unwrap();
@@ -2237,15 +2261,17 @@ mod tests {
         let policy = ApprovalPolicy::default();
         assert!(!policy.allows(
             "commandExecution",
-            &json!({ "arguments": { "command": ["rm", "-rf", "/"] } })
+            &json!({ "arguments": { "command": ["rm", "-rf", "/"] } }),
+            Absent
         ));
         assert!(policy.allows(
             "commandExecution",
-            &json!({ "arguments": { "command": ["cat", "Cargo.toml"] } })
+            &json!({ "arguments": { "command": ["cat", "Cargo.toml"] } }),
+            Absent
         ));
-        assert!(policy.allows("webSearch", &json!({ "arguments": {} })));
+        assert!(policy.allows("webSearch", &json!({ "arguments": {} }), Absent));
         // Nothing unknown is auto-approved.
-        assert!(!policy.allows("someNewTool", &json!({ "arguments": {} })));
+        assert!(!policy.allows("someNewTool", &json!({ "arguments": {} }), Absent));
         // The shapes that used to slip through: a write flag, a second command,
         // and an argv whose quotes would hide one once joined.
         for command in [
@@ -2255,13 +2281,14 @@ mod tests {
             json!(["find", ".", "'", "-delete", "'"]),
         ] {
             assert!(
-                !policy.allows("commandExecution", &json!({ "command": command })),
+                !policy.allows("commandExecution", &json!({ "command": command }), Absent),
                 "{command} was approved"
             );
         }
         assert!(policy.allows(
             "commandExecution",
-            &json!({ "command": "/bin/zsh -lc 'rg -n foo src'" })
+            &json!({ "command": "/bin/zsh -lc 'rg -n foo src'" }),
+            Absent
         ));
     }
 
@@ -2271,15 +2298,21 @@ mod tests {
         // included — was refused under the read-only policy.
         let policy = ApprovalPolicy::DenyUnlessReadOnly;
         for tool in ["Read", "Grep", "Glob", "LS"] {
-            assert!(policy.allows_claude_tool(tool, &json!({})), "{tool}");
+            assert!(
+                policy.allows_claude_tool(tool, &json!({}), Absent),
+                "{tool}"
+            );
         }
-        assert!(policy.allows_claude_tool("Bash", &json!({ "command": "git status" })));
-        assert!(!policy.allows_claude_tool("Bash", &json!({ "command": "git push" })));
+        assert!(policy.allows_claude_tool("Bash", &json!({ "command": "git status" }), Absent));
+        assert!(!policy.allows_claude_tool("Bash", &json!({ "command": "git push" }), Absent));
         for tool in ["Edit", "Write", "MultiEdit", "NotebookEdit", "SomethingNew"] {
-            assert!(!policy.allows_claude_tool(tool, &json!({})), "{tool}");
+            assert!(
+                !policy.allows_claude_tool(tool, &json!({}), Absent),
+                "{tool}"
+            );
         }
-        assert!(ApprovalPolicy::AllowAll.allows_claude_tool("Write", &json!({})));
-        assert!(!ApprovalPolicy::DenyAll.allows_claude_tool("Read", &json!({})));
+        assert!(ApprovalPolicy::AllowAll.allows_claude_tool("Write", &json!({}), Absent));
+        assert!(!ApprovalPolicy::DenyAll.allows_claude_tool("Read", &json!({}), Launched));
     }
 
     #[test]
@@ -2293,8 +2326,11 @@ mod tests {
             "mcp__flowx__read_thread",
             "mcp__flowx__wait_for_threads",
         ] {
-            assert!(policy.allows(tool, &json!({})), "codex {tool}");
-            assert!(policy.allows_claude_tool(tool, &json!({})), "claude {tool}");
+            assert!(policy.allows(tool, &json!({}), Launched), "codex {tool}");
+            assert!(
+                policy.allows_claude_tool(tool, &json!({}), Launched),
+                "claude {tool}"
+            );
         }
         // Starting, sending and stopping act on other threads: under an
         // access level that asks, each is a card, and Read Only refuses it.
@@ -2303,17 +2339,17 @@ mod tests {
             "mcp__flowx__send_to_thread",
             "mcp__flowx__stop_thread",
         ] {
-            assert!(!policy.allows(tool, &json!({})), "codex {tool}");
+            assert!(!policy.allows(tool, &json!({}), Launched), "codex {tool}");
             assert!(
-                !policy.allows_claude_tool(tool, &json!({})),
+                !policy.allows_claude_tool(tool, &json!({}), Launched),
                 "claude {tool}"
             );
             assert!(
-                !ApprovalPolicy::Ask.allows(tool, &json!({})),
+                !ApprovalPolicy::Ask.allows(tool, &json!({}), Launched),
                 "codex {tool}"
             );
             assert!(
-                !ApprovalPolicy::Ask.allows_claude_tool(tool, &json!({})),
+                !ApprovalPolicy::Ask.allows_claude_tool(tool, &json!({}), Launched),
                 "claude {tool}"
             );
         }
@@ -2323,28 +2359,56 @@ mod tests {
             "mcp__flowx",
             "mcp__github__list_threads",
         ] {
-            assert!(!policy.allows(tool, &json!({})), "codex {tool}");
+            assert!(!policy.allows(tool, &json!({}), Launched), "codex {tool}");
             assert!(
-                !policy.allows_claude_tool(tool, &json!({})),
+                !policy.allows_claude_tool(tool, &json!({}), Launched),
                 "claude {tool}"
             );
         }
         // Refusing everything still refuses them.
-        assert!(!ApprovalPolicy::DenyAll.allows("mcp__flowx__list_threads", &json!({})));
+        assert!(!ApprovalPolicy::DenyAll.allows("mcp__flowx__list_threads", &json!({}), Launched));
         // A level that asks answers FlowX's reads itself, and only those.
         for tool in [
             "mcp__flowx__list_threads",
             "mcp__flowx__read_thread",
             "mcp__flowx__wait_for_threads",
         ] {
-            assert!(ApprovalPolicy::Ask.allows(tool, &json!({})), "codex {tool}");
             assert!(
-                ApprovalPolicy::Ask.allows_claude_tool(tool, &json!({})),
+                ApprovalPolicy::Ask.allows(tool, &json!({}), Launched),
+                "codex {tool}"
+            );
+            assert!(
+                ApprovalPolicy::Ask.allows_claude_tool(tool, &json!({}), Launched),
                 "claude {tool}"
             );
         }
-        assert!(!ApprovalPolicy::Ask.allows("commandExecution", &json!({"command": "ls"})));
-        assert!(!ApprovalPolicy::Ask.allows_claude_tool("Read", &json!({})));
+        assert!(!ApprovalPolicy::Ask.allows(
+            "commandExecution",
+            &json!({"command": "ls"}),
+            Launched
+        ));
+        assert!(!ApprovalPolicy::Ask.allows_claude_tool("Read", &json!({}), Launched));
+    }
+
+    #[test]
+    fn a_flowx_read_is_one_only_in_a_turn_given_flowx_s_server() {
+        // A user's own server called `flowx` names its tools as FlowX's are
+        // named. In a turn FlowX gave no server to, its `read_thread` passed
+        // as FlowX's, without a card, at every level that asks and at Read
+        // Only.
+        for tool in fx_core::policy::flowx_tools::READ_ONLY {
+            let name = fx_core::policy::flowx_tools::provider_tool_name(tool);
+            for policy in [ApprovalPolicy::DenyUnlessReadOnly, ApprovalPolicy::Ask] {
+                assert!(
+                    !policy.allows(&name, &json!({}), Absent),
+                    "codex {policy:?} {name}"
+                );
+                assert!(
+                    !policy.allows_claude_tool(&name, &json!({}), Absent),
+                    "claude {policy:?} {name}"
+                );
+            }
+        }
     }
 
     #[tokio::test]
@@ -2357,15 +2421,13 @@ mod tests {
         for policy in [ApprovalPolicy::DenyUnlessReadOnly, ApprovalPolicy::Ask] {
             // A card would be declined here, so a regression fails the
             // assertions below rather than leaving the turn waiting.
-            let Some((seen, _)) =
-                answer_first_request("flowx-tool-approval", policy, |event| match event {
-                    ProviderEvent::Approval(request) => Some(UserResponse::Approval {
-                        id: request.id.clone(),
-                        approved: false,
-                    }),
-                    _ => None,
-                })
-                .await
+            let Some((seen, _)) = answer_first_request_with(
+                "flowx-tool-approval",
+                policy,
+                &[crate::mcp::fixture()],
+                decline_any_card,
+            )
+            .await
             else {
                 return;
             };
@@ -2383,9 +2445,52 @@ mod tests {
         }
     }
 
+    /// Decline whatever approval card a turn shows.
+    fn decline_any_card(event: &ProviderEvent) -> Option<UserResponse> {
+        match event {
+            ProviderEvent::Approval(request) => Some(UserResponse::Approval {
+                id: request.id.clone(),
+                approved: false,
+            }),
+            _ => None,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_flowx_named_approval_in_a_thread_without_flowx_s_server_is_not_flowx_s() {
+        // The same approval, from a server of the user's that is also called
+        // `flowx`: FlowX gave this thread no server of its own. Answered as
+        // FlowX's read, it ran unasked under Supervised and under Read Only.
+        for (policy, card) in [
+            (ApprovalPolicy::Ask, true),
+            (ApprovalPolicy::DenyUnlessReadOnly, false),
+        ] {
+            let Some((seen, _)) =
+                answer_first_request("flowx-tool-approval", policy, decline_any_card).await
+            else {
+                return;
+            };
+            assert_eq!(
+                seen.iter()
+                    .any(|event| matches!(event, ProviderEvent::Approval(_))),
+                card,
+                "{policy:?}: {seen:?}"
+            );
+            assert_eq!(
+                echoed_response(&seen)["result"]["action"],
+                "decline",
+                "{policy:?}"
+            );
+        }
+    }
+
     #[test]
     fn the_allow_all_policy_allows_everything() {
-        assert!(ApprovalPolicy::AllowAll.allows("shell", &json!({ "command": "rm -rf /" })));
+        assert!(ApprovalPolicy::AllowAll.allows(
+            "shell",
+            &json!({ "command": "rm -rf /" }),
+            Absent
+        ));
     }
 
     #[test]

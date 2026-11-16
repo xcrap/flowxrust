@@ -1024,6 +1024,9 @@ impl Job {
         let mut thread_id = resume.unwrap_or_default();
         let mut accepted = false;
         let mut waiting = std::collections::HashSet::new();
+        // Whether a call named as one of FlowX's reads is one: only in a turn
+        // FlowX gave its own server to. A user's server may share its name.
+        let flowx = fx_agent::mcp::FlowxServer::among(&self.mcp_servers);
         // A closed channel is ready forever, so selecting on it again would
         // spin a CPU for the rest of the turn. Once it closes it is left out.
         let mut responses_open = true;
@@ -1121,11 +1124,12 @@ impl Job {
                             if let ProviderEvent::Approval(ref request) = event {
                                 let auto = if self.approvals == ApprovalPolicy::Ask {
                                     // Full Access answers everything; FlowX's
-                                    // own reads are answered at any level.
+                                    // own reads are answered at any level, in
+                                    // a turn given FlowX's server.
                                     (self.access == AgentAccess::FullAccess
-                                        || self.approvals.allows_claude_tool(&request.tool_name, &request.input))
+                                        || self.approvals.allows_claude_tool(&request.tool_name, &request.input, flowx))
                                     .then_some(true)
-                                } else { Some(self.approvals.allows_claude_tool(&request.tool_name, &request.input)) };
+                                } else { Some(self.approvals.allows_claude_tool(&request.tool_name, &request.input, flowx)) };
                                 if let Some(approved) = auto {
                                     let answered = if approved {
                                         transport.approve(&request.id, true).await
@@ -3580,13 +3584,19 @@ for worker in workers: worker.join()
         let Some(server) = ClaudeFixture::new() else {
             return;
         };
+        let bridge_dir = tempfile::tempdir().unwrap();
+        let bridge = crate::bridge::test_access(bridge_dir.path());
+        let mut agent = Agent::new("Claude");
+        agent.configuration.flowx_tools = Some(true);
+        agent.configuration.agent_access = Some(AgentAccess::Supervised);
         let conversation = conversation();
-        let (_runner, recorder) = server.start_with(
+        let (_runner, recorder) = server.start_agent(
             &conversation,
             "flowx-wait",
-            AgentAccess::Supervised,
-            "fixture-model",
+            agent,
             ApprovalPolicy::Ask,
+            RuntimeDiscovery::default().without_extra_directories(),
+            Some(&bridge),
         );
         let updates = recorder.wait_for_end(TURN_BUDGET);
         assert!(
@@ -3608,6 +3618,49 @@ for worker in workers: worker.join()
             .find(|item| item["type"] == "control_response")
             .unwrap();
         assert_eq!(response["response"]["response"]["behavior"], "allow");
+    }
+
+    #[test]
+    fn a_flowx_named_claude_call_in_a_turn_without_flowx_s_server_is_not_flowx_s() {
+        // The thread has no FlowX tools, so the call can only come from a
+        // server of the user's that is also called `flowx`. Answered as
+        // FlowX's read, it ran without a card under Supervised and Read Only.
+        let Some(server) = ClaudeFixture::new() else {
+            return;
+        };
+        let supervised = conversation();
+        let (runner, recorder) = server.start(&supervised, "flowx-wait", AgentAccess::Supervised);
+        let ProviderEvent::Approval(request) = wait_for_interaction(&recorder) else {
+            panic!("approval expected")
+        };
+        assert_eq!(request.tool_name, "mcp__flowx__wait_for_threads");
+        assert!(runner.respond(UserResponse::Approval {
+            id: request.id,
+            approved: false
+        }));
+        recorder.wait_for_end(TURN_BUDGET);
+
+        let Some(server) = ClaudeFixture::new() else {
+            return;
+        };
+        let read_only = conversation();
+        let (_runner, recorder) = server.start(&read_only, "flowx-wait", AgentAccess::ReadOnly);
+        let updates = recorder.wait_for_end(TURN_BUDGET);
+        assert!(
+            !updates.iter().any(|update| matches!(
+                update,
+                SessionUpdate::Interaction {
+                    event: ProviderEvent::Approval(_)
+                }
+            )),
+            "Read Only asked the reader: {updates:?}"
+        );
+        let response = server
+            .received()
+            .into_iter()
+            .find(|item| item["type"] == "control_response")
+            .unwrap();
+        assert_eq!(response["response"]["response"]["behavior"], "deny");
     }
 
     #[test]

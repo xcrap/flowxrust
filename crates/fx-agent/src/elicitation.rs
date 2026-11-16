@@ -217,16 +217,29 @@ impl Elicitation {
         matches!(self.form, Form::ToolApproval { .. })
     }
 
+    /// The call this is about, named as both providers name an MCP call:
+    /// `mcp__<server>__<tool>`.
+    ///
+    /// With no tool read from the message, the name stops at the separator,
+    /// `mcp__<server>__`, which is no tool's name, so a policy that knows a
+    /// tool by its name never takes it for one. Named `mcp__<server>`, a
+    /// server called `flowx__read_thread` read as FlowX's own read tool.
+    pub fn call_name(&self) -> String {
+        match &self.form {
+            Form::ToolApproval {
+                tool: Some(tool), ..
+            } => format!("mcp__{}__{tool}", self.server),
+            _ => format!("mcp__{}__", self.server),
+        }
+    }
+
     /// What the conversation and the views are shown, under the id the
     /// caller will be answered by.
     pub fn event(&self, id: String) -> ProviderEvent {
         match &self.form {
-            Form::ToolApproval { tool, arguments } => ProviderEvent::Approval(ApprovalRequest {
+            Form::ToolApproval { arguments, .. } => ProviderEvent::Approval(ApprovalRequest {
                 id,
-                tool_name: match tool {
-                    Some(tool) => format!("mcp__{}__{tool}", self.server),
-                    None => format!("mcp__{}", self.server),
-                },
+                tool_name: self.call_name(),
                 input: arguments.clone(),
                 risk: RiskLevel::Moderate,
             }),
@@ -726,6 +739,36 @@ mod tests {
         );
         // A question's answer is not an approval's, and leaves it open.
         assert!(elicitation.reply(&answers(&[])).is_none());
+    }
+
+    #[test]
+    fn an_approval_that_names_no_tool_is_never_named_as_a_flowx_tool() {
+        // Codex names the tool only in its message. Without one there, the
+        // name was `mcp__<server>`, and a server called `flowx__read_thread`
+        // made it `mcp__flowx__read_thread`: FlowX's own read, by name.
+        let mut params = codex_tool_approval();
+        params["serverName"] = json!("flowx__read_thread");
+        params["message"] = json!("Allow this MCP server to run a tool?");
+        let elicitation = Elicitation::from_codex(&params);
+        let ProviderEvent::Approval(approval) = elicitation.event("codex:0".into()) else {
+            panic!("a tool approval is an approval");
+        };
+        assert_eq!(approval.tool_name, "mcp__flowx__read_thread__");
+        assert!(
+            !fx_core::policy::flowx_tools::is_read_only_call(&approval.tool_name),
+            "{}",
+            approval.tool_name
+        );
+        // A question from it is no FlowX tool either, and a named tool still
+        // reads as the server's.
+        let question = Elicitation::from_claude(&json!({
+            "mcp_server_name": "flowx__list_threads", "message": "Sure?", "mode": "form"
+        }));
+        assert_eq!(question.call_name(), "mcp__flowx__list_threads__");
+        assert_eq!(
+            Elicitation::from_codex(&codex_tool_approval()).call_name(),
+            "mcp__probe__ask_name"
+        );
     }
 
     #[test]
