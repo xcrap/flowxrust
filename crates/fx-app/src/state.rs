@@ -955,9 +955,27 @@ impl AppState {
         if !self.is_expanded(project_id) {
             self.toggle_project_expansion(project_id);
         }
+        self.reveal_in_space(agent_id);
         self.select_agent(agent_id);
         self.request_conversation(project_id, agent_id, cx);
         true
+    }
+
+    /// Open the space a thread is listed in, so the thread has a row.
+    fn reveal_in_space(&mut self, agent_id: Uuid) {
+        let Some(space) = self
+            .snapshot
+            .projects
+            .iter()
+            .flat_map(|record| &record.agents)
+            .find(|agent| agent.id == agent_id)
+            .and_then(|agent| agent.space)
+        else {
+            return;
+        };
+        if self.space(space).is_some_and(|(_, held)| !held.is_expanded) {
+            self.toggle_space_expansion(space);
+        }
     }
 
     /// Clear a thread's conversation and start over with a new provider session.
@@ -1444,6 +1462,16 @@ impl AppState {
             return true;
         }
         agent.space = space;
+        // The open thread moved into a closed space would leave the sidebar
+        // with no row for what the window shows, so its space opens.
+        if self.snapshot.active_agent_id == Some(agent_id)
+            && let Some(held) = record
+                .spaces
+                .iter_mut()
+                .find(|held| Some(held.space.id) == space)
+        {
+            held.is_expanded = true;
+        }
         self.commit_thread_change(next, "move this thread")
     }
 
@@ -11992,6 +12020,17 @@ mod space_tests {
                 assert_eq!(space_of(&saved(temp.path()), threads[0]), Some(here));
                 assert!(state.move_thread_to_space(threads[0], None));
                 assert_eq!(space_of(&saved(temp.path()), threads[0]), None);
+                // The open thread moved into a closed space opens it, or the
+                // sidebar has no row for what the window shows; another
+                // thread moved there leaves it closed.
+                state.toggle_space_expansion(here);
+                assert!(state.move_thread_to_space(threads[2], Some(here)));
+                assert!(!state.space(here).unwrap().1.is_expanded);
+                state.select_agent(threads[0]);
+                assert!(state.move_thread_to_space(threads[0], Some(here)));
+                assert!(state.space(here).unwrap().1.is_expanded);
+                assert!(saved(temp.path()).projects[0].spaces[0].is_expanded);
+                assert!(state.move_thread_to_space(threads[0], None));
                 // A new space made from a thread's menu takes the thread in
                 // the same save.
                 let made = state
@@ -12004,6 +12043,26 @@ mod space_tests {
                     "a thread of another project"
                 );
                 assert_eq!(state.spaces_of(project).len(), 2);
+            })
+        });
+    }
+
+    #[test]
+    fn opening_a_thread_from_elsewhere_opens_its_space() {
+        // ⌘1–9, the palette and a restore show a thread as a click does; a
+        // thread in a closed space had no row to show it on.
+        let temp = tempfile::tempdir().unwrap();
+        let test = gpui::TestAppContext::single();
+        let (state, [project, _], threads) = test.update(|cx| workspace(cx, temp.path()));
+        test.update(|cx| {
+            state.update(cx, |state, cx| {
+                let space = state.create_space(project, "Closed", None).unwrap();
+                assert!(state.move_thread_to_space(threads[1], Some(space)));
+                state.toggle_space_expansion(space);
+                assert!(!state.space(space).unwrap().1.is_expanded);
+                assert!(state.open_thread(threads[1], cx));
+                assert!(state.space(space).unwrap().1.is_expanded);
+                assert_eq!(state.snapshot.active_agent_id, Some(threads[1]));
             })
         });
     }
