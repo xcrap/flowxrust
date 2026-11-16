@@ -192,6 +192,17 @@ impl AppState {
             _ => "Started by a space's lead".into(),
         })
     }
+
+    /// A thread's title by its id, for a row that names one. A frame asks,
+    /// so it reads the index.
+    pub(crate) fn thread_title(&self, agent_id: Uuid) -> Option<String> {
+        let index = self.snapshot_index();
+        let agent = index.agent(&self.snapshot, agent_id)?;
+        Some(match agent.title.trim() {
+            "" => "Untitled thread".to_string(),
+            title => title.to_string(),
+        })
+    }
 }
 
 /// The position of a space's lead in a record's threads.

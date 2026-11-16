@@ -1948,6 +1948,7 @@ fn row_element(row: &RowPlan, snapshot: &Snapshot, has_active_group: bool, cx: &
             activity_group(
                 &group_for(snapshot.id, &messages, *index, *is_active),
                 snapshot,
+                &|thread| app_thread_title(thread, cx),
             )
         }
         RowPlan::Plan { message, is_live } => plan_card(&snapshot.messages[*message], *is_live),
@@ -4151,8 +4152,22 @@ fn error_banner(message: &str, snapshot: &Snapshot) -> AnyElement {
 
 // ── The activity group ─────────────────────────────────────────────────────
 
+/// A thread's title by its id, for a row naming one: an orchestration call
+/// names the thread it reaches by id, and only the app knows the title.
+type ThreadTitles<'a> = dyn Fn(Uuid) -> Option<String> + 'a;
+
+/// A thread's title from the app, read from its index, so a row asking on
+/// every frame costs a lookup.
+fn app_thread_title(thread: Uuid, cx: &App) -> Option<String> {
+    crate::AppHandle::get(cx)?.0.read(cx).thread_title(thread)
+}
+
 /// A collapsible group of tool traffic.
-fn activity_group(group: &ActivityGroup<'_>, snapshot: &Snapshot) -> AnyElement {
+fn activity_group(
+    group: &ActivityGroup<'_>,
+    snapshot: &Snapshot,
+    titles: &ThreadTitles,
+) -> AnyElement {
     let theme = global::current();
     // Progress stays compact until the reader asks for details. Streaming new
     // calls must never override a reader's decision to close the disclosure.
@@ -4240,7 +4255,7 @@ fn activity_group(group: &ActivityGroup<'_>, snapshot: &Snapshot) -> AnyElement 
     // What the turn is doing this moment, open or closed: a closed group is
     // exactly when the reader cannot see the calls for themselves.
     if group.is_active {
-        column = column.child(live_step_line(group, snapshot));
+        column = column.child(live_step_line(group, snapshot, titles));
     }
 
     if expanded {
@@ -4284,7 +4299,7 @@ fn activity_group(group: &ActivityGroup<'_>, snapshot: &Snapshot) -> AnyElement 
                 GroupEntry::Thought(thought) => {
                     thought_block(thought.text, thought_key(group, thought))
                 }
-                GroupEntry::Call(position) => tool_row(group, position, snapshot),
+                GroupEntry::Call(position) => tool_row(group, position, snapshot, titles),
             });
         }
         // The thought arriving now, after everything recorded: it is
@@ -4303,12 +4318,22 @@ fn activity_group(group: &ActivityGroup<'_>, snapshot: &Snapshot) -> AnyElement 
 /// The row opens on a click to what the call is: an edit's diff, or any other
 /// call's arguments, and its output once it has one. While it runs in a live
 /// group, what it has printed so far is drawn under it, open or closed.
-fn tool_row(group: &ActivityGroup<'_>, position: usize, snapshot: &Snapshot) -> AnyElement {
+///
+/// An orchestration call that reaches a thread FlowX still holds has a
+/// button that opens it. Not the row's click, which opens the row as every
+/// other row's does, to the arguments and result it sent and got back.
+fn tool_row(
+    group: &ActivityGroup<'_>,
+    position: usize,
+    snapshot: &Snapshot,
+    titles: &ThreadTitles,
+) -> AnyElement {
     let theme = global::current();
     let call = &group.calls[position];
     let running = !call_finished(call, snapshot) && group.is_active;
     let key = call_key(group, position);
     let open = is_disclosed(&key);
+    let worker = orchestrated_thread(call).filter(|thread| titles(*thread).is_some());
 
     let status: AnyElement = if call.is_error {
         status_glyph(StatusGlyph::Failed, false)
@@ -4360,7 +4385,7 @@ fn tool_row(group: &ActivityGroup<'_>, position: usize, snapshot: &Snapshot) -> 
                 .text_color(Colors::fg_secondary(&theme))
                 .child(SharedString::from(tool_title(call, Tense::Past))),
         )
-        .child(if let Some(detail) = tool_detail(call) {
+        .child(if let Some(detail) = tool_detail(call, titles) {
             div()
                 .debug_selector({
                     let id = call.id.clone();
@@ -4376,6 +4401,22 @@ fn tool_row(group: &ActivityGroup<'_>, position: usize, snapshot: &Snapshot) -> 
                 .into_any_element()
         } else {
             div().flex_1().min_w_0().into_any_element()
+        })
+        .when_some(worker, |row, thread| {
+            row.child(fx_design::components::glyph_button(
+                SharedString::from(format!("open-thread:{key}")),
+                Icon::ARROW_UP_RIGHT_SQUARE,
+                "Open thread",
+                move |_, _, cx| {
+                    let Some(handle) = crate::AppHandle::get(cx) else {
+                        return;
+                    };
+                    handle.0.update(cx, |state, cx| {
+                        state.open_thread(thread, cx);
+                        cx.notify();
+                    });
+                },
+            ))
         })
         .child(div().flex_shrink_0().child(status));
 
@@ -4640,7 +4681,12 @@ fn display_tool_name(name: &str) -> String {
 ///
 /// Read from the arguments as they are, which while Claude streams them is a
 /// prefix of the JSON: a path that has arrived is shown before the rest has.
-fn tool_detail(call: &ToolCall<'_>) -> Option<String> {
+/// An orchestration call names its worker, the thread it reaches, or how
+/// many it waits for (`orchestrator::call_subject`).
+fn tool_detail(call: &ToolCall<'_>, titles: &ThreadTitles) -> Option<String> {
+    if let Some(detail) = orchestration_detail(call, titles) {
+        return Some(detail);
+    }
     let argument = json_string(call.input, "file_path")
         .or_else(|| json_string(call.input, "pattern"))
         .or_else(|| json_string(call.input, "command"))
@@ -4650,6 +4696,39 @@ fn tool_detail(call: &ToolCall<'_>) -> Option<String> {
         .or_else(|| partial_json_string(call.input, "command"))?;
     let summarized = summarize_line(&argument, SUMMARY_CHARACTER_LIMIT);
     (!summarized.is_empty()).then_some(summarized)
+}
+
+/// What a lead's orchestration call is about: the worker `start_thread`
+/// names, the title of the thread `send_to_thread` or `stop_thread` reaches,
+/// or how many `wait_for_threads` watches. A thread FlowX no longer holds is
+/// left unnamed rather than shown as an id.
+fn orchestration_detail(call: &ToolCall<'_>, titles: &ThreadTitles) -> Option<String> {
+    use fx_core::policy::flowx_tools;
+    use fx_core::policy::orchestrator::{CallSubject, call_subject};
+    let detail = match call_subject(call.name, call.input) {
+        Some(CallSubject::NewThread(title)) => title,
+        Some(CallSubject::Thread(thread)) => titles(thread)?,
+        Some(CallSubject::Threads(1)) => "1 thread".into(),
+        Some(CallSubject::Threads(count)) => format!("{count} threads"),
+        // A worker's title that has arrived, before the rest of the call.
+        None if call.name == flowx_tools::provider_tool_name(flowx_tools::START_THREAD) => {
+            partial_json_string(call.input, "title")?
+        }
+        None => return None,
+    };
+    let summarized = summarize_line(&detail, SUMMARY_CHARACTER_LIMIT);
+    (!summarized.is_empty()).then_some(summarized)
+}
+
+/// The thread an orchestration call reached: the one it sent to or
+/// stopped, or the worker it started, once its result names it.
+fn orchestrated_thread(call: &ToolCall<'_>) -> Option<Uuid> {
+    use fx_core::policy::orchestrator::{CallSubject, call_subject, result_thread};
+    match call_subject(call.name, call.input)? {
+        CallSubject::Thread(thread) => Some(thread),
+        CallSubject::NewThread(_) if !call.is_error => result_thread(call.output?),
+        _ => None,
+    }
 }
 
 /// The files a Codex `fileChange` touches: the first, and how many more.
@@ -4799,7 +4878,11 @@ enum LiveStep<'a> {
 ///
 /// The latest open call rather than the latest call: with calls running side
 /// by side, the one that finished last says nothing about what is still going.
-fn live_step<'a>(group: &ActivityGroup<'a>, snapshot: &Snapshot) -> LiveStep<'a> {
+fn live_step<'a>(
+    group: &ActivityGroup<'a>,
+    snapshot: &Snapshot,
+    titles: &ThreadTitles,
+) -> LiveStep<'a> {
     // Waiting on the reader is not work. The call awaiting approval has not
     // started, so it is not "Running", and no clock ticks against the agent
     // while the reader decides.
@@ -4819,7 +4902,7 @@ fn live_step<'a>(group: &ActivityGroup<'a>, snapshot: &Snapshot) -> LiveStep<'a>
         // What the call is pointed at, and the last thing it printed, so a
         // closed group still shows a build going by.
         let detail = match (
-            tool_detail(call),
+            tool_detail(call, titles),
             last_output_line(live_output_of(call, group, snapshot)),
         ) {
             (Some(detail), Some(line)) => Some(format!("{detail} · {line}")),
@@ -4869,10 +4952,14 @@ fn thinking_detail(snapshot: &Snapshot) -> Option<String> {
 /// One line of a fixed height whatever it says, so neither a tick nor the next
 /// call can change the row's height — which is what lets a tick re-measure
 /// nothing.
-fn live_step_line(group: &ActivityGroup<'_>, snapshot: &Snapshot) -> AnyElement {
+fn live_step_line(
+    group: &ActivityGroup<'_>,
+    snapshot: &Snapshot,
+    titles: &ThreadTitles,
+) -> AnyElement {
     let theme = global::current();
     // A call's detail is a path or a command; a thought's is prose.
-    let (glyph, label, detail, detail_role, since) = match live_step(group, snapshot) {
+    let (glyph, label, detail, detail_role, since) = match live_step(group, snapshot, titles) {
         LiveStep::Call {
             name,
             title,
@@ -6042,8 +6129,68 @@ mod tests {
                 result_recorded: false,
                 started: fx_core::models::now(),
             };
-            assert_eq!(tool_detail(&call), expected, "for {name} {input}");
+            assert_eq!(
+                tool_detail(&call, &|_| None),
+                expected,
+                "for {name} {input}"
+            );
         }
+    }
+
+    #[test]
+    fn an_orchestration_row_names_its_worker_its_thread_or_how_many() {
+        let worker = Uuid::from_u128(11);
+        let gone = Uuid::from_u128(12);
+        let titles = |thread: Uuid| (thread == worker).then(|| "Parser rewrite".to_string());
+        fn call<'a>(name: &'a str, input: &'a str, output: Option<&'a str>) -> ToolCall<'a> {
+            ToolCall {
+                id: "t".into(),
+                name,
+                input,
+                output,
+                is_error: false,
+                result_recorded: output.is_some(),
+                started: fx_core::models::now(),
+            }
+        }
+        let send = format!(r#"{{"thread_id":"{worker}","prompt":"Also the tests"}}"#);
+        let stop = format!(r#"{{"thread_id":"{gone}"}}"#);
+        let wait = format!(r#"{{"thread_ids":["{worker}","{gone}"]}}"#);
+        let started = format!(r#"{{"thread_id":"{worker}","title":"Parser rewrite"}}"#);
+        let start = call(
+            "mcp__flowx__start_thread",
+            r#"{"title":"Parser rewrite","prompt":"…","worktree":true}"#,
+            Some(&started),
+        );
+        assert_eq!(
+            tool_detail(&start, &titles).as_deref(),
+            Some("Parser rewrite")
+        );
+        // Its result names the worker, so the row can open it.
+        assert_eq!(orchestrated_thread(&start), Some(worker));
+        // The title, while the rest of the call is still arriving.
+        let streaming = call("mcp__flowx__start_thread", r#"{"title":"Pars"#, None);
+        assert_eq!(tool_detail(&streaming, &titles).as_deref(), Some("Pars"));
+        assert_eq!(orchestrated_thread(&streaming), None);
+
+        let send = call("mcp__flowx__send_to_thread", &send, None);
+        assert_eq!(
+            tool_detail(&send, &titles).as_deref(),
+            Some("Parser rewrite")
+        );
+        assert_eq!(orchestrated_thread(&send), Some(worker));
+        // A thread FlowX no longer holds is not named by its id.
+        let stop = call("mcp__flowx__stop_thread", &stop, None);
+        assert_eq!(tool_detail(&stop, &titles), None);
+        assert_eq!(orchestrated_thread(&stop), Some(gone));
+
+        let wait = call("mcp__flowx__wait_for_threads", &wait, None);
+        assert_eq!(tool_detail(&wait, &titles).as_deref(), Some("2 threads"));
+        assert_eq!(orchestrated_thread(&wait), None);
+        // Another server's tool of the same name reads as any other call.
+        let other = call("mcp__probe__start_thread", r#"{"title":"x"}"#, None);
+        assert_eq!(tool_detail(&other, &titles), None);
+        assert_eq!(display_tool_name(start.name), "flowx · start_thread");
     }
 
     #[test]
@@ -7106,6 +7253,62 @@ mod tests {
     // ── Copying ─────────────────────────────────────────────────────────────
 
     /// A window that renders the transcript, kept open for driving.
+    #[test]
+    fn an_orchestration_row_names_the_thread_it_reached_and_opens_it() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = fx_store::AppPaths::at(temp.path().join("state"));
+        let worker = fx_core::Agent::new("Parser rewrite");
+        let worker_id = worker.id;
+        let mut project = fx_core::Project::new(temp.path().to_string_lossy());
+        project.agent_order = vec![worker_id];
+        fx_store::Store::new(paths.clone())
+            .save_app(&fx_store::PersistedApp {
+                projects: vec![fx_store::PersistedProject {
+                    project: Some(project),
+                    agents: vec![worker],
+                    is_expanded: true,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            })
+            .unwrap();
+        let mut test = TestAppContext::single();
+        let state = test.update(|cx| {
+            let state = cx.new(|cx| crate::AppState::restore(paths, cx));
+            crate::AppHandle::install(state.clone(), cx);
+            state
+        });
+        let mut conversation = Conversation::new(Uuid::new_v4());
+        conversation.append(text(MessageRole::User, "Get the parser done"));
+        conversation.append(tool_use(
+            "send",
+            "mcp__flowx__send_to_thread",
+            &format!(r#"{{"thread_id":"{worker_id}","prompt":"Also the tests"}}"#),
+        ));
+        conversation.append(tool_result("send", "Sent.", false));
+        conversation.append(text(MessageRole::Assistant, "Asked it for the tests."));
+        {
+            let messages: Vec<_> = conversation.messages().collect();
+            let rows = build_rows(&messages, false, conversation.id);
+            toggle_disclosure(&only_group(&rows).key);
+        }
+        let window = test.add_window(move |_, _| Harness { conversation });
+        let mut visual = VisualTestContext::from_window(*window.deref(), &test);
+        visual.simulate_resize(size(px(900.0), px(600.0)));
+        test.refresh().unwrap();
+
+        assert!(drew(&mut visual, "transcript.call-detail:send"));
+        let open = visual
+            .debug_bounds("glyph-button:Open thread")
+            .expect("the row opens the thread it reached")
+            .center();
+        visual.simulate_click(open, Default::default());
+        test.refresh().unwrap();
+        test.read(|cx| assert_eq!(state.read(cx).snapshot.active_agent_id, Some(worker_id)));
+        // The button opened the thread; the row itself stayed as it was.
+        assert!(drew(&mut visual, "transcript.activity-call:send"));
+    }
+
     fn open(
         conversation: Conversation,
         width: f32,
