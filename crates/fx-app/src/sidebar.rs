@@ -6,14 +6,16 @@ use std::rc::Rc;
 
 use fx_core::{Agent, Project};
 use fx_design::components::{
-    ButtonStyle, DividerAxis, IconButtonProps, MenuItem, MenuItemTone, MenuModel, MenuSection,
-    button_with_icon, collapsible, context_region, divider_with_axis, empty_state, icon_button,
-    provider_status, revealed_on_hover,
+    ActivityState, ButtonStyle, DividerAxis, IconButtonProps, MenuItem, MenuItemTone, MenuModel,
+    MenuSection, activity_dot, button_with_icon, collapsible, context_region, divider_with_axis,
+    empty_state, icon_button, provider_status, revealed_on_hover,
 };
 use fx_design::icon::Icon;
 use fx_design::styled::{FxRefinement, FxStyled, px_len};
-use fx_design::theme::{BorderWidth, Colors, IconSize, Layout, Radii, Spacing, TextRole, global};
-use fx_store::PersistedProject;
+use fx_design::theme::{
+    AccentColor, BorderWidth, Colors, IconSize, Layout, Radii, Spacing, TextRole, global,
+};
+use fx_store::{PersistedProject, PersistedSpace};
 use gpui::prelude::*;
 use gpui::{
     AnyElement, App, ClipboardItem, Context, Entity, MouseButton, Render, Rgba, SharedString,
@@ -21,7 +23,7 @@ use gpui::{
 };
 use uuid::Uuid;
 
-use crate::snapshot_index::{RecordIndex, SnapshotIndex};
+use crate::snapshot_index::{RecordIndex, SnapshotIndex, SpaceIndex};
 use crate::state::AppState;
 use crate::text_field::TextField;
 
@@ -45,6 +47,9 @@ const THREAD_TITLE_ROLE: TextRole = TextRole::Caption;
 /// The width of a thread row's provider tile. Every row under a project
 /// reserves it, so a label starts where thread titles do.
 const LEADING_SLOT: f32 = Spacing::XL;
+/// How much further in a space's threads start than the space's header:
+/// one level.
+const SPACE_INDENT: f32 = Spacing::MD;
 /// What a project or thread row names itself for its trailing controls,
 /// which show only while it is hovered or selected.
 const ROW_GROUP: &str = "sidebar-row";
@@ -497,8 +502,20 @@ fn project_row(
     context_region(&registry, format!("project:{id}"), Some(context_menu), row).into_any_element()
 }
 
-/// A project's threads, indented under the project name: those matching the
-/// search, one page at a time.
+/// What every row under one project is drawn from.
+struct Rows<'a> {
+    state: &'a Entity<AppState>,
+    app: &'a AppState,
+    record: &'a PersistedProject,
+    listed: &'a RecordIndex,
+    project_id: Uuid,
+    query: &'a ThreadQuery,
+    open_menu: Option<&'a str>,
+}
+
+/// A project's threads, indented under the project name: its spaces, each
+/// with its own threads one level further in, then the threads in no space;
+/// or, during a search, the matches, flat. One page at a time per group.
 ///
 /// `matching` is positions in the record's threads, in sidebar order: every
 /// listed thread, or the search's matches among them. Only the page shown is
@@ -517,12 +534,35 @@ fn threads(
 ) -> AnyElement {
     let theme = global::current();
     let project_id = record.project.as_ref().map_or_else(Uuid::nil, |p| p.id);
-    let column = div()
+    let rows = Rows {
+        state,
+        app,
+        record,
+        listed,
+        project_id,
+        query,
+        open_menu,
+    };
+    let mut column = div()
         .flex()
         .flex_col()
         .flex_shrink_0()
         .gap(px_len(Spacing::XXXS))
         .pb(px_len(Spacing::XXS));
+    // A search lists its matches flat, as it always has: one match under a
+    // space's header would say less than its row does.
+    let grouped = !query.is_active();
+    if grouped && !listed.spaces.is_empty() {
+        let activity = space_activity(app, listed);
+        for space in listed.spaces.iter() {
+            column = column.child(space_group(
+                &rows,
+                space,
+                activity.get(&space.id).copied(),
+                interactive,
+            ));
+        }
+    }
     if listed.visible.is_empty() {
         // A project whose every thread is archived is not one with no
         // threads. Claude desktop's archive is mirrored here, so a project
@@ -574,36 +614,286 @@ fn threads(
             )
             .into_any_element();
     }
-    let limit = app.sidebar.visible_limit(project_id, query);
-    let remaining = matching.len().saturating_sub(limit);
-    let active_agent = app.snapshot.active_agent_id;
-    let mut column = column;
-    for agent in matching
+    let slots = if grouped {
+        &listed.ungrouped[..]
+    } else {
+        matching
+    };
+    thread_rows(column, &rows, project_id, slots, interactive, 0.0).into_any_element()
+}
+
+/// One page of `slots` as thread rows, and the "Show more" row under it.
+/// `page` is what the paging is kept by: the project for its ungrouped
+/// threads, a space for its own.
+fn thread_rows(
+    mut column: gpui::Div,
+    rows: &Rows,
+    page: Uuid,
+    slots: &[usize],
+    interactive: bool,
+    indent: f32,
+) -> gpui::Div {
+    let limit = rows.app.sidebar.visible_limit(page, rows.query);
+    let remaining = slots.len().saturating_sub(limit);
+    let active_agent = rows.app.snapshot.active_agent_id;
+    for agent in slots
         .iter()
         .take(limit)
-        .filter_map(|&slot| record.agents.get(slot))
+        .filter_map(|&slot| rows.record.agents.get(slot))
     {
         column = column.child(thread_row(
-            state,
-            app,
-            project_id,
+            rows.state,
+            rows.app,
+            rows.project_id,
             agent,
             Some(agent.id) == active_agent,
-            listed.unseen.contains(&agent.id),
+            rows.listed.unseen.contains(&agent.id),
             interactive,
-            open_menu,
+            rows.open_menu,
+            indent,
         ));
     }
     if remaining > 0 {
         column = column.child(show_more_row(
-            state.clone(),
-            project_id,
-            query.clone(),
+            rows.state.clone(),
+            page,
+            rows.query.clone(),
             remaining,
             interactive,
+            indent,
         ));
     }
-    column.into_any_element()
+    column
+}
+
+/// One space: its header, and its threads one level in under a disclosure.
+fn space_group(
+    rows: &Rows,
+    space: &SpaceIndex,
+    activity: Option<ActivityState>,
+    interactive: bool,
+) -> AnyElement {
+    let Some(persisted) = rows.record.spaces.get(space.slot) else {
+        return div().into_any_element();
+    };
+    let id = space.id;
+    let expanded = persisted.is_expanded;
+    let content = thread_rows(
+        div()
+            .flex()
+            .flex_col()
+            .flex_shrink_0()
+            .gap(px_len(Spacing::XXXS))
+            .pt(px_len(Spacing::XXXS)),
+        rows,
+        id,
+        &space.threads,
+        // Clipped while folded, but still mounted: nothing in it may act.
+        interactive && expanded,
+        SPACE_INDENT,
+    );
+    div()
+        .debug_selector(move || format!("sidebar-space-group:{id}"))
+        .flex()
+        .flex_col()
+        .flex_shrink_0()
+        .child(space_row(
+            rows,
+            persisted,
+            space.threads.len(),
+            // Open, its threads say it themselves.
+            activity.filter(|_| !expanded),
+            interactive,
+        ))
+        .child(collapsible(
+            format!("space-content:{id}"),
+            expanded,
+            content,
+        ))
+        .into_any_element()
+}
+
+/// A space's header: its colour, name and thread count, and the disclosure.
+/// Laid out as a thread row is, so its name starts where their titles do.
+fn space_row(
+    rows: &Rows,
+    space: &PersistedSpace,
+    count: usize,
+    activity: Option<ActivityState>,
+    interactive: bool,
+) -> AnyElement {
+    let theme = global::current();
+    let id = space.space.id;
+    let mark = space
+        .space
+        .color
+        .as_deref()
+        .and_then(space_accent)
+        .map_or_else(
+            || Colors::fg_tertiary(&theme),
+            |accent| Colors::space_mark(&theme, accent),
+        );
+    let name = match space.space.name.trim() {
+        "" => "Untitled space".to_string(),
+        name => name.to_string(),
+    };
+    let owner = format!("space:{id}");
+    let pinned = rows.open_menu == Some(owner.as_str());
+    let menu = space_menu();
+    let context_menu = menu.clone();
+    let registry = rows.app.context_registry.clone();
+    let state = rows.state.clone();
+    let expanded = space.is_expanded;
+    let status = activity.map(|activity| match activity {
+        ActivityState::Waiting => "waiting",
+        _ => "running",
+    });
+    let row = div()
+        .id(SharedString::from(owner.clone()))
+        .group(ROW_GROUP)
+        .debug_selector(move || format!("sidebar-space:{id}"))
+        .h(px(THREAD_ROW_HEIGHT))
+        .flex_shrink_0()
+        .flex()
+        .items_center()
+        .gap(px_len(Spacing::SM))
+        .pl(px_len(Spacing::SM))
+        .pr(px_len(Spacing::XXS))
+        .cursor_pointer()
+        .rounded(px_len(Radii::SM))
+        .hover(|s| s.fx_background(Colors::bg_hover(&theme)))
+        .on_click({
+            let state = state.clone();
+            move |_, _, cx| {
+                if !interactive {
+                    return;
+                }
+                state.update(cx, |state, cx| {
+                    state.toggle_space_expansion(id);
+                    cx.notify();
+                });
+            }
+        })
+        .child(
+            div()
+                .w(px_len(LEADING_SLOT))
+                .flex_shrink_0()
+                .flex()
+                .justify_center()
+                .when_some(status, |slot, status| {
+                    slot.debug_selector(move || format!("sidebar-space-status:{id}:{status}"))
+                })
+                .child(activity_dot(mark, activity.unwrap_or_default())),
+        )
+        .child(
+            utility_label(name, Colors::fg_secondary(&theme))
+                .debug_selector(|| "sidebar-space-title".into()),
+        )
+        .child(
+            div()
+                .debug_selector(move || format!("sidebar-space-count:{id}:{count}"))
+                .flex_shrink_0()
+                .whitespace_nowrap()
+                .fx_role(TextRole::MonoSmall)
+                .text_color(Colors::fg_tertiary(&theme))
+                .child(SharedString::from(count.to_string())),
+        )
+        .child(
+            div()
+                .w(px_len(Spacing::LG))
+                .flex_shrink_0()
+                .flex()
+                .justify_center()
+                .child(
+                    if expanded {
+                        Icon::CHEVRON_DOWN
+                    } else {
+                        Icon::CHEVRON_RIGHT
+                    }
+                    .render(
+                        IconSize::Micro,
+                        Colors::fg_tertiary(&theme),
+                        &theme,
+                    ),
+                ),
+        )
+        .child(revealed_on_hover(
+            icon_button(
+                IconButtonProps::new(Icon::ELLIPSIS, "Space actions")
+                    .small()
+                    .ghost()
+                    .enabled(interactive),
+                move |event, _, cx| {
+                    cx.stop_propagation();
+                    let layer = state.read(cx).menu_layer.clone();
+                    layer.update(cx, |layer, cx| {
+                        let owner = format!("space:{id}");
+                        if layer.is_owner(&owner) {
+                            layer.dismiss();
+                        } else {
+                            layer.open_at(menu.clone(), owner, event.position());
+                        }
+                        cx.notify();
+                    });
+                },
+            ),
+            ROW_GROUP,
+            pinned,
+        ));
+    if !interactive {
+        return row.into_any_element();
+    }
+    context_region(&registry, owner, Some(context_menu), row).into_any_element()
+}
+
+/// What each folded space's header says of its threads: waiting when one
+/// waits on the reader, here or in another app, and running when one runs.
+///
+/// Only a thread with a runner, a loaded transcript or a wait reported from
+/// another app can be doing either, so those are asked, once each, and the
+/// work follows them rather than the threads the spaces hold.
+fn space_activity(app: &AppState, listed: &RecordIndex) -> HashMap<Uuid, ActivityState> {
+    let mut activity = HashMap::new();
+    if listed.space_of.is_empty() {
+        return activity;
+    }
+    let live: HashSet<Uuid> = app
+        .runners
+        .keys()
+        .chain(app.conversations.keys())
+        .chain(app.waiting_elsewhere_threads())
+        .filter(|id| listed.space_of.contains_key(id))
+        .copied()
+        .collect();
+    for id in live {
+        // Read before the conversation is locked, as a thread row does: both
+        // lock it, and the lock is not reentrant.
+        let busy = app.is_thread_busy(id);
+        let elsewhere = app.waiting_elsewhere(id).map(str::to_owned);
+        let phase = app.conversation_by_agent(id).map(|conversation| {
+            conversation
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .phase()
+        });
+        let (state, _) = crate::thread_presentation::activity(
+            phase,
+            busy,
+            fx_core::AgentExecutionState::Idle,
+            elsewhere.as_deref(),
+        );
+        let space = listed.space_of[&id];
+        match state {
+            ActivityState::Waiting => {
+                activity.insert(space, ActivityState::Waiting);
+            }
+            ActivityState::Running => {
+                activity.entry(space).or_insert(ActivityState::Running);
+            }
+            _ => {}
+        }
+    }
+    activity
 }
 
 /// What the sync row's tooltip says: each warning once, and no more of them
@@ -875,13 +1165,15 @@ impl SearchCache {
     }
 }
 
-/// The row under a long list that reveals its next page.
+/// The row under a long list that reveals its next page. `page` is the
+/// project or space the list is kept by.
 fn show_more_row(
     state: Entity<AppState>,
-    project_id: Uuid,
+    page: Uuid,
     query: ThreadQuery,
     remaining: usize,
     interactive: bool,
+    indent: f32,
 ) -> AnyElement {
     let theme = global::current();
     utility_row(Some(Icon::CHEVRON_DOWN.render(
@@ -889,12 +1181,11 @@ fn show_more_row(
         Colors::fg_tertiary(&theme),
         &theme,
     )))
-    .id(SharedString::from(format!(
-        "show-more-threads:{project_id}"
-    )))
-    .debug_selector(move || format!("sidebar-show-more:{project_id}"))
+    .id(SharedString::from(format!("show-more-threads:{page}")))
+    .debug_selector(move || format!("sidebar-show-more:{page}"))
     .h(px(THREAD_ROW_HEIGHT))
     .flex_shrink_0()
+    .pl(px_len(Spacing::SM + indent))
     .pr(px_len(Spacing::SM))
     .cursor_pointer()
     .rounded(px_len(Radii::SM))
@@ -904,7 +1195,7 @@ fn show_more_row(
             return;
         }
         state.update(cx, |state, cx| {
-            state.sidebar.show_more(project_id, &query);
+            state.sidebar.show_more(page, &query);
             cx.notify();
         });
     })
@@ -936,6 +1227,7 @@ fn thread_row(
     unseen: bool,
     interactive: bool,
     open_menu: Option<&str>,
+    indent: f32,
 ) -> AnyElement {
     let theme = global::current();
     let agent_id = agent.id;
@@ -978,8 +1270,9 @@ fn thread_row(
         .flex()
         .items_center()
         .gap(px_len(Spacing::SM))
-        // Past the project row's disclosure triangle and gutter.
-        .pl(px_len(Spacing::SM))
+        // Past the project row's disclosure triangle and gutter, and a
+        // space's header when it is in one.
+        .pl(px_len(Spacing::SM + indent))
         .pr(px_len(Spacing::XXS))
         .cursor_pointer()
         .rounded(px_len(Radii::SM))
@@ -1003,12 +1296,17 @@ fn thread_row(
                 });
             }
         })
-        .child(provider_status(
-            format!("thread-status:{agent_id}"),
-            provider,
-            activity,
-            activity_label,
-        ))
+        .child(
+            div()
+                .debug_selector(move || format!("sidebar-thread-tile:{agent_id}"))
+                .flex_shrink_0()
+                .child(provider_status(
+                    format!("thread-status:{agent_id}"),
+                    provider,
+                    activity,
+                    activity_label,
+                )),
+        )
         .child(
             div()
                 .debug_selector(|| "sidebar-thread-title".into())
@@ -1088,6 +1386,7 @@ fn project_menu(root_path: &str, busy: bool) -> MenuModel {
             "actions",
             vec![
                 MenuItem::new("new-thread", "New thread"),
+                MenuItem::new("new-space", "New space…"),
                 MenuItem::new("refresh-threads", "Refresh provider threads"),
             ],
         ),
@@ -1117,15 +1416,25 @@ fn project_menu(root_path: &str, busy: bool) -> MenuModel {
 fn thread_menu(archived: bool, busy: bool, thread_id: Option<&str>) -> MenuModel {
     let mut sections = vec![MenuSection::new(
         "actions",
-        vec![
-            MenuItem::new("rename", "Rename thread…").enabled(!busy),
-            MenuItem::new("reveal-workspace", "Reveal workspace in Finder"),
-            if archived {
+        [
+            Some(MenuItem::new("rename", "Rename thread…").enabled(!busy)),
+            // Grouping is where a thread is listed, not anything its turn
+            // reads, so a running turn does not disable it. An archived
+            // thread is listed nowhere.
+            (!archived).then(|| MenuItem::new("move-to-space", "Move to space").submenu()),
+            Some(MenuItem::new(
+                "reveal-workspace",
+                "Reveal workspace in Finder",
+            )),
+            Some(if archived {
                 MenuItem::new("unarchive", "Restore thread").enabled(!busy)
             } else {
                 MenuItem::new("archive", "Archive thread").enabled(!busy)
-            },
-        ],
+            }),
+        ]
+        .into_iter()
+        .flatten()
+        .collect(),
     )];
     if let Some(thread_id) = thread_id {
         // Reading an id changes nothing, so a running turn does not disable it.
@@ -1143,6 +1452,213 @@ fn thread_menu(archived: bool, busy: bool, thread_id: Option<&str>) -> MenuModel
         ],
     ));
     MenuModel::new(sections)
+}
+
+/// The accent a space's colour names, if it is one this build draws.
+pub(crate) fn space_accent(name: &str) -> Option<AccentColor> {
+    let name = fx_core::Space::known_color(name)?;
+    AccentColor::ALL
+        .into_iter()
+        .find(|accent| accent.label().eq_ignore_ascii_case(name))
+}
+
+/// The spaces a thread can move to, from its menu's "Move to space": each of
+/// its project's, the one it is in checked, then a new one or none.
+pub(crate) fn space_picker_menu(spaces: &[PersistedSpace], current: Option<Uuid>) -> MenuModel {
+    let current = current.filter(|current| spaces.iter().any(|space| space.space.id == *current));
+    let mut sections = Vec::new();
+    if !spaces.is_empty() {
+        sections.push(MenuSection::new(
+            "spaces",
+            spaces
+                .iter()
+                .map(|space| {
+                    let item = MenuItem::new(
+                        format!("space:{}", space.space.id),
+                        space.space.name.clone(),
+                    )
+                    .selected(current == Some(space.space.id));
+                    if space.space.codex_section.is_some() {
+                        item.subtitle("Codex section")
+                    } else {
+                        item
+                    }
+                })
+                .collect(),
+        ));
+    }
+    sections.push(MenuSection::new(
+        "manage",
+        vec![
+            MenuItem::new("new-space", "New space…"),
+            MenuItem::new("remove-from-space", "Remove from space").enabled(current.is_some()),
+        ],
+    ));
+    MenuModel::new(sections)
+}
+
+/// The actions for a space's header.
+fn space_menu() -> MenuModel {
+    MenuModel::new(vec![
+        MenuSection::new(
+            "actions",
+            vec![
+                MenuItem::new("rename-space", "Rename…"),
+                MenuItem::new("space-colour", "Colour").submenu(),
+            ],
+        ),
+        MenuSection::new(
+            "danger",
+            vec![
+                MenuItem::new("delete-space", "Delete space")
+                    .subtitle("Its threads stay in the project")
+                    .tone(MenuItemTone::Destructive),
+            ],
+        ),
+    ])
+}
+
+/// The colours a space can take, from its header's "Colour": none, or one
+/// of the accents, the current one checked.
+pub(crate) fn space_colour_menu(current: Option<&str>) -> MenuModel {
+    let current = current.and_then(space_accent);
+    let mut items = vec![MenuItem::new("colour:none", "No colour").selected(current.is_none())];
+    items.extend(AccentColor::ALL.into_iter().map(|accent| {
+        MenuItem::new(
+            format!("colour:{}", accent.label().to_lowercase()),
+            accent.label(),
+        )
+        .selected(current == Some(accent))
+    }));
+    MenuModel::new(vec![MenuSection::new("colours", items)])
+}
+
+/// Open `model` where the menu it was chosen from was, for a row that opens
+/// another menu, with its first row highlighted so the keyboard carries on.
+fn open_follow_up(state: &Entity<AppState>, model: MenuModel, owner: String, cx: &mut App) {
+    let layer = state.read(cx).menu_layer.clone();
+    layer.update(cx, |layer, cx| {
+        let mut model = model;
+        model.highlight_first();
+        match layer.last_position() {
+            Some(at) => layer.open_at(model, owner, at),
+            None => layer.open(model, owner),
+        }
+        cx.notify();
+    });
+}
+
+/// Act on the menu rows that make, move between, rename, colour and delete
+/// spaces. Returns whether `chosen` was one of them.
+pub fn dispatch_space_choice(
+    state: &Entity<AppState>,
+    owner: &str,
+    chosen: &str,
+    window: &mut Window,
+    cx: &mut App,
+) -> bool {
+    use crate::thread_actions::{SpaceAction, open_space};
+    let id = |prefix: &str| {
+        owner
+            .strip_prefix(prefix)
+            .and_then(|id| Uuid::parse_str(id).ok())
+    };
+    let project_of =
+        |agent: Uuid, cx: &App| state.read(cx).snapshot_index().project_for_agent(agent);
+    if let Some(agent) = id("thread:") {
+        if chosen != "move-to-space" {
+            return false;
+        }
+        let app = state.read(cx);
+        let Some(project) = project_of(agent, cx) else {
+            return true;
+        };
+        let model = space_picker_menu(
+            app.spaces_of(project),
+            app.thread(agent).and_then(|agent| agent.space),
+        );
+        open_follow_up(state, model, format!("thread-space:{agent}"), cx);
+        return true;
+    }
+    if let Some(agent) = id("thread-space:") {
+        let target = match chosen {
+            "new-space" => {
+                if let Some(project) = project_of(agent, cx) {
+                    open_space(
+                        state.clone(),
+                        SpaceAction::Create {
+                            project,
+                            thread: Some(agent),
+                        },
+                        window,
+                        cx,
+                    );
+                }
+                return true;
+            }
+            "remove-from-space" => None,
+            other => match other
+                .strip_prefix("space:")
+                .and_then(|space| Uuid::parse_str(space).ok())
+            {
+                Some(space) => Some(space),
+                None => return true,
+            },
+        };
+        state.update(cx, |state, cx| {
+            state.move_thread_to_space(agent, target);
+            cx.notify();
+        });
+        return true;
+    }
+    if let Some(project) = id("project:") {
+        if chosen != "new-space" {
+            return false;
+        }
+        open_space(
+            state.clone(),
+            SpaceAction::Create {
+                project,
+                thread: None,
+            },
+            window,
+            cx,
+        );
+        return true;
+    }
+    if let Some(space) = id("space:") {
+        match chosen {
+            "rename-space" => open_space(state.clone(), SpaceAction::Rename { space }, window, cx),
+            "space-colour" => {
+                let current = state
+                    .read(cx)
+                    .space(space)
+                    .and_then(|(_, held)| held.space.color.clone());
+                open_follow_up(
+                    state,
+                    space_colour_menu(current.as_deref()),
+                    format!("space-colour:{space}"),
+                    cx,
+                );
+            }
+            "delete-space" => state.update(cx, |state, cx| {
+                state.delete_space(space);
+                cx.notify();
+            }),
+            _ => {}
+        }
+        return true;
+    }
+    if let Some(space) = id("space-colour:") {
+        if let Some(colour) = chosen.strip_prefix("colour:") {
+            state.update(cx, |state, cx| {
+                state.set_space_color(space, (colour != "none").then_some(colour));
+                cx.notify();
+            });
+        }
+        return true;
+    }
+    false
 }
 
 /// Act on the sidebar's menu rows that write to the clipboard, which
@@ -1851,13 +2367,19 @@ mod tests {
     }
 
     #[test]
-    fn running_threads_allow_only_copying_the_id_and_revealing_the_workspace() {
+    fn running_threads_allow_only_copying_the_id_revealing_the_workspace_and_grouping() {
+        // Moving between spaces changes where the thread is listed, nothing
+        // its turn reads, so it is the one change a running turn allows.
         for archived in [false, true] {
             let menu = thread_menu(archived, true, Some("thread-123"));
+            assert_eq!(item(&menu, "move-to-space").is_some(), !archived);
             for item in menu.sections().iter().flat_map(|s| &s.items) {
                 assert_eq!(
                     item.enabled,
-                    matches!(item.id.as_str(), "copy-thread-id" | "reveal-workspace"),
+                    matches!(
+                        item.id.as_str(),
+                        "copy-thread-id" | "reveal-workspace" | "move-to-space"
+                    ),
                     "{}",
                     item.id
                 );
@@ -2033,6 +2555,384 @@ mod tests {
         assert_eq!(
             ThreadQuery::parse(" Ação  Café").key(),
             ThreadQuery::parse("acao cafe").key()
+        );
+    }
+
+    /// A seeded project with `spaces` spaces made through the state, and
+    /// the threads put in them: `(space index, thread index)` pairs. The
+    /// spaces named in `folded` start folded.
+    fn with_spaces(
+        test: &mut TestAppContext,
+        state: &Entity<AppState>,
+        names: &[&str],
+        members: &[(usize, usize)],
+        folded: &[usize],
+        ids: &[Uuid],
+    ) -> Vec<Uuid> {
+        test.update(|cx| {
+            state.update(cx, |state, _| {
+                let project = state.snapshot.active_project_id.unwrap();
+                let spaces: Vec<Uuid> = names
+                    .iter()
+                    .map(|name| state.create_space(project, name, None).unwrap())
+                    .collect();
+                for &(space, thread) in members {
+                    assert!(state.move_thread_to_space(ids[thread], Some(spaces[space])));
+                }
+                for &space in folded {
+                    state.toggle_space_expansion(spaces[space]);
+                }
+                spaces
+            })
+        })
+    }
+
+    /// A selector built at run time, as `debug_bounds` wants one for good.
+    fn selector(text: String) -> &'static str {
+        Box::leak(text.into_boxed_str())
+    }
+
+    fn tile(visual: &mut VisualTestContext, agent: Uuid) -> gpui::Bounds<gpui::Pixels> {
+        visual
+            .debug_bounds(selector(format!("sidebar-thread-tile:{agent}")))
+            .expect("the thread's row is drawn")
+    }
+
+    #[test]
+    fn spaces_group_their_threads_one_level_in_above_the_threads_in_none() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut test = TestAppContext::single();
+        let (state, ids) = seeded(&mut test, AppPaths::at(temp.path()), 5, false);
+        let spaces = with_spaces(
+            &mut test,
+            &state,
+            &["Work", "Folded"],
+            &[(0, 0), (0, 2), (1, 3)],
+            &[1],
+            &ids,
+        );
+        let (_window, mut visual) = tall_sidebar(&mut test, &state);
+
+        let work = visual
+            .debug_bounds(selector(format!("sidebar-space:{}", spaces[0])))
+            .unwrap();
+        let folded = visual
+            .debug_bounds(selector(format!("sidebar-space:{}", spaces[1])))
+            .unwrap();
+        assert!(
+            work.top() < folded.top(),
+            "spaces keep the order they were made in"
+        );
+        // One row's height and role, as the project's other rows.
+        assert_eq!(work.size.height, px(THREAD_ROW_HEIGHT));
+        let in_space = tile(&mut visual, ids[0]);
+        let ungrouped = tile(&mut visual, ids[1]);
+        assert!(work.bottom() <= in_space.top());
+        assert!(
+            folded.bottom() <= ungrouped.top(),
+            "threads in no space follow"
+        );
+        assert_eq!(in_space.left() - ungrouped.left(), px(SPACE_INDENT));
+        // Newest first within the space, as the project orders them.
+        assert!(in_space.top() < tile(&mut visual, ids[2]).top());
+        // The name starts where a thread's title does.
+        let title = visual.debug_bounds("sidebar-space-title").unwrap();
+        assert_eq!(
+            title.left(),
+            visual.debug_bounds("sidebar-thread-title").unwrap().left()
+        );
+        assert!(
+            visual
+                .debug_bounds(selector(format!("sidebar-space-count:{}:2", spaces[0])))
+                .is_some()
+        );
+        assert!(
+            visual
+                .debug_bounds(selector(format!("sidebar-space-count:{}:1", spaces[1])))
+                .is_some()
+        );
+
+        // A folded space's threads are clipped, and offer no menu.
+        let regions = thread_regions(&test, &state);
+        for (index, listed) in [(0, true), (1, true), (2, true), (3, false), (4, true)] {
+            assert_eq!(
+                regions.contains(&format!("thread:{}", ids[index])),
+                listed,
+                "thread {index}"
+            );
+        }
+        let space_regions: Vec<String> = test.read(|cx| {
+            state
+                .read(cx)
+                .context_registry
+                .read(cx)
+                .regions()
+                .iter()
+                .filter(|region| region.owner.starts_with("space:"))
+                .map(|region| region.owner.to_string())
+                .collect()
+        });
+        assert_eq!(space_regions.len(), 2);
+
+        // Clicking the header unfolds it, and saves that it was.
+        visual.simulate_click(folded.center(), Default::default());
+        settle_disclosure(&mut test);
+        assert!(test.read(|cx| state.read(cx).space(spaces[1]).unwrap().1.is_expanded));
+        assert!(thread_regions(&test, &state).contains(&format!("thread:{}", ids[3])));
+    }
+
+    #[test]
+    fn a_search_lists_its_matches_flat_and_reaches_into_folded_spaces() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut test = TestAppContext::single();
+        let (state, ids) = seeded(&mut test, AppPaths::at(temp.path()), 4, false);
+        let spaces = with_spaces(&mut test, &state, &["Folded"], &[(0, 3)], &[0], &ids);
+        // Searched before the window first draws, so a header drawn earlier
+        // cannot linger in the debug bounds.
+        let field = test.read(|cx| state.read(cx).sidebar.search().read(cx).field().clone());
+        test.update(|cx| field.update(cx, |field, cx| field.set_value("thread", cx)));
+        let (_window, mut visual) = tall_sidebar(&mut test, &state);
+        assert!(
+            visual
+                .debug_bounds(selector(format!("sidebar-space:{}", spaces[0])))
+                .is_none()
+        );
+        let regions = thread_regions(&test, &state);
+        assert_eq!(regions.len(), 4, "the folded space's thread included");
+        assert!(regions.contains(&format!("thread:{}", ids[3])));
+        // Flat: the grouped thread at the same inset as the rest.
+        assert_eq!(
+            tile(&mut visual, ids[3]).left(),
+            tile(&mut visual, ids[0]).left()
+        );
+    }
+
+    #[test]
+    fn a_folded_spaces_header_says_when_a_thread_in_it_runs_or_waits() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut test = TestAppContext::single();
+        let (state, ids) = seeded(&mut test, AppPaths::at(temp.path()), 4, false);
+        let spaces = with_spaces(
+            &mut test,
+            &state,
+            &["Busy", "Quiet"],
+            &[(0, 0), (0, 1), (1, 2)],
+            &[0, 1],
+            &ids,
+        );
+        let activity = |test: &TestAppContext| {
+            test.read(|cx| {
+                let state = state.read(cx);
+                let index = state.snapshot_index();
+                space_activity(state, &index.records[0])
+            })
+        };
+        assert!(activity(&test).is_empty());
+        let project = test.read(|cx| state.read(cx).snapshot.active_project_id.unwrap());
+        let phase = |test: &mut TestAppContext, thread: usize, phase| {
+            test.update(|cx| {
+                state.update(cx, |state, _| {
+                    state
+                        .conversation(project, ids[thread])
+                        .lock()
+                        .unwrap()
+                        .set_phase(phase);
+                })
+            })
+        };
+        use fx_agent::conversation::Phase;
+        // A thread in no space says nothing for any space.
+        phase(&mut test, 3, Phase::Running);
+        assert!(activity(&test).is_empty());
+        phase(&mut test, 0, Phase::Running);
+        assert_eq!(
+            activity(&test),
+            HashMap::from([(spaces[0], ActivityState::Running)])
+        );
+        // Waiting outranks running, whichever thread is asked first.
+        phase(&mut test, 1, Phase::WaitingForApproval);
+        assert_eq!(
+            activity(&test),
+            HashMap::from([(spaces[0], ActivityState::Waiting)])
+        );
+        let (_window, mut visual) = tall_sidebar(&mut test, &state);
+        assert!(
+            visual
+                .debug_bounds(selector(format!(
+                    "sidebar-space-status:{}:waiting",
+                    spaces[0]
+                )))
+                .is_some()
+        );
+        assert!(
+            visual
+                .debug_bounds(selector(format!(
+                    "sidebar-space-status:{}:running",
+                    spaces[1]
+                )))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn the_space_menus_offer_what_each_row_can_do() {
+        let root = "/tmp/project";
+        assert!(item(&project_menu(root, false), "new-space").is_some());
+        let menu = thread_menu(false, false, None);
+        assert!(item(&menu, "move-to-space").is_some_and(|item| item.submenu));
+
+        let mut mirrored = fx_core::Space::new("Pinned");
+        mirrored.codex_section = Some("pinned".into());
+        let own = fx_core::Space::new("Mine");
+        let spaces = [
+            PersistedSpace::new(own.clone()),
+            PersistedSpace::new(mirrored.clone()),
+        ];
+        let picker = space_picker_menu(&spaces, Some(own.id));
+        let mine = item(&picker, &format!("space:{}", own.id)).unwrap();
+        assert!(mine.selected);
+        assert_eq!(mine.title, "Mine");
+        assert_eq!(
+            item(&picker, &format!("space:{}", mirrored.id))
+                .unwrap()
+                .subtitle
+                .as_deref(),
+            Some("Codex section")
+        );
+        assert!(item(&picker, "new-space").is_some());
+        assert!(item(&picker, "remove-from-space").unwrap().enabled);
+        // In none, or in one this build does not hold: nothing to leave.
+        for current in [None, Some(Uuid::new_v4())] {
+            let picker = space_picker_menu(&spaces, current);
+            assert!(!item(&picker, "remove-from-space").unwrap().enabled);
+            assert!(
+                picker
+                    .sections()
+                    .iter()
+                    .flat_map(|section| &section.items)
+                    .all(|item| !item.selected)
+            );
+        }
+        // With no spaces yet, only a new one.
+        let empty = space_picker_menu(&[], None);
+        assert_eq!(empty.sections().len(), 1);
+
+        let header = space_menu();
+        assert!(item(&header, "rename-space").is_some());
+        assert!(item(&header, "space-colour").is_some_and(|item| item.submenu));
+        assert_eq!(
+            item(&header, "delete-space").unwrap().tone,
+            MenuItemTone::Destructive
+        );
+
+        let colours = space_colour_menu(Some("Rose"));
+        assert!(item(&colours, "colour:rose").unwrap().selected);
+        assert!(!item(&colours, "colour:none").unwrap().selected);
+        assert!(
+            item(&space_colour_menu(None), "colour:none")
+                .unwrap()
+                .selected
+        );
+        assert!(
+            item(&space_colour_menu(Some("teal")), "colour:none")
+                .unwrap()
+                .selected
+        );
+    }
+
+    #[test]
+    fn a_spaces_colours_are_the_accents_by_name() {
+        assert_eq!(fx_core::Space::COLORS.len(), AccentColor::ALL.len());
+        for (name, accent) in fx_core::Space::COLORS.iter().zip(AccentColor::ALL) {
+            assert_eq!(space_accent(name), Some(accent));
+            // The spelling the accent saves as, so one list names both.
+            assert_eq!(serde_json::to_value(accent).unwrap(), *name);
+        }
+        assert_eq!(space_accent("teal"), None);
+    }
+
+    /// As `a_repaint_does_no_work_that_grows_with_the_threads`, with the
+    /// threads spread over spaces, some folded: the groups come from the
+    /// index, built once, and each draws one page.
+    #[test]
+    fn a_repaint_with_spaces_does_no_work_that_grows_with_the_threads() {
+        const THREADS: usize = 2_000;
+        const SPACES: usize = 8;
+        const EACH: usize = 200;
+        let temp = tempfile::tempdir().unwrap();
+        let mut test = TestAppContext::single();
+        let (state, ids) = seeded(&mut test, AppPaths::at(temp.path()), THREADS, false);
+        let names: Vec<String> = (0..SPACES).map(|i| format!("Space {i}")).collect();
+        let names: Vec<&str> = names.iter().map(String::as_str).collect();
+        // Placed directly, as a sync pass would: one save, not two thousand.
+        let spaces = with_spaces(&mut test, &state, &names, &[], &[6, 7], &ids);
+        test.update(|cx| {
+            state.update(cx, |state, _| {
+                let record = &mut state.snapshot.projects[0];
+                for (at, agent) in record.agents.iter_mut().enumerate().take(SPACES * EACH) {
+                    agent.space = Some(spaces[at / EACH]);
+                }
+                state.save();
+            })
+        });
+        let (_window, visual) = tall_sidebar(&mut test, &state);
+        // Tall enough for every page of every open group.
+        visual.simulate_resize(size(px(Layout::SIDEBAR_WIDTH), px(9000.0)));
+        test.refresh().unwrap();
+        let index = |test: &TestAppContext| test.read(|cx| state.read(cx).snapshot_index());
+        let generation =
+            |test: &TestAppContext| test.read(|cx| state.read(cx).snapshot.generation());
+        let repaint = |test: &mut TestAppContext| {
+            test.update(|cx| state.update(cx, |_, cx| cx.notify()));
+            test.refresh().unwrap();
+        };
+        let built = index(&test);
+        let before = generation(&test);
+        repaint(&mut test);
+        repaint(&mut test);
+        assert!(
+            Rc::ptr_eq(&built, &index(&test)),
+            "a repaint rebuilt the index"
+        );
+        assert_eq!(
+            generation(&test),
+            before,
+            "a repaint borrowed the workspace mutably"
+        );
+        assert_eq!(built.records[0].spaces.len(), SPACES);
+        assert_eq!(built.records[0].ungrouped.len(), THREADS - SPACES * EACH);
+        // A page per open space and one for the rest; the folded two offer
+        // nothing.
+        assert_eq!(
+            thread_regions(&test, &state).len(),
+            (SPACES - 2) * THREAD_PAGE + THREAD_PAGE
+        );
+        // Paging is kept per space.
+        test.update(|cx| {
+            state.update(cx, |state, cx| {
+                let query = state.sidebar.search().read(cx).query(cx);
+                state.sidebar.show_more(spaces[0], &query);
+                cx.notify();
+            })
+        });
+        test.refresh().unwrap();
+        assert_eq!(
+            thread_regions(&test, &state).len(),
+            (SPACES - 2) * THREAD_PAGE + THREAD_PAGE * 2
+        );
+        assert!(Rc::ptr_eq(&built, &index(&test)));
+        // A running turn's update rebuilds nothing either.
+        test.update(|cx| {
+            state.update(cx, |state, cx| {
+                (state.update_sender_for(ids[5]))(crate::session::SessionUpdate::Changed);
+                state.drain_updates();
+                cx.notify();
+            })
+        });
+        test.refresh().unwrap();
+        assert!(
+            Rc::ptr_eq(&built, &index(&test)),
+            "an update rebuilt the index"
         );
     }
 

@@ -2562,6 +2562,12 @@ impl AppState {
     /// What a thread FlowX does not run is waiting for in another app, as its
     /// provider reports it. Only the active project polls, so another
     /// project's mark would be stale and is not reported.
+    /// Every thread a provider reported waiting in another app, whichever
+    /// project it is in: what a folded space's header asks about.
+    pub(crate) fn waiting_elsewhere_threads(&self) -> impl Iterator<Item = &Uuid> {
+        self.waiting_elsewhere.keys()
+    }
+
     pub fn waiting_elsewhere(&self, agent_id: Uuid) -> Option<&str> {
         if self.is_thread_busy(agent_id)
             || self.project_for_agent(agent_id) != self.snapshot.active_project_id

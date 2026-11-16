@@ -625,6 +625,13 @@ impl Render for FlowX {
                 if !layer.read(cx).is_open() {
                     return;
                 }
+                // Right opens the menu a `▸` row stands for, as Return does.
+                let opens_submenu = event.keystroke.key == "right"
+                    && layer
+                        .read(cx)
+                        .model()
+                        .and_then(|model| model.highlighted_item())
+                        .is_some_and(|item| item.submenu);
                 let choice = layer.update(cx, |layer, cx| {
                     match event.keystroke.key.as_str() {
                         "down" => layer.move_highlight(1),
@@ -637,12 +644,19 @@ impl Render for FlowX {
                             cx.notify();
                             return choice;
                         }
+                        "right" if opens_submenu => {
+                            let choice = layer.activate();
+                            cx.notify();
+                            return choice;
+                        }
                         _ => return None,
                     }
                     cx.notify();
                     None
                 });
-                if ["down", "up", "escape", "enter"].contains(&event.keystroke.key.as_str()) {
+                if opens_submenu
+                    || ["down", "up", "escape", "enter"].contains(&event.keystroke.key.as_str())
+                {
                     cx.stop_propagation();
                 }
                 if let Some(choice) = choice
@@ -2132,6 +2146,9 @@ pub fn dispatch_menu_choice(owner: &str, chosen: &str, window: &mut Window, cx: 
     // its first frames.
     if matches!(chosen, "sidebar" | "inspector") {
         shell_action(chosen, cx);
+        return;
+    }
+    if sidebar::dispatch_space_choice(&handle.0, owner, chosen, window, cx) {
         return;
     }
     if sidebar::dispatch_menu_choice(&handle.0, owner, chosen, cx) {

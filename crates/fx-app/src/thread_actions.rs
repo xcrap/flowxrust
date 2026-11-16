@@ -1,4 +1,4 @@
-//! Thread-scoped rename and deletion dialogs.
+//! Thread-scoped rename and deletion dialogs, and naming a space.
 
 use fx_design::components::{
     ButtonStyle, DialogAction, DialogClose, DialogHeader, DialogWidth, NoticeTone, cycle_focus,
@@ -18,10 +18,32 @@ pub enum ThreadAction {
     Delete,
 }
 
+/// What a space's name is asked for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SpaceAction {
+    /// A new space in `project`, which takes `thread` in when one is given:
+    /// "New space…" from a thread's "Move to space".
+    Create {
+        project: Uuid,
+        thread: Option<Uuid>,
+    },
+    Rename {
+        space: Uuid,
+    },
+}
+
+/// What the dialog acts on.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Subject {
+    Thread(Uuid, ThreadAction),
+    Space(SpaceAction),
+}
+
+/// The one name-or-confirm dialog, for a thread or a space. One slot, so
+/// opening either while the other is up is refused as any modal is.
 pub struct ThreadDialog {
     state: Entity<AppState>,
-    agent_id: Uuid,
-    action: ThreadAction,
+    subject: Subject,
     title: String,
     field: Entity<TextField>,
     focus: FocusHandle,
@@ -71,8 +93,7 @@ pub fn open(
         let observation = cx.observe(&field, |_, _, cx| cx.notify());
         ThreadDialog {
             state,
-            agent_id,
-            action,
+            subject: Subject::Thread(agent_id, action),
             title: agent.title,
             field,
             focus: cx.focus_handle(),
@@ -96,12 +117,76 @@ pub fn open(
     focus.focus(window);
 }
 
+/// Ask for a space's name: a new space's, or a new name for one.
+pub fn open_space(state: Entity<AppState>, action: SpaceAction, window: &mut Window, cx: &mut App) {
+    if workspace_ui::has_modal(&state, cx) {
+        return;
+    }
+    let current = match action {
+        SpaceAction::Create { project, .. } => {
+            if state.read(cx).project(project).is_none() {
+                return;
+            }
+            String::new()
+        }
+        SpaceAction::Rename { space } => match state.read(cx).space(space) {
+            Some((_, held)) => held.space.name.clone(),
+            None => return,
+        },
+    };
+    let menu = state.read(cx).menu_layer.clone();
+    menu.update(cx, |menu, cx| {
+        menu.dismiss();
+        cx.notify();
+    });
+    let dialog = cx.new(|cx| {
+        let field = cx.new(|cx| {
+            let mut field = TextField::new(cx)
+                .placeholder("Space name")
+                .max_len(fx_core::Space::MAX_NAME);
+            field.set_value(current.clone(), cx);
+            field
+        });
+        let observation = cx.observe(&field, |_, _, cx| cx.notify());
+        ThreadDialog {
+            state,
+            subject: Subject::Space(action),
+            title: current,
+            field,
+            focus: cx.focus_handle(),
+            cancel_focus: cx.focus_handle(),
+            confirm_focus: cx.focus_handle(),
+            close_focus: cx.focus_handle(),
+            error: None,
+            settled: false,
+            _observation: observation,
+        }
+    });
+    let focus = dialog.read(cx).field.read(cx).focus_handle();
+    workspace_ui::handle(cx).update(cx, |ui, cx| {
+        ui.thread_dialog = Some(dialog);
+        cx.notify();
+    });
+    focus.focus(window);
+}
+
 impl ThreadDialog {
+    fn deleting(&self) -> bool {
+        matches!(self.subject, Subject::Thread(_, ThreadAction::Delete))
+    }
+
     fn can_confirm(&self, cx: &App) -> bool {
-        !self.settled
-            && !self.state.read(cx).is_thread_busy(self.agent_id)
-            && (self.action == ThreadAction::Delete
-                || !self.field.read(cx).value().trim().is_empty())
+        if self.settled {
+            return false;
+        }
+        let named = !self.field.read(cx).value().trim().is_empty();
+        match self.subject {
+            Subject::Thread(agent, action) => {
+                !self.state.read(cx).is_thread_busy(agent)
+                    && (action == ThreadAction::Delete || named)
+            }
+            Subject::Space(_) => named,
+        }
     }
 
     fn close(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -118,11 +203,16 @@ impl ThreadDialog {
             return;
         }
         let title = self.field.read(cx).value().to_string();
+        let subject = self.subject;
         let success = self.state.update(cx, |state, cx| {
             state.save_all(cx);
-            let success = match self.action {
-                ThreadAction::Rename => state.rename_thread(self.agent_id, &title),
-                ThreadAction::Delete => state.delete_thread(self.agent_id),
+            let success = match subject {
+                Subject::Thread(agent, ThreadAction::Rename) => state.rename_thread(agent, &title),
+                Subject::Thread(agent, ThreadAction::Delete) => state.delete_thread(agent),
+                Subject::Space(SpaceAction::Create { project, thread }) => {
+                    state.create_space(project, &title, thread).is_some()
+                }
+                Subject::Space(SpaceAction::Rename { space }) => state.rename_space(space, &title),
             };
             cx.notify();
             success
@@ -130,13 +220,13 @@ impl ThreadDialog {
         if success {
             self.close(window, cx);
         } else {
-            self.error = Some(
-                self.state
-                    .read(cx)
-                    .last_error
-                    .clone()
-                    .unwrap_or_else(|| "This thread is no longer available.".into()),
-            );
+            self.error = Some(self.state.read(cx).last_error.clone().unwrap_or_else(|| {
+                match subject {
+                    Subject::Thread(..) => "This thread is no longer available.",
+                    Subject::Space(_) => "This space could not be saved.",
+                }
+                .into()
+            }));
             cx.notify();
         }
     }
@@ -145,8 +235,14 @@ impl ThreadDialog {
 impl Render for ThreadDialog {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = global::current();
-        let deleting = self.action == ThreadAction::Delete;
+        let deleting = self.deleting();
         let this = cx.entity();
+        let (heading, confirm_label) = match self.subject {
+            Subject::Thread(_, ThreadAction::Delete) => ("Delete thread?", "Delete thread"),
+            Subject::Thread(_, ThreadAction::Rename) => ("Rename thread", "Save"),
+            Subject::Space(SpaceAction::Create { .. }) => ("New space", "Create space"),
+            Subject::Space(SpaceAction::Rename { .. }) => ("Rename space", "Save"),
+        };
         let can_confirm = self.can_confirm(cx);
         let mut body = dialog_body();
         if deleting {
@@ -165,12 +261,7 @@ impl Render for ThreadDialog {
             body = body.child(notice(NoticeTone::Error, error.clone()));
         }
         let (cancel, confirm, close) = (this.clone(), this.clone(), this.clone());
-        let header = DialogHeader::new(if deleting {
-            "Delete thread?"
-        } else {
-            "Rename thread"
-        })
-        .close(
+        let header = DialogHeader::new(heading).close(
             DialogClose::new("Close", move |window, cx| {
                 close.update(cx, |dialog, cx| dialog.close(window, cx));
             })
@@ -184,7 +275,7 @@ impl Render for ThreadDialog {
                 })
                 .focus(&self.cancel_focus),
                 DialogAction::new(
-                    if deleting { "Delete thread" } else { "Save" },
+                    confirm_label,
                     if deleting {
                         ButtonStyle::Danger
                     } else {
@@ -389,6 +480,142 @@ mod tests {
             assert!(workspace_ui::handle(cx).read(cx).thread_dialog.is_none());
             assert_eq!(state.read(cx).snapshot.projects[0].agents.len(), 2);
         });
+    }
+
+    #[test]
+    fn spaces_are_made_moved_into_renamed_coloured_and_deleted_from_their_menus() {
+        use fx_design::components::{MenuItem, MenuModel, MenuSection};
+        let dir = tempfile::tempdir().unwrap();
+        let paths = AppPaths::at(dir.path().join("state"));
+        let mut test = TestAppContext::single();
+        let (state, first, second) = seeded(&mut test, &paths);
+        let project = test.read(|cx| state.read(cx).snapshot.active_project_id.unwrap());
+        let view_state = state.clone();
+        let window = test.add_window(move |_, _| crate::FlowX::new(view_state));
+        test.refresh().unwrap();
+        let choose = |test: &mut TestAppContext, owner: String, chosen: &str| {
+            window
+                .update(test, |_, window, cx| {
+                    crate::dispatch_menu_choice(&owner, chosen, window, cx);
+                })
+                .unwrap();
+            test.refresh().unwrap();
+        };
+        let dialog = |test: &mut TestAppContext| {
+            test.update(|cx| workspace_ui::handle(cx).read(cx).thread_dialog.clone())
+        };
+        let name = |test: &mut TestAppContext, text: &str| {
+            let entity = dialog(test).unwrap();
+            let field = test.read(|cx| entity.read(cx).field.clone());
+            test.update(|cx| field.update(cx, |field, cx| field.set_value(text, cx)));
+            test.refresh().unwrap();
+        };
+        let owner = |test: &TestAppContext| {
+            test.read(|cx| {
+                state
+                    .read(cx)
+                    .menu_layer
+                    .read(cx)
+                    .owner()
+                    .map(str::to_owned)
+            })
+        };
+
+        // From the project's menu, named in the dialog. Unnamed, it waits.
+        choose(&mut test, format!("project:{project}"), "new-space");
+        test.simulate_keystrokes(window.into(), "enter");
+        assert!(dialog(&mut test).is_some());
+        assert!(test.read(|cx| state.read(cx).spaces_of(project).is_empty()));
+        name(&mut test, "Auth");
+        test.simulate_keystrokes(window.into(), "enter");
+        assert!(dialog(&mut test).is_none());
+        let space = test.read(|cx| state.read(cx).spaces_of(project)[0].space.clone());
+        assert_eq!(space.name, "Auth");
+
+        // A thread's "Move to space" opens the picker where its menu was,
+        // and Right opens it as Return does.
+        let at = gpui::point(gpui::px(30.0), gpui::px(60.0));
+        test.update(|cx| {
+            let layer = state.read(cx).menu_layer.clone();
+            layer.update(cx, |layer, cx| {
+                let mut model = MenuModel::new(vec![MenuSection::new(
+                    "actions",
+                    vec![MenuItem::new("move-to-space", "Move to space").submenu()],
+                )]);
+                model.highlight_first();
+                layer.open_at(model, format!("thread:{second}"), at);
+                cx.notify();
+            });
+        });
+        test.refresh().unwrap();
+        test.simulate_keystrokes(window.into(), "right");
+        assert_eq!(owner(&test), Some(format!("thread-space:{second}")));
+        test.read(|cx| {
+            let layer = state.read(cx).menu_layer.read(cx);
+            assert_eq!(layer.position(), Some(at));
+            let picker = layer.model().unwrap();
+            assert_eq!(
+                picker.highlighted(),
+                Some(format!("spaces|space:{}", space.id).as_str()),
+                "the keyboard carries on from the first row"
+            );
+        });
+        test.simulate_keystrokes(window.into(), "enter");
+        assert_eq!(
+            test.read(|cx| state.read(cx).thread(second).unwrap().space),
+            Some(space.id)
+        );
+
+        // "New space…" from the picker makes one and moves the thread in.
+        choose(&mut test, format!("thread-space:{first}"), "new-space");
+        name(&mut test, "Fresh");
+        test.simulate_keystrokes(window.into(), "enter");
+        let fresh = test.read(|cx| state.read(cx).thread(first).unwrap().space.unwrap());
+        assert_ne!(fresh, space.id);
+        choose(
+            &mut test,
+            format!("thread-space:{first}"),
+            "remove-from-space",
+        );
+        assert_eq!(
+            test.read(|cx| state.read(cx).thread(first).unwrap().space),
+            None
+        );
+
+        // The header's menu: renamed in the dialog it fills in, coloured
+        // from the menu its "Colour" opens, and deleted.
+        choose(&mut test, format!("space:{}", space.id), "rename-space");
+        let entity = dialog(&mut test).unwrap();
+        let field = test.read(|cx| entity.read(cx).field.clone());
+        assert_eq!(test.read(|cx| field.read(cx).value().to_string()), "Auth");
+        name(&mut test, "Auth work");
+        test.simulate_keystrokes(window.into(), "enter");
+        choose(&mut test, format!("space:{}", space.id), "space-colour");
+        assert_eq!(owner(&test), Some(format!("space-colour:{}", space.id)));
+        choose(
+            &mut test,
+            format!("space-colour:{}", space.id),
+            "colour:rose",
+        );
+        let saved = Store::new(paths.clone()).load_app().unwrap();
+        let held = &saved.projects[0].spaces[0].space;
+        assert_eq!(held.name, "Auth work");
+        assert_eq!(held.color.as_deref(), Some("rose"));
+        choose(
+            &mut test,
+            format!("space-colour:{}", space.id),
+            "colour:none",
+        );
+        choose(&mut test, format!("space:{}", space.id), "delete-space");
+        let saved = Store::new(paths).load_app().unwrap();
+        assert_eq!(saved.projects[0].spaces.len(), 1, "only Fresh is left");
+        assert_eq!(saved.projects[0].agents.len(), 2, "and both threads");
+        assert!(
+            saved.projects[0]
+                .agents
+                .iter()
+                .all(|agent| agent.space.is_none())
+        );
     }
 
     #[test]
