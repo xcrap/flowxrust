@@ -59,6 +59,7 @@ anything above it.
 | `fx-design` | `Packages/FXDesign` | gpui | The design system: tokens, typography, icons, shared controls. The source of truth for how FlowX looks. |
 | `fx-agent` | `Packages/FXAgent` | fx-core | Providers (Codex, Claude), the conversation engine, streaming, approvals. |
 | `fx-store` | `FlowX/Services` | fx-core | Persistence. Owns the on-disk format and nothing else. |
+| `fx-bridge` | — | fx-core | FlowX's own tools for the agents it runs: `flowx --mcp-server`, the app's socket, tokens. |
 | `fx-term` | `Packages/FXTerminal` | fx-design | Terminal sessions and rendering. Phase 2. |
 | `fx-app` | `FlowX/State`, `FlowX/Views` | all of the above | Application state, the window shell, and every view. |
 | `flowx` | — | fx-app | A `main` that opens the window. Nothing else. |
@@ -186,7 +187,7 @@ before styling a screen ad hoc.
 | `settings` | The preferences vocabulary: a section heading over a group card whose rows (title, description, trailing control) are split by hairlines, the navigation's group label and search field, a breadcrumb, and an on/off `switch`. |
 | `tooltip` | Hover tooltip body. |
 | `menu` | Dropdown and context-menu panels, plus `MenuLayer`, the one-open-menu-at-a-time owner. |
-| `menu_model` | `MenuItem` / `MenuSection` / `MenuModel`, and the highlight and keyboard-navigation rules. |
+| `menu_model` | `MenuItem` / `MenuSection` / `MenuModel`, and the highlight and keyboard-navigation rules. A `MenuItem::submenu` row opens another menu in place, at `MenuLayer::last_position`, since only one menu is open at a time. |
 | `dialog` | Every modal: the dialog shadow on the surface (never on a padded wrapper), one title role, a ghost close, a footer; its `capture_key_down` calls `cycle_focus` first, so Tab and Shift-Tab move between its controls and Space presses the focused one. |
 | `loading` | `loading_spinner(id)` for work whose end FlowX cannot see coming, on the shared beat. |
 | `motion` | `request_activity_frame` and the activity `Beat`: every continuous phase is read from one `Instant`, 12 beats a second (half that in a window that is not key), and an element asks for its next beat only while it is drawn. |
@@ -463,6 +464,37 @@ path, common Git directory and worktree registration. Never fall back to the
 project when a worktree is missing. Reset keeps the checkout while retiring the
 provider session. Worktrees live in the private app data directory, independent
 of conversation cache deletion.
+
+## Spaces
+
+A space is a named, coloured group of a project's threads, drawn as a heading
+in the sidebar with its threads under it; a thread in none is listed after
+them. The project owns its spaces (`PersistedProject::spaces`, in draw order)
+and a thread names its own (`Agent::space`), so moving a thread is one field
+and deleting a space only clears that field on its threads. Spaces are
+grouping, not order: `RecordIndex::visible` stays one flat list in thread
+order, so ⌘1–9 and the palette number threads as before, and the sidebar
+groups them as it draws. The open thread always has a row: moving it into a
+closed space opens that space, and so does opening it from elsewhere (⌘1–9,
+the palette, a restore), as its project already did. `Space::COLORS` is the
+accent names, because `fx-core` cannot see the design system; a sidebar test
+checks the two agree.
+
+Claude has no sections; its projects are folders, which FlowX projects
+already are. Codex files threads in account-wide sections (`thread/list`'s
+`section {id, name, appearance}`), and each project index pass mirrors them,
+read-only, as one space per section in each project that has threads in it
+(`Space::codex_section`). Three rules:
+
+- **The provider moves a thread only when its section changed.** The binding
+  records the section the provider last listed (`PersistedBinding::section`);
+  a listing that differs from it files the thread in that section's space,
+  and one that does not leaves the reader's own placement alone, as an
+  archive does.
+- **A mirror no thread names is removed**; a space the reader made is never
+  removed by a pass.
+- **Nothing is written back to Codex.** Codex's sections are its own
+  account's, and FlowX does not move or rename them.
 
 ## Native history
 
@@ -827,6 +859,44 @@ refused still gets a row: the call it asked about, with the refusal as its
 result, because its own item never reaches this transcript and a silent
 refusal failed the call with nothing on screen to say why.
 
+### FlowX's tools
+
+A thread can be given FlowX's own tools (`AgentConfiguration::flowx_tools`,
+off unless chosen, from the access menu): `list_threads` lists the asking
+thread's project and `read_thread` reads one of its threads' latest prose,
+loaded or from its saved transcript. They are an MCP server, `flowx
+--mcp-server`, which `main` checks for before anything else starts, since
+stdout is the MCP channel in that mode. The server forwards each call over a
+Unix socket to the running app, which answers on the UI thread from app
+state; a thread nothing has loaded is read from disk off it. Checked live
+against Claude Code 2.1.325 and codex-cli 0.167 at Read Only: both found the
+tools, read a sibling thread and answered from it, with no card shown.
+
+- **Each provider is told its own way.** Claude takes
+  `--mcp-config=<json>`, with `=` because the flag takes a list, and never
+  `--strict-mcp-config`, which would drop the user's own servers;
+  `--restricted` still loads it. Codex takes `config` on both `thread/start`
+  and `thread/resume` (FlowX opens a fresh app-server per turn), as one dotted
+  key per server, `mcp_servers.flowx`: the whole `mcp_servers` table would be
+  a claim on every server the user configured.
+- **A call proves which thread asks.** The socket is in a fresh `0700`
+  directory under the temporary directory (a socket path must fit in 104
+  bytes, which app support does not), is `0600`, and is removed on quit. A
+  call is accepted only from the same user and only with the HMAC of the
+  thread it names under a secret made fresh each launch, so one thread's
+  token cannot speak for another and a relaunch retires them all. The token
+  is in Claude's argv, which the same user can read; that user can read the
+  transcripts on disk anyway.
+- **The opt-in and the project are checked on every call**, not at launch:
+  a thread whose tools were turned off is refused although its server still
+  runs, and `read_thread` refuses a thread outside the asker's project.
+- **The tools' names are in one place**, `fx_core::policy::flowx_tools`,
+  which both approval policies read: only those exact names are reads, so
+  Read Only answers them without a card and a lookalike from another server
+  is not one.
+- **The server notices a socket when it starts, not at its first tick**:
+  one removed before that tick was never seen, and the server never exited.
+
 ### What a provider can ask the user
 
 Every request either provider can block on, checked against the real CLIs
@@ -1023,7 +1093,12 @@ Four more, for what stays put while a turn runs:
 Tool output is read from `aggregatedOutput` first, then `output`, `result`,
 `error`, `contentItems`, `changes`, `results`, `agentsStates` — that order is the
 server's, and live turns and restored history share one reader
-(`codex::session::tool_outcome`). Reading only `output`/`result` yields an empty
+(`codex::session::tool_outcome`). Three of those are envelopes and are read
+for their text: an MCP call's `result` is the MCP result (`{content,
+structuredContent, _meta}`), its `error` is `{message}`, and a dynamic
+call's `contentItems` are blocks. Shown as JSON, every Codex MCP row was the
+envelope around its answer. An MCP call is named `mcp__<server>__<tool>`, as
+Claude names one, so both read `server · tool`. Reading only `output`/`result` yields an empty
 result for every real tool call, which then looks trivial and is dropped, so the
 transcript silently loses every tool output. An explicit `null` is not output:
 Codex sends `"error": null` on every successful MCP call.
