@@ -188,7 +188,7 @@ before styling a screen ad hoc.
 | `tooltip` | Hover tooltip body. |
 | `menu` | Dropdown and context-menu panels, plus `MenuLayer`, the one-open-menu-at-a-time owner. |
 | `menu_model` | `MenuItem` / `MenuSection` / `MenuModel`, and the highlight and keyboard-navigation rules. A `MenuItem::submenu` row opens another menu in place, at `MenuLayer::last_position`, since only one menu is open at a time. |
-| `dialog` | Every modal: the dialog shadow on the surface (never on a padded wrapper), one title role, a ghost close, a footer; its `capture_key_down` calls `cycle_focus` first, so Tab and Shift-Tab move between its controls and Space presses the focused one. |
+| `dialog` | Every modal: the dialog shadow on the surface (never on a padded wrapper), one title role, a ghost close, a footer; its `capture_key_down` calls `cycle_focus` first, so Tab and Shift-Tab move between its controls and Space presses the focused one, once (`focusable` blocks the click GPUI adds on the key's release). Choice rows (`choice_row`, given a focus handle) are in that order, and Space chooses one. |
 | `loading` | `loading_spinner(id)` for work whose end FlowX cannot see coming, on the shared beat. |
 | `motion` | `request_activity_frame` and the activity `Beat`: every continuous phase is read from one `Instant`, 12 beats a second (half that in a window that is not key), and an element asks for its next beat only while it is drawn. |
 
@@ -238,8 +238,8 @@ asks for frames only until it settles; closing is instant. A panel slide lays
 the centre out at its widest width for the whole slide and clips it, because
 `gpui::list` drops every row height when its width changes. Reduce Motion is
 read from `NSWorkspace` in `fx-app` (`motion_preference.rs`) at first draw and
-on each activation and stored on the theme: offsets and slides go, spinners
-still, fades stay. State a timer reads back belongs in an app `Global`, never a
+on each activation and stored on the theme: offsets and slides go, the
+sidebar's collapsible sections included, spinners still, fades stay. State a timer reads back belongs in an app `Global`, never a
 thread-local: two test apps on one thread share thread-locals and window ids.
 
 ### Menus
@@ -271,6 +271,9 @@ Two things are deliberately preserved from the original:
   by an ancestor's mask.
 - Pointer and keyboard share one highlight, so pressing a row and then pressing
   an arrow key continues from the pointer rather than from the top of the menu.
+  A row's fill comes from that highlight alone, never a hover fill of its own:
+  a submenu opened under the pointer lit two rows, and Return chose the one
+  the pointer was not on.
 
 Two behaviours are deliberate departures from the Swift original, both because
 GPUI cannot express the original:
@@ -373,6 +376,12 @@ touching that shape directly:
   with everything in view. Put vertical insets on a wrapper. The list needs
   `ListSizingBehavior::Infer` to fit its rows under a `max_h`; the default,
   `Auto`, sizes it from its style alone, which under only a `max_h` is zero.
+- **GPUI clicks a focused element again when Return or Space is released.**
+  A dialog button pressed on key-down was pressed twice, and Return on a
+  focused Cancel withdrew the provider's question; `focusable` in
+  `dialog.rs` blocks the second press.
+- **Any `.cursor()` makes an element re-render as the pointer enters and
+  leaves it**, so counting renders proves nothing about hover.
 
 ## Persistence
 
@@ -523,7 +532,10 @@ tools on.
   Renaming the space renames its lead. Deleting the space keeps the lead as
   an ordinary thread, its brief dropped and its read tools kept. Archiving
   it or Reset hands the role to the next. A Codex-mirrored space is kept
-  while it has a lead.
+  while it has a lead. Every call is checked by that rule too: a second
+  thread naming the space is an ordinary row and no lead. A lead stays in
+  the space it leads, so neither "New space…" from search nor a Codex
+  section moves it, and another space's lead is never a worker.
 - **Only the chevron folds a space.** The rest of the header opens the lead,
   takes the selected fill while it is open, and shows its activity; opening
   a lead never unfolds its space.
@@ -532,6 +544,9 @@ tools on.
   lead alone and checked as one on every call: the server's role hint
   (`FLOWX_MCP_ROLE`) only decides what is listed, and proves nothing. FlowX
   never prompts a lead by itself, and a lead's Stop stops only the lead.
+  Every call also needs the lead's own turn running, and not stopping: a
+  start still making its worktree when the reader pressed Stop was
+  finished afterwards, and ran a thread nobody asked for.
 - **A worker is an ordinary thread in the lead's space** (`spawned_by`),
   with the lead's access, none of FlowX's tools, its own title kept (never
   auto-named), and not selected when it starts. `worktree: true` gives it a
@@ -539,10 +554,18 @@ tools on.
 - **Starts are bounded.** At most `MAX_RUNNING_WORKERS` (4) of a space's
   threads run at once, sends included, checked again on the UI thread when
   the thread is made, so two starts cannot race for the last slot. No new
-  work starts once the provider's usage passes `LIMIT_WARNING_AT`.
+  work starts once the provider's usage passes `LIMIT_WARNING_AT`, or while
+  a refusal for the limit holds; it holds until the window behind it (a
+  full one, or the first to reset) has reset. A start may take 240 s,
+  which every step's own bound fits inside: cut at 150 s, its worktree or
+  thread was made after the lead was told to try again. Making a worker
+  saves the thread and waits on no transcript save, and a prompt to a
+  worker nothing has loaded starts its transcript's read in the
+  background and asks the lead to send again.
 - **A wait is bounded and watches.** At most 240 s, polled off the UI
   thread; a worker blocked on the reader counts as settled, as "waiting",
-  so the lead can say where to answer. Listing, reading and waiting are
+  so the lead can say where to answer. A thread running in the Claude app
+  is running, and takes no prompt. Listing, reading and waiting are
   reads: answered without a card at any level that asks. Starting, sending
   and stopping are each a card there, and Read Only refuses them.
 - **A tool timeout is set per server, never through the environment.**
@@ -915,7 +938,10 @@ command it asked to run failed. Codex names each child as it starts it (a
 accepts only a thread named that way; nothing is guessed. A request that is
 refused still gets a row: the call it asked about, with the refusal as its
 result, because its own item never reaches this transcript and a silent
-refusal failed the call with nothing on screen to say why.
+refusal failed the call with nothing on screen to say why. That holds for a
+sub-agent's MCP approval, which arrives as an elicitation, too. A call FlowX
+refused has one result: Codex still completes its item as `declined`, and
+read as well, every refused command showed "Tool failed" under the refusal.
 
 ### FlowX's tools
 
@@ -951,7 +977,11 @@ tools, read a sibling thread and answered from it, with no card shown.
 - **The tools' names are in one place**, `fx_core::policy::flowx_tools`,
   which both approval policies read: only those exact names are reads, so
   Read Only answers them without a card and a lookalike from another server
-  is not one.
+  is not one. They are reads only in a turn FlowX launched with its own
+  server (`mcp::FlowxServer`), because a user's own server named `flowx`
+  answers to the same names. A Codex approval whose message names no tool
+  is `mcp__<server>__`, never a name a server could compose into one of
+  FlowX's.
 - **The server notices a socket when it starts, not at its first tick**:
   one removed before that tick was never seen, and the server never exited.
 
@@ -1033,7 +1063,13 @@ provider and project, a failed pass clears it, and it is reported for the
 projects that keep polling: the active one every five seconds and every
 expanded one every 30 (`BACKGROUND_INDEX_INTERVAL`). Polling only the active
 project left a thread archived in Codex or Claude listed under every other
-project until it was clicked. Coming back to the window
+project until it was clicked. Read for the active project alone, a thread
+in another expanded project never showed either. A Claude killed mid-turn
+leaves its record saying busy, and macOS reuses pids, so a record older
+than the process now holding its pid is not that process's
+(`record_is_its_process`). While the mark holds, the transcript's last
+group is live ("Working", its unanswered calls spinning), never a turn
+FlowX runs. Coming back to the window
 (`refresh_native_projects`) and expanding a project read it at once. A turn FlowX runs on the thread
 answers for itself. The sidebar row shows Waiting, the title bar's dot turns to
 Waiting for the active thread, and the transcript says where to answer.
@@ -1164,7 +1200,8 @@ server's, and live turns and restored history share one reader
 for their text: an MCP call's `result` is the MCP result (`{content,
 structuredContent, _meta}`), its `error` is `{message}`, and a dynamic
 call's `contentItems` are blocks. Shown as JSON, every Codex MCP row was the
-envelope around its answer. An MCP call is named `mcp__<server>__<tool>`, as
+envelope around its answer. A function call's `output` may be a list of
+`input_*` blocks, read the same way; encrypted content is never shown. An MCP call is named `mcp__<server>__<tool>`, as
 Claude names one, so both read `server · tool`. Reading only `output`/`result` yields an empty
 result for every real tool call, which then looks trivial and is dropped, so the
 transcript silently loses every tool output. An explicit `null` is not output:
@@ -1193,7 +1230,11 @@ conversation rather than kept by the view:
   seconds. A tick changes no row's stamp and the clocks sit on fixed-height
   lines, so it re-measures nothing.
 - **The plan.** `fx-core::policy::TurnPlan` reads Claude's `TodoWrite` and
-  Codex's `update_plan` alike. Codex reports the latter only as
+  Codex's `update_plan` alike. codex-cli 0.167 offers `update_plan` only
+  when its config asks, so every Codex thread is opened with
+  `tools.update_plan` `{enabled: true}` and its developer instructions end
+  with `codex::session::PLAN_INSTRUCTION`; without them no Codex turn
+  showed a plan. Codex reports the plan only as
   `turn/plan/updated`, so the conversation records it as the `update_plan`
   call it stands for, and one checklist card per turn follows the turn's last
   burst of work. Plan calls are not rows or counted actions. Claude Code
@@ -1208,7 +1249,11 @@ conversation rather than kept by the view:
   system prompt ends with `PLAN_INSTRUCTION`, after the thread's own
   instructions, in one `--append-system-prompt`. With it, the same task kept
   a list updated after each step. Read Only keeps `TodoWrite`: it writes
-  only Claude's own list. The Claude desktop app keeps a
+  only Claude's own list. Claude records a conversation's system prompt at
+  its first request and replays it on every resume, whatever a later launch
+  passes, so every turn passes `--system-prompt-snapshot=off`: live, a
+  thread's instructions edited from ALPHA to BETA were answered as ALPHA
+  until then. An unchanged prompt still caches. The Claude desktop app keeps a
   session's plan with its own `mcp__ccd_turn__update_plan`, mostly steps on
   from the last list (`advance`, `done`/`start`, 1-based); the history
   reader folds those into the whole list each left
@@ -1480,7 +1525,15 @@ its own side, because FlowX only hears about what a provider asks:
   back (`READ_ONLY_TOOLS`; `default,Bash` leaves Bash alone). WebFetch stays
   out, because a fetch can carry away what was read. Lists are written with
   `=`, because the flags take lists. 2.1.325 has no `MultiEdit` and warns
-  about a rule naming it.
+  about a rule naming it. Every tool the list offers that Claude asks about
+  passes the read-only classifier (WebSearch, ToolSearch and Agent among
+  them), and a test checks the two agree: offered and then refused, every
+  search failed. A sub-agent's own calls are still asked of FlowX.
+- **Only Read Only shuts out the checkout's own Claude config.** The other
+  levels read user, project and local settings and the checkout's
+  `.claude/agents`, as the CLI does in that folder: live, an agent file
+  there with `permissionMode: acceptEdits` ran `touch` under Supervised
+  with no card. Under `--restricted` the agent was not offered.
 - **`GIT_OPTIONAL_LOCKS=0` is in the environment** (`launch_environment`),
   so a reviewer's `git status` refreshes the index in memory instead of
   writing it beside the author's own `git add`. Porcelain `git diff` ignores
@@ -1518,7 +1571,10 @@ rules, each of which was a bug first:
 - **A row keeps its id across a sync.** The provider's copy of a turn has ids
   of its own, so native sync carries each local message's id onto the matching
   message (`carry_message_ids`), and a splice that finds none of the reader's
-  rows keeps their place counted from the stretch's end. Taking the provider's
+  rows keeps their place counted from the stretch's end. A call is matched by
+  its id wherever it is, because the history orders calls as they finished,
+  or call and result in turn; a prompt of images alone, by its images.
+  Taking the provider's
   ids sent a reader in the turn just finished to the top of the thread and
   closed every disclosure in it. The live reply is keyed per segment for the
   same reason: under one key, a selection in one reply came back over the
@@ -1542,7 +1598,7 @@ every pass, so a fast stream cannot turn it into a frame per delta.
 ### View tests
 
 GPUI's test platform is behind the `test-support` feature, which is enabled from
-`fx-app`'s **dev-dependencies** rather than from the workspace. Adding it to the
+`fx-app`'s and `fx-design`'s **dev-dependencies** rather than from the workspace. Adding it to the
 workspace dependency would pull leak detection and a fake platform into the
 shipped binary.
 

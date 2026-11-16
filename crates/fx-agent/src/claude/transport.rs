@@ -380,7 +380,8 @@ pub const SYSTEM_PROMPT_SNAPSHOT: &str = "--system-prompt-snapshot=off";
 /// With `TodoWrite` offered ([`PLAN_TOOL_ENVIRONMENT`]) but deferred, Claude
 /// Code 2.1.325 never loaded it for a five-step task, and the turn showed no
 /// plan; with this line it loaded it at once and updated the list after each
-/// step, four times in five steps. Codex plans by itself. The Claude desktop
+/// step, four times in five steps. Codex is asked the same in its developer
+/// instructions (`codex::session::PLAN_INSTRUCTION`). The Claude desktop
 /// app's sessions keep one because its own instructions require it.
 pub const PLAN_INSTRUCTION: &str = "When a request takes several steps, keep a task list \
 with the TodoWrite tool from the start (load it with ToolSearch if it is deferred), and \
