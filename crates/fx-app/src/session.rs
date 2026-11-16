@@ -287,7 +287,7 @@ impl TurnRunner {
     /// The same runner as [`Self::start`]: a control shows as a running turn,
     /// can be stopped the same way, and reports through the same updates.
     pub fn start_work(
-        _cx: &mut gpui::App,
+        cx: &mut gpui::App,
         conversation: Arc<Mutex<Conversation>>,
         project_root: String,
         agent: Agent,
@@ -295,6 +295,9 @@ impl TurnRunner {
         approvals: ApprovalPolicy,
         on_update: impl Fn(SessionUpdate) + Send + 'static,
     ) -> Self {
+        // The only thing this runner takes from the app: where FlowX's own
+        // tools are listening, for a thread that opted in to them.
+        let bridge = crate::bridge::BridgeHandle::access(cx);
         let discovery = || {
             RuntimeDiscovery::new(launch_environment(
                 agent.configuration.resolved_access(AgentAccess::default()),
@@ -321,6 +324,7 @@ impl TurnRunner {
             work,
             approvals,
             provider,
+            bridge.as_ref(),
             on_update,
         )
     }
@@ -374,6 +378,9 @@ impl TurnRunner {
     }
 
     /// The single path into a worker, shared by `start` and its test seam.
+    ///
+    /// Every argument is one the tests replace, so none is bundled away.
+    #[allow(clippy::too_many_arguments)]
     fn launch(
         conversation: Arc<Mutex<Conversation>>,
         project_root: String,
@@ -381,8 +388,13 @@ impl TurnRunner {
         work: Work,
         approvals: ApprovalPolicy,
         provider: RuntimeProvider,
+        bridge: Option<&crate::bridge::BridgeAccess>,
         on_update: impl Fn(SessionUpdate) + Send + 'static,
     ) -> Self {
+        let mcp_servers = bridge
+            .and_then(|bridge| bridge.server_for(&agent))
+            .into_iter()
+            .collect();
         let (handle, interrupt) = tokio::sync::mpsc::unbounded_channel();
         let (response_handle, responses) = tokio::sync::mpsc::unbounded_channel();
         let (steer_handle, steers) = tokio::sync::mpsc::unbounded_channel();
@@ -426,6 +438,7 @@ impl TurnRunner {
             model,
             effort,
             system_prompt: agent.configuration.system_prompt.clone(),
+            mcp_servers,
             on_update: Arc::new(Mutex::new(Box::new(on_update))),
             // The job keeps a sender of its own for the length of the run, so
             // the receiver cannot see a closed channel. The UI dropping its
@@ -505,6 +518,7 @@ impl TurnRunner {
             Work::prompt(prompt),
             approvals,
             RuntimeProvider::Codex(provider),
+            None,
             on_update,
         )
     }
@@ -527,6 +541,7 @@ impl TurnRunner {
             work,
             approvals,
             RuntimeProvider::Codex(provider),
+            None,
             on_update,
         )
     }
@@ -580,6 +595,9 @@ struct Job {
     model: String,
     effort: Option<String>,
     system_prompt: Option<String>,
+    /// MCP servers added to the user's own: FlowX's, for a thread that
+    /// opted in to its tools.
+    mcp_servers: Vec<fx_agent::mcp::McpServer>,
     on_update: UpdateSink,
     /// Held for the length of the run so its receivers never close spuriously.
     interrupt: tokio::sync::mpsc::UnboundedSender<()>,
@@ -706,13 +724,14 @@ impl Job {
         let resume = lock(&self.conversation).session_id().map(str::to_string);
 
         let opened = tokio::select! {
-            result = CodexSession::open_with_instructions(
+            result = CodexSession::open_with_servers(
             transport,
             resume.as_deref(),
             self.access,
             &self.project_root,
             self.approvals,
             self.system_prompt.as_deref(),
+            &self.mcp_servers,
         ) => result,
             _ = interrupts.recv() => return self.cancel_before_start(),
         };
@@ -922,6 +941,7 @@ impl Job {
             system_prompt: self.system_prompt.clone(),
             access: Some(self.access),
             resume_session_id: resume.clone(),
+            mcp_servers: self.mcp_servers.clone(),
             ..Default::default()
         };
         let mut args = spec.arguments.clone();
@@ -1343,13 +1363,14 @@ impl Job {
             Err(error) => return self.fail(HANDSHAKE_FAILED, error.to_string()),
         };
         let opened = tokio::select! {
-            result = CodexSession::open_with_instructions(
+            result = CodexSession::open_with_servers(
                 transport,
                 resume.as_deref(),
                 self.access,
                 &self.project_root,
                 self.approvals,
                 self.system_prompt.as_deref(),
+                &self.mcp_servers,
             ) => result,
             _ = interrupts.recv() => return self.cancel_before_start(),
         };
@@ -2973,11 +2994,24 @@ for worker in workers: worker.join()
             discovery: RuntimeDiscovery,
         ) -> (TurnRunner, Recorder) {
             let mut agent = Agent::new("Claude");
-            agent.configuration.provider_id = Some("claude".into());
+            agent.configuration.agent_access = Some(access);
             agent.configuration.model_id = Some(model.into());
+            self.start_agent(conversation, prompt, agent, approvals, discovery, None)
+        }
+
+        /// A turn for this thread, with FlowX's bridge listening or not.
+        fn start_agent(
+            &self,
+            conversation: &Arc<Mutex<Conversation>>,
+            prompt: &str,
+            mut agent: Agent,
+            approvals: ApprovalPolicy,
+            discovery: RuntimeDiscovery,
+            bridge: Option<&crate::bridge::BridgeAccess>,
+        ) -> (TurnRunner, Recorder) {
+            agent.configuration.provider_id = Some("claude".into());
             agent.configuration.effort = Some("high".into());
             agent.configuration.system_prompt = Some("fixture instructions".into());
-            agent.configuration.agent_access = Some(access);
             let provider = RuntimeProvider::Claude {
                 discovery,
                 spec: BinarySpec::new("claude", "Claude Code", vec![FakeServer::python().unwrap()])
@@ -2992,6 +3026,7 @@ for worker in workers: worker.join()
                 Work::prompt(prompt),
                 approvals,
                 provider,
+                bridge,
                 move |update| sink.record(update),
             );
             (runner, recorder)
@@ -3031,6 +3066,7 @@ for worker in workers: worker.join()
                 model: "fixture-model".into(),
                 effort: None,
                 system_prompt: None,
+                mcp_servers: Vec::new(),
                 on_update: Arc::new(Mutex::new(Box::new(on_update))),
                 interrupt,
                 responses,
@@ -3533,6 +3569,120 @@ for worker in workers: worker.join()
     }
 
     #[test]
+    fn claude_is_given_flowx_s_tools_only_for_a_thread_that_opted_in() {
+        let bridge_dir = tempfile::tempdir().unwrap();
+        let bridge = crate::bridge::test_access(bridge_dir.path());
+        for (opted, access) in [
+            (Some(true), AgentAccess::Supervised),
+            // Read Only keeps them: `--restricted` still loads `--mcp-config`.
+            (Some(true), AgentAccess::ReadOnly),
+            (None, AgentAccess::Supervised),
+            (Some(false), AgentAccess::FullAccess),
+        ] {
+            let Some(server) = ClaudeFixture::new() else {
+                return;
+            };
+            let mut agent = Agent::new("Claude");
+            agent.configuration.flowx_tools = opted;
+            agent.configuration.agent_access = Some(access);
+            let thread = agent.id;
+            let conversation = conversation();
+            let (_runner, recorder) = server.start_agent(
+                &conversation,
+                "hello",
+                agent,
+                ApprovalPolicy::Ask,
+                RuntimeDiscovery::default().without_extra_directories(),
+                Some(&bridge),
+            );
+            recorder.wait_for_end(TURN_BUDGET);
+            let arguments: Vec<String> = server
+                .received()
+                .iter()
+                .find_map(|item| item["args"].as_array().cloned())
+                .expect("the fake records its arguments")
+                .iter()
+                .filter_map(|argument| argument.as_str().map(str::to_owned))
+                .collect();
+            let configs: Vec<&String> = arguments
+                .iter()
+                .filter(|argument| argument.starts_with("--mcp-config"))
+                .collect();
+            if opted != Some(true) {
+                assert!(configs.is_empty(), "{opted:?}: {arguments:?}");
+                continue;
+            }
+            assert_eq!(configs.len(), 1, "{access:?}: {arguments:?}");
+            let config: Value =
+                serde_json::from_str(configs[0].strip_prefix("--mcp-config=").unwrap()).unwrap();
+            let entry = &config["mcpServers"]["flowx"];
+            assert_eq!(entry["args"], serde_json::json!(["--mcp-server"]));
+            assert_eq!(entry["env"][fx_bridge::ENV_THREAD], thread.to_string());
+            if access == AgentAccess::ReadOnly {
+                assert!(arguments.contains(&"--restricted".to_string()));
+            }
+        }
+    }
+
+    #[test]
+    fn codex_opens_its_thread_with_flowx_s_tools_only_for_a_thread_that_opted_in() {
+        let bridge_dir = tempfile::tempdir().unwrap();
+        let bridge = crate::bridge::test_access(bridge_dir.path());
+        for opted in [Some(true), None] {
+            let Some(server) = FakeServer::new() else {
+                return;
+            };
+            let Some(provider) = server.provider() else {
+                return;
+            };
+            let mut agent = Agent::new("Codex");
+            agent.configuration.flowx_tools = opted;
+            let thread = agent.id;
+            let recorder = Recorder::default();
+            let sink = recorder.clone();
+            let _runner = TurnRunner::launch(
+                conversation(),
+                "/tmp/project".into(),
+                agent,
+                Work::prompt("hello"),
+                ApprovalPolicy::AllowAll,
+                RuntimeProvider::Codex(provider),
+                Some(&bridge),
+                move |update| sink.record(update),
+            );
+            recorder.wait_for_end(TURN_BUDGET);
+            let (_, opened) = server
+                .thread_calls()
+                .into_iter()
+                .find(|(method, _)| method == "thread/start")
+                .expect("the thread was opened");
+            let config = &opened["config"];
+            if opted.is_none() {
+                assert!(config.is_null(), "{opened}");
+                continue;
+            }
+            let entry = &config["mcp_servers.flowx"];
+            assert_eq!(
+                entry["args"],
+                serde_json::json!(["--mcp-server"]),
+                "{opened}"
+            );
+            assert_eq!(entry["env"][fx_bridge::ENV_THREAD], thread.to_string());
+            assert_eq!(
+                entry["env"][fx_bridge::ENV_TOKEN],
+                bridge
+                    .server_for(&{
+                        let mut agent = Agent::with_id(thread, "Codex");
+                        agent.configuration.flowx_tools = Some(true);
+                        agent
+                    })
+                    .unwrap()
+                    .env[fx_bridge::ENV_TOKEN]
+            );
+        }
+    }
+
+    #[test]
     fn claude_fails_the_turn_when_an_answer_cannot_be_delivered() {
         // An answer that failed to write left its request open: the panel's
         // buttons stayed disabled and nothing would ever clear them.
@@ -3706,6 +3856,7 @@ for worker in workers: worker.join()
                 model: "fixture-model".into(),
                 effort: None,
                 system_prompt: None,
+                mcp_servers: Vec::new(),
                 on_update: Arc::new(Mutex::new(Box::new(move |update| {
                     let _ = updates.send(update);
                 }))),

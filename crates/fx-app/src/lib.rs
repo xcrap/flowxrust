@@ -14,6 +14,7 @@ pub mod approvals;
 mod archived_chats;
 mod attachments;
 mod auto_title;
+pub mod bridge;
 mod claude_session_lease;
 pub mod command_palette;
 pub mod commands;

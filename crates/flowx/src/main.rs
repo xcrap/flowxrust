@@ -46,6 +46,7 @@ fn main() -> ExitCode {
 
             let state = cx.new(|cx| AppState::restore(paths, cx));
             fx_app::AppHandle::install(state.clone(), cx);
+            fx_app::bridge::start(state.clone(), cx);
 
             if let Err(error) = open_window(state, cx) {
                 tracing::error!(%error, "could not open the FlowX window");

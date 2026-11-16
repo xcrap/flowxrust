@@ -193,6 +193,9 @@ pub fn bar(state: &Entity<AppState>, cx: &mut App) -> AnyElement {
                 vec![MenuItem::new("__refresh-models", "Refresh models")],
             ));
         }
+        if field == "access" {
+            sections.push(flowx_tools_section(&agent));
+        }
         let trigger = MenuTrigger::new(
             MenuModel::new(sections),
             SharedString::from(owner.clone()),
@@ -222,6 +225,22 @@ pub fn bar(state: &Entity<AppState>, cx: &mut App) -> AnyElement {
             }),
         )
         .into_any_element()
+}
+
+/// The access menu's item that turns FlowX's own tools on or off for the
+/// thread. Beside access because it is what the thread may do: with it on,
+/// the thread's agent can list and read the project's other threads.
+const FLOWX_TOOLS_ITEM: &str = "__flowx-tools";
+
+fn flowx_tools_section(agent: &Agent) -> MenuSection {
+    MenuSection::new(
+        "flowx",
+        vec![
+            MenuItem::new(FLOWX_TOOLS_ITEM, "FlowX tools")
+                .subtitle("Let the agent list and read this project's threads")
+                .selected(agent.configuration.uses_flowx_tools()),
+        ],
+    )
 }
 
 pub fn apply(state: &Entity<AppState>, owner: &str, chosen: &str, cx: &mut App) {
@@ -269,8 +288,11 @@ pub fn apply(state: &Entity<AppState>, owner: &str, chosen: &str, cx: &mut App) 
                     return;
                 }
                 let system_prompt = agent.configuration.system_prompt.take();
+                let flowx_tools = agent.configuration.flowx_tools.take();
                 agent.configuration = provider_defaults.expect("validated provider defaults");
                 agent.configuration.system_prompt = system_prompt;
+                // Both providers take the tools; switching keeps the choice.
+                agent.configuration.flowx_tools = flowx_tools;
             }
             "model" if models(&effective).iter().any(|(id, _)| id == chosen) => {
                 agent.configuration.model_id = Some(chosen.into());
@@ -286,6 +308,11 @@ pub fn apply(state: &Entity<AppState>, owner: &str, chosen: &str, cx: &mut App) 
             }
             "effort" if efforts(&effective).iter().any(|id| id == chosen) => {
                 agent.configuration.effort = Some(chosen.into())
+            }
+            // Off is unset, as for a thread that never chose: nothing to save.
+            "access" if chosen == FLOWX_TOOLS_ITEM => {
+                agent.configuration.flowx_tools =
+                    (!agent.configuration.uses_flowx_tools()).then_some(true);
             }
             "access" => {
                 let Some(access) = AgentAccess::ALL
@@ -404,6 +431,58 @@ mod tests {
         assert_eq!(config.agent_access, Some(AgentAccess::Supervised));
         assert!(config.effort.is_none());
         assert!(config.model_id.is_none());
+    }
+
+    #[test]
+    fn flowx_tools_toggle_from_the_access_menu_and_survive_a_restart_and_a_provider_switch() {
+        let test = gpui::TestAppContext::single();
+        let dir = tempfile::tempdir().unwrap();
+        let paths = AppPaths::at(dir.path().join("state"));
+        let first = Agent::new("First");
+        let second = Agent::new("Second");
+        Store::new(paths.clone())
+            .save_app(&PersistedApp {
+                projects: vec![PersistedProject {
+                    project: Some(Project::new(dir.path().to_str().unwrap())),
+                    agents: vec![first.clone(), second.clone()],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            })
+            .unwrap();
+        assert!(
+            !flowx_tools_section(&second).items[0].selected,
+            "a thread that never chose is off"
+        );
+        let state = test.update(|cx| cx.new(|cx| AppState::restore(paths.clone(), cx)));
+        let owner = format!("configuration:{}:access", second.id);
+        test.update(|cx| {
+            apply(&state, &owner, FLOWX_TOOLS_ITEM, cx);
+            // The toggle is not an access level: the level is unchanged.
+            assert!(
+                state.read(cx).snapshot.projects[0].agents[1]
+                    .configuration
+                    .agent_access
+                    .is_none()
+            );
+            apply(
+                &state,
+                &format!("configuration:{}:provider", second.id),
+                "claude",
+                cx,
+            );
+        });
+        let saved = Store::new(paths.clone()).load_app().unwrap();
+        let config = &saved.projects[0].agents[1].configuration;
+        assert!(config.uses_flowx_tools());
+        assert_eq!(config.provider_id.as_deref(), Some("claude"));
+        assert!(flowx_tools_section(&saved.projects[0].agents[1]).items[0].selected);
+        // Only the thread it was chosen for.
+        assert!(!saved.projects[0].agents[0].configuration.uses_flowx_tools());
+
+        test.update(|cx| apply(&state, &owner, FLOWX_TOOLS_ITEM, cx));
+        let saved = Store::new(paths).load_app().unwrap();
+        assert_eq!(saved.projects[0].agents[1].configuration.flowx_tools, None);
     }
 
     #[test]
