@@ -146,10 +146,10 @@ for line in sys.stdin:
                   "params": {"turn": {"id": "turn-1", "status": "interrupted"}}})
         elif prompt in ("interactive-approval", "interactive-question", "foreign-request",
                         "subagent-request", "mcp-tool-approval", "flowx-tool-approval",
-                        "mcp-form", "mcp-link"):
+                        "subagent-mcp-approval", "mcp-form", "mcp-link"):
             send({"jsonrpc": "2.0", "method": "turn/started",
                   "params": {"threadId": thread, "turn": {"id": "turn-1"}}})
-            if prompt == "subagent-request":
+            if prompt in ("subagent-request", "subagent-mcp-approval"):
                 # The turn names the sub-agent it started, as Codex 0.164 does;
                 # the sub-agent then asks under its own thread and turn.
                 send({"jsonrpc": "2.0", "method": "item/started", "params": {
@@ -157,10 +157,13 @@ for line in sys.stdin:
                         "type": "subAgentActivity", "id": "activity-1", "kind": "started",
                         "agentThreadId": "child-thread", "agentPath": "/root/worker",
                         "model": None, "reasoningEffort": None}}})
-            if prompt == "mcp-tool-approval":
-                # Codex 0.164's approval for an MCP tool call, captured live.
+            if prompt in ("mcp-tool-approval", "subagent-mcp-approval"):
+                # Codex 0.164's approval for an MCP tool call, captured live;
+                # a sub-agent's asks under its own thread and turn.
+                origin = (("child-thread", "child-turn") if prompt == "subagent-mcp-approval"
+                          else (thread, "turn-1"))
                 method = "mcpServer/elicitation/request"
-                params = {"threadId": thread, "turnId": "turn-1", "serverName": "probe",
+                params = {"threadId": origin[0], "turnId": origin[1], "serverName": "probe",
                           "mode": "form", "_meta": {"codex_approval_kind": "mcp_tool_call",
                           "persist": ["session", "always"],
                           "tool_description": "Asks the user for their name.",

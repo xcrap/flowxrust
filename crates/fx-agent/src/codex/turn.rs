@@ -519,9 +519,15 @@ impl CodexSession {
                             // call has not run yet, and an empty result here
                             // marked it finished while it was still running.
                             // Codex reports the real one when it is done.
+                            //
+                            // An MCP tool approval carries no call id, so in
+                            // this turn's thread the outcome is left to the
+                            // call's own item. A sub-agent's item stays in its
+                            // own thread: with no row of FlowX's, a refused
+                            // sub-agent MCP call showed nothing at all.
                             if let ProviderEvent::Approval(a) = event
                                 && !approved
-                                && request.elicitation.is_none()
+                                && (request.elicitation.is_none() || !ours)
                             {
                                 // A sub-agent's call is a row in its own
                                 // thread, not here, so the refusal brings it.
@@ -2134,6 +2140,60 @@ mod tests {
             })
             .expect("the refusal is its result");
         assert!(call < refusal, "{events:?}");
+    }
+
+    #[tokio::test]
+    async fn a_sub_agents_mcp_call_refused_by_policy_has_a_row_to_finish() {
+        // A sub-agent's MCP tool approval is an elicitation, and only a
+        // request that was not one brought its row: under Read Only, or with
+        // nobody to ask, the refused call showed nothing.
+        for policy in [ApprovalPolicy::DenyUnlessReadOnly, ApprovalPolicy::DenyAll] {
+            let Some(server) = FakeServer::new() else {
+                return;
+            };
+            let mut session = CodexSession::open(
+                Transport::start(server.launch(), "FlowX", "test")
+                    .await
+                    .expect("started"),
+                None,
+                AgentAccess::ReadOnly,
+                "/tmp",
+                policy,
+            )
+            .await
+            .expect("a session");
+            let thread_id = session.thread_id().to_string();
+            let mut events = Vec::new();
+            session
+                .run_turn(
+                    &TurnRequest::new(&thread_id, "subagent-mcp-approval", "/tmp"),
+                    |event| events.push(event),
+                )
+                .await
+                .expect("the turn ran");
+            assert_eq!(
+                echoed_response(&events)["result"]["action"],
+                "decline",
+                "{policy:?}"
+            );
+            let (call, id) = events
+                .iter()
+                .enumerate()
+                .find_map(|(index, event)| match event {
+                    ProviderEvent::ToolUse { id, name, .. } if name == "mcp__probe__ask_name" => {
+                        Some((index, id.clone()))
+                    }
+                    _ => None,
+                })
+                .unwrap_or_else(|| panic!("{policy:?}: the call has no row: {events:?}"));
+            let refusal = events
+                .iter()
+                .position(|event| {
+                    matches!(event, ProviderEvent::ToolResult { id: result, is_error: true, .. } if *result == id)
+                })
+                .unwrap_or_else(|| panic!("{policy:?}: the refusal is not its result: {events:?}"));
+            assert!(call < refusal, "{policy:?}: {events:?}");
+        }
     }
 
     #[test]
