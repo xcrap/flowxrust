@@ -284,6 +284,15 @@ impl TurnRequest {
             "--include-partial-messages".to_string(),
             "--thinking-display".to_string(),
             THINKING_DISPLAY.to_string(),
+            // Claude records a conversation's system prompt at its first
+            // request and replays it on every resume, whatever a later
+            // launch passes: live against 2.1.325, a thread's instructions
+            // edited from ALPHA to BETA were answered as ALPHA, and a thread
+            // started before the plan line never got it. Off, the prompt is
+            // the one this launch gives. Unchanged, it is still a cache hit
+            // (28 tokens written); changed, it costs one rewrite. It has to
+            // be on every turn: one turn without it replays the old record.
+            SYSTEM_PROMPT_SNAPSHOT.to_string(),
             // The thread's own instructions, then the plan FlowX asks for,
             // which every turn carries: one flag, because a second
             // `--append-system-prompt` is not a second instruction.
@@ -361,6 +370,9 @@ pub const THINKING_DISPLAY: &str = "summarized";
 /// commands for FlowX to judge, sub-agents, and questions to the reader.
 pub const READ_ONLY_TOOLS: &str =
     "Bash,Read,Grep,Glob,Agent,ToolSearch,WebSearch,AskUserQuestion,TodoWrite";
+
+/// Every turn's system prompt is the one it was launched with.
+pub const SYSTEM_PROMPT_SNAPSHOT: &str = "--system-prompt-snapshot=off";
 
 /// What every Claude turn is asked beyond the thread's own instructions: to
 /// keep its plan where FlowX draws it.
@@ -1424,6 +1436,7 @@ mod tests {
             "--include-partial-messages",
             "--thinking-display",
             "summarized",
+            SYSTEM_PROMPT_SNAPSHOT,
             "--append-system-prompt",
             PLAN_INSTRUCTION,
         ]

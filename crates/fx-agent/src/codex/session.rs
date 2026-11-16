@@ -126,6 +126,20 @@ fn resolve_mention(token: &str, working_directory: &Path) -> Option<PathBuf> {
     .find(|path| path.is_file())
 }
 
+/// What every Codex thread is asked beyond its own instructions: to keep its
+/// plan where FlowX draws it, as every Claude turn is.
+///
+/// codex-cli 0.167 offers no `update_plan` unless asked
+/// (`tools.update_plan`, [`PLAN_TOOL_CONFIG`]): asked whether it had one,
+/// gpt-6-astra said no, and no Codex turn ever showed a plan. Offered and
+/// asked to use it, it kept a list updated after each step.
+pub const PLAN_INSTRUCTION: &str = "When a request takes several steps, keep a plan with the \
+     update_plan tool from the start, and update it as each step finishes, so the person can \
+     follow the work.";
+
+/// The config key that offers Codex's plan tool, and its value.
+pub const PLAN_TOOL_CONFIG: &str = "tools.update_plan";
+
 /// Parameters for `thread/start` or `thread/resume`.
 pub fn thread_params(
     thread_id: Option<&str>,
@@ -156,13 +170,15 @@ pub fn thread_params_with_servers(
     if let Some(id) = thread_id {
         params["threadId"] = json!(id);
     }
-    if let Some(prompt) = system_prompt.filter(|p| !p.is_empty()) {
-        params["developerInstructions"] = json!(prompt);
-    }
-    let config = crate::mcp::codex_config(mcp_servers);
-    if !config.is_empty() {
-        params["config"] = Value::Object(config);
-    }
+    // The thread's own instructions, then the plan FlowX asks for.
+    params["developerInstructions"] = json!(match system_prompt.filter(|p| !p.trim().is_empty()) {
+        Some(prompt) => format!("{prompt}\n\n{PLAN_INSTRUCTION}"),
+        None => PLAN_INSTRUCTION.to_owned(),
+    });
+    // One dotted key each, so nothing else of the user's config is claimed.
+    let mut config = crate::mcp::codex_config(mcp_servers);
+    config.insert(PLAN_TOOL_CONFIG.into(), json!({"enabled": true}));
+    params["config"] = Value::Object(config);
     params
 }
 
@@ -1700,12 +1716,24 @@ mod tests {
     }
 
     #[test]
-    fn a_system_prompt_becomes_a_developer_instruction() {
+    fn a_system_prompt_becomes_a_developer_instruction_followed_by_the_plan() {
         let params = thread_params(None, AgentAccess::FullAccess, Some("be terse"), "/w");
-        assert_eq!(params["developerInstructions"], "be terse");
-        // An empty prompt must not send an empty instruction.
+        assert_eq!(
+            params["developerInstructions"],
+            format!("be terse\n\n{PLAN_INSTRUCTION}")
+        );
+        // An empty prompt adds no empty paragraph.
         let blank = thread_params(None, AgentAccess::FullAccess, Some(""), "/w");
-        assert!(blank.get("developerInstructions").is_none());
+        assert_eq!(blank["developerInstructions"], PLAN_INSTRUCTION);
+    }
+
+    #[test]
+    fn every_thread_is_offered_codex_s_plan_tool() {
+        // codex-cli 0.167 offers no update_plan unless the config asks.
+        for thread in [None, Some("t1")] {
+            let params = thread_params(thread, AgentAccess::ReadOnly, None, "/w");
+            assert_eq!(params["config"][PLAN_TOOL_CONFIG], json!({"enabled": true}));
+        }
     }
 
     #[test]
@@ -1721,13 +1749,16 @@ mod tests {
                 &[crate::mcp::fixture()],
             );
             let config = params["config"].as_object().expect("a config");
-            assert_eq!(config.keys().collect::<Vec<_>>(), ["mcp_servers.flowx"]);
+            let mut keys: Vec<_> = config.keys().collect();
+            keys.sort();
+            assert_eq!(keys, ["mcp_servers.flowx", PLAN_TOOL_CONFIG]);
             assert_eq!(config["mcp_servers.flowx"]["args"][0], "--mcp-server");
             // The access pairing is untouched by it.
             assert_eq!(params["sandbox"], "read-only");
         }
         let plain = thread_params(None, AgentAccess::FullAccess, None, "/w");
-        assert!(plain.get("config").is_none(), "{plain}");
+        let config = plain["config"].as_object().expect("a config");
+        assert_eq!(config.keys().collect::<Vec<_>>(), [PLAN_TOOL_CONFIG]);
     }
 
     #[test]

@@ -2662,7 +2662,10 @@ mod tests {
         assert_eq!(params["sandboxPolicy"]["type"], "workspaceWrite");
         assert_eq!(
             server.thread_calls()[0].1["developerInstructions"],
-            "fixture instructions"
+            format!(
+                "fixture instructions\n\n{}",
+                fx_agent::codex::session::PLAN_INSTRUCTION
+            )
         );
     }
 
@@ -3777,7 +3780,7 @@ for worker in workers: worker.join()
                 .expect("the thread was opened");
             let config = &opened["config"];
             if opted.is_none() && !lead {
-                assert!(config.is_null(), "{opened}");
+                assert!(config.get("mcp_servers.flowx").is_none(), "{opened}");
                 continue;
             }
             let entry = &config["mcp_servers.flowx"];

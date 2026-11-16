@@ -1254,7 +1254,7 @@ mod tests {
                 .expect("the thread was opened");
             let config = &opened["params"]["config"];
             if servers.is_empty() {
-                assert!(config.is_null(), "{opened}");
+                assert!(config.get("mcp_servers.flowx").is_none(), "{opened}");
             } else {
                 assert_eq!(
                     opened["method"],
