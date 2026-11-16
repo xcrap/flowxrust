@@ -1160,10 +1160,15 @@ fn content_string(value: &Value) -> String {
     if let Some(text) = value.as_str() {
         return text.into();
     }
+    // A `ToolSearch` result names the tools it loaded as `tool_reference`
+    // blocks, which say nothing to the reader: live they are read past,
+    // and read here as JSON, every turn that loaded its plan tool gained a
+    // row of it once the history replaced the live transcript.
     if let Some(blocks) = value.as_array()
-        && blocks
-            .iter()
-            .all(|block| block["type"] == "text" && block["text"].is_string())
+        && blocks.iter().all(|block| {
+            block["type"] == "tool_reference"
+                || block["type"] == "text" && block["text"].is_string()
+        })
     {
         return blocks
             .iter()
@@ -1711,6 +1716,29 @@ mod tests {
         assert!(!record_is_its_process(&record((started - 60) * 1000), pid));
         // Nothing to compare: as before.
         assert!(record_is_its_process(&json!({"pid": pid}), pid));
+    }
+
+    #[test]
+    fn a_tool_search_result_reads_as_the_live_one_does() {
+        // Read as JSON, every turn that loaded its plan tool gained a row of
+        // it once the history replaced the live transcript.
+        assert_eq!(
+            content_string(&json!([{"type": "tool_reference", "tool_name": "TodoWrite"}])),
+            ""
+        );
+        assert_eq!(
+            content_string(&json!([
+                {"type": "text", "text": "Loaded"},
+                {"type": "tool_reference", "tool_name": "TodoWrite"}
+            ])),
+            "Loaded"
+        );
+        // Anything else is still shown rather than lost.
+        let other = json!([{"type": "image", "source": {}}]);
+        assert_eq!(
+            serde_json::from_str::<Value>(&content_string(&other)).unwrap(),
+            other
+        );
     }
 
     #[test]

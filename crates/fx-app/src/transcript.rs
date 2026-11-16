@@ -3130,8 +3130,8 @@ pub(crate) fn apply_menu_choice(owner: &str, chosen: &str, cx: &mut App) {
                 .and_then(|input| clipboard_image(&input));
             match item {
                 Ok(item) => cx.write_to_clipboard(item),
-                // A menu has no room to explain itself, and the preview above
-                // it already says why the image is unavailable.
+                // A menu has no room to explain itself, and the thumbnail
+                // above it says why the image is unavailable on hover.
                 Err(reason) => tracing::info!(reason, "an image could not be copied"),
             }
         }

@@ -17,8 +17,8 @@ use fx_core::{
     Attachment, ConversationImageAssetReference, ConversationMessage, MessageContent, MessageRole,
 };
 use fx_design::components::attachment::{
-    IMAGE_PREVIEW_MAX_WIDTH, attachment_chip, attachment_fallback, image_preview, image_thumbnail,
-    image_thumbnail_size,
+    IMAGE_PREVIEW_MAX_WIDTH, ThumbnailImage, attachment_chip, attachment_fallback, image_preview,
+    image_thumbnail, image_thumbnail_size,
 };
 use fx_design::components::{IconButtonProps, icon_button};
 use fx_design::icon::Icon;
@@ -492,9 +492,10 @@ fn thumbnail_preview(
     loaded: Option<Result<DecodedPreview, &'static str>>,
     theme: &fx_design::theme::Theme,
 ) -> impl IntoElement {
-    let (image, can_open) = match loaded {
-        Some(Ok(preview)) => (Some(preview.image), true),
-        _ => (None, false),
+    let (image, can_open, failed) = match loaded {
+        Some(Ok(preview)) => (ThumbnailImage::Loaded(preview.image), true, None),
+        Some(Err(reason)) => (ThumbnailImage::Failed, false, Some(reason)),
+        None => (ThumbnailImage::Loading, false, None),
     };
     let (width, _) = image_thumbnail_size();
     let hover = Colors::bg_hover(theme);
@@ -518,6 +519,10 @@ fn thumbnail_preview(
                         })
                         .detach();
                 })
+        })
+        // Why it cannot be shown, where the full preview's caption said it.
+        .when_some(failed, |this, reason| {
+            this.tooltip(move |window, cx| fx_design::components::tooltip(reason, window, cx))
         })
         .child(image_thumbnail(image))
 }

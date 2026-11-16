@@ -51,24 +51,42 @@ pub fn image_thumbnail_size() -> (f32, f32) {
     )
 }
 
+/// What a prompt's thumbnail has to show.
+pub enum ThumbnailImage {
+    /// Still decoding: the photo glyph holds the box.
+    Loading,
+    Loaded(Arc<RenderImage>),
+    /// It cannot be shown. A glyph of its own, so it does not read as one
+    /// still on its way; the caller says why in a tooltip.
+    Failed,
+}
+
 /// A prompt's image as a thumbnail: the fixed box of
 /// [`image_thumbnail_size`], filled and cropped, as Claude and the Swift
 /// original draw one. The full image opens on click.
-pub fn image_thumbnail(image: Option<Arc<RenderImage>>) -> AnyElement {
+pub fn image_thumbnail(image: ThumbnailImage) -> AnyElement {
     let theme = global::current();
     let (width, height) = image_thumbnail_size();
-    let body = match image {
-        Some(image) => img(image)
-            .size_full()
-            .object_fit(ObjectFit::Cover)
-            .into_any_element(),
-        None => div()
+    let glyph = |icon: Icon, selector: &'static str| {
+        div()
+            .debug_selector(move || selector.into())
             .size_full()
             .flex()
             .items_center()
             .justify_center()
-            .child(Icon::PHOTO.render(IconSize::Regular, Colors::fg_tertiary(&theme), &theme))
+            .child(icon.render(IconSize::Regular, Colors::fg_tertiary(&theme), &theme))
+            .into_any_element()
+    };
+    let body = match image {
+        ThumbnailImage::Loaded(image) => img(image)
+            .size_full()
+            .object_fit(ObjectFit::Cover)
             .into_any_element(),
+        ThumbnailImage::Loading => glyph(Icon::PHOTO, "attachment.thumbnail-loading"),
+        ThumbnailImage::Failed => glyph(
+            Icon::PHOTO_BADGE_EXCLAMATIONMARK,
+            "attachment.thumbnail-failed",
+        ),
     };
     div()
         .debug_selector(|| "attachment.thumbnail".into())

@@ -5289,6 +5289,16 @@ fn carry_message_ids<'a>(
         if !thought.is_empty() {
             return Some((message.role, format!("thinking:{thought}")));
         }
+        // A prompt of images alone, by how many: under the provider's id
+        // its row and its turn's plan card were keyed anew on every sync.
+        let images = message
+            .content
+            .iter()
+            .filter(|block| block.is_image())
+            .count();
+        if images > 0 {
+            return Some((message.role, format!("images:{images}")));
+        }
         message.content.iter().find_map(|block| match block {
             fx_core::MessageContent::Compaction {
                 trigger,
@@ -5302,16 +5312,36 @@ fn carry_message_ids<'a>(
             _ => None,
         })
     }
-    let local: Vec<_> = local
-        .filter_map(|message| Some((key(message)?, message.id)))
-        .collect();
+    // A call is matched by its id wherever it is, which is unique to it:
+    // the history orders calls as they finished, or call and result in
+    // turn, where the live turn listed parallel calls before their results,
+    // and matched in order the calls took the provider's ids and moved. The
+    // rest, which only their text names, are matched in order.
+    let mut calls: HashMap<(fx_core::MessageRole, String), Uuid> = HashMap::new();
+    let mut ordered = Vec::new();
+    for message in local {
+        let Some(key) = key(message) else {
+            continue;
+        };
+        if key.1.starts_with("tool:") {
+            calls.entry(key).or_insert(message.id);
+        } else {
+            ordered.push((key, message.id));
+        }
+    }
     let mut from = 0;
     for message in &mut native {
         let Some(wanted) = key(message) else {
             continue;
         };
-        if let Some(offset) = local[from..].iter().position(|(key, _)| *key == wanted) {
-            message.id = local[from + offset].1;
+        if wanted.1.starts_with("tool:") {
+            if let Some(id) = calls.remove(&wanted) {
+                message.id = id;
+            }
+            continue;
+        }
+        if let Some(offset) = ordered[from..].iter().position(|(key, _)| *key == wanted) {
+            message.id = ordered[from + offset].1;
             from += offset + 1;
         }
     }
@@ -11667,6 +11697,86 @@ mod native_sync_tests {
             &carried[2].content[0],
             fx_core::MessageContent::ToolUse { input, .. } if input.contains("ls")
         ));
+    }
+
+    #[test]
+    fn a_prompt_of_images_alone_keeps_its_id_through_a_sync() {
+        use fx_core::MessageContent;
+        let image = || MessageContent::Image {
+            data: vec![1, 2, 3],
+            mime_type: "image/png".into(),
+        };
+        let local = [
+            ConversationMessage::new(
+                MessageRole::User,
+                vec![image(), MessageContent::Text { text: "".into() }],
+            ),
+            ConversationMessage::text(MessageRole::Assistant, "A chart."),
+        ];
+        let native = vec![
+            ConversationMessage::new(MessageRole::User, vec![image()]),
+            ConversationMessage::text(MessageRole::Assistant, "A chart."),
+        ];
+        let carried = carry_message_ids(local.iter(), native);
+        let ids: Vec<Uuid> = carried.iter().map(|message| message.id).collect();
+        assert_eq!(ids, [local[0].id, local[1].id]);
+    }
+
+    #[test]
+    fn calls_keep_their_ids_through_a_history_that_orders_them_otherwise() {
+        // Live, parallel calls were listed before their results; the history
+        // interleaves each call with its result. Matched in order, the
+        // second call took the provider's id and its row moved.
+        use fx_core::MessageContent;
+        let call = |id: &str| {
+            ConversationMessage::new(
+                MessageRole::Assistant,
+                vec![MessageContent::ToolUse {
+                    id: id.into(),
+                    name: "Write".into(),
+                    input: "{}".into(),
+                }],
+            )
+        };
+        let result = |id: &str| {
+            ConversationMessage::new(
+                MessageRole::User,
+                vec![MessageContent::ToolResult {
+                    id: id.into(),
+                    content: "ok".into(),
+                    is_error: false,
+                }],
+            )
+        };
+        let local = [
+            ConversationMessage::text(MessageRole::User, "Write both"),
+            call("a"),
+            call("b"),
+            result("a"),
+            result("b"),
+            ConversationMessage::text(MessageRole::Assistant, "Done."),
+        ];
+        let native = vec![
+            ConversationMessage::text(MessageRole::User, "Write both"),
+            call("a"),
+            result("a"),
+            call("b"),
+            result("b"),
+            ConversationMessage::text(MessageRole::Assistant, "Done."),
+        ];
+        let carried = carry_message_ids(local.iter(), native);
+        let ids: Vec<Uuid> = carried.iter().map(|message| message.id).collect();
+        assert_eq!(
+            ids,
+            [
+                local[0].id,
+                local[1].id,
+                local[3].id,
+                local[2].id,
+                local[4].id,
+                local[5].id
+            ]
+        );
     }
 
     #[test]
