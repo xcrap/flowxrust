@@ -15,8 +15,16 @@
 //!   claim on every server the user configured, where the dotted key adds one.
 //!   Codex hands an MCP server only a minimal environment of its own plus the
 //!   entry's `env`, so everything the server needs goes there.
+//!
+//! Both bound each tool call, and both take the bound per server, so a server
+//! whose calls run long says so in its own entry and every other server keeps
+//! the user's setting: Claude's `timeout`, in milliseconds (Claude Code
+//! 2.1.325's stdio schema; it overrides `MCP_TOOL_TIMEOUT` for that server
+//! alone), and Codex's `tool_timeout_sec`, in seconds as a float (codex-cli
+//! 0.167's `McpServerConfig`).
 
 use std::collections::BTreeMap;
+use std::time::Duration;
 
 use serde_json::{Map, Value, json};
 
@@ -30,6 +38,9 @@ pub struct McpServer {
     pub command: String,
     pub args: Vec<String>,
     pub env: BTreeMap<String, String>,
+    /// How long one tool call may take before the provider gives up on it.
+    /// `None` leaves the provider's own default, or the user's.
+    pub tool_timeout: Option<Duration>,
 }
 
 impl McpServer {
@@ -49,6 +60,17 @@ impl McpServer {
             "env": self.env,
         })
     }
+
+    /// The timeout in milliseconds, as Claude reads it. Claude ignores a
+    /// value under a second and falls through to its default, so a shorter
+    /// one is rounded up rather than lost.
+    fn timeout_ms(&self) -> Option<u64> {
+        self.tool_timeout.map(|timeout| {
+            u64::try_from(timeout.as_millis())
+                .unwrap_or(u64::MAX)
+                .max(1_000)
+        })
+    }
 }
 
 /// Claude's `--mcp-config` value for these servers.
@@ -59,6 +81,9 @@ pub fn claude_config(servers: &[McpServer]) -> String {
         .map(|server| {
             let mut entry = server.entry();
             entry["type"] = json!("stdio");
+            if let Some(timeout) = server.timeout_ms() {
+                entry["timeout"] = json!(timeout);
+            }
             (server.name.clone(), entry)
         })
         .collect();
@@ -70,7 +95,15 @@ pub fn codex_config(servers: &[McpServer]) -> Map<String, Value> {
     servers
         .iter()
         .filter(|server| server.has_valid_name())
-        .map(|server| (format!("mcp_servers.{}", server.name), server.entry()))
+        .map(|server| {
+            let mut entry = server.entry();
+            if let Some(timeout) = server.tool_timeout {
+                // A float, as Codex writes it back itself: the key is read as
+                // `Option<f64>` seconds.
+                entry["tool_timeout_sec"] = json!(timeout.as_secs_f64());
+            }
+            (format!("mcp_servers.{}", server.name), entry)
+        })
         .collect()
 }
 
@@ -88,6 +121,7 @@ pub(crate) fn fixture() -> McpServer {
             ("FLOWX_MCP_THREAD".into(), "thread-1".into()),
             ("FLOWX_MCP_TOKEN".into(), "secret".into()),
         ]),
+        tool_timeout: None,
     }
 }
 
@@ -107,6 +141,37 @@ mod tests {
         assert_eq!(entry["args"], json!(["--mcp-server"]));
         assert_eq!(entry["env"]["FLOWX_MCP_THREAD"], "thread-1");
         assert_eq!(config.as_object().unwrap().len(), 1, "{config}");
+        // No timeout stated: the provider's, or the user's, applies.
+        assert!(entry.get("timeout").is_none(), "{entry}");
+    }
+
+    #[test]
+    fn a_server_s_tool_timeout_is_stated_in_each_provider_s_own_unit() {
+        // A lead's wait holds a call open for minutes. Each provider takes
+        // the bound in the server's own entry, so FlowX's server is given
+        // longer without changing any other server's.
+        let server = McpServer {
+            tool_timeout: Some(Duration::from_secs(600)),
+            ..fixture()
+        };
+        let claude: Value =
+            serde_json::from_str(&claude_config(std::slice::from_ref(&server))).unwrap();
+        assert_eq!(claude["mcpServers"]["flowx"]["timeout"], 600_000);
+        let codex = codex_config(std::slice::from_ref(&server));
+        assert_eq!(codex["mcp_servers.flowx"]["tool_timeout_sec"], 600.0);
+        assert!(codex["mcp_servers.flowx"]["tool_timeout_sec"].is_f64());
+        assert!(
+            codex_config(&[fixture()])["mcp_servers.flowx"]
+                .get("tool_timeout_sec")
+                .is_none()
+        );
+        // Claude reads under a second as unset, so it is never sent as one.
+        let short = McpServer {
+            tool_timeout: Some(Duration::from_millis(10)),
+            ..fixture()
+        };
+        let claude: Value = serde_json::from_str(&claude_config(&[short])).unwrap();
+        assert_eq!(claude["mcpServers"]["flowx"]["timeout"], 1_000);
     }
 
     #[test]

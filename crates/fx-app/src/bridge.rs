@@ -66,6 +66,7 @@ impl BridgeAccess {
                 (fx_bridge::ENV_TOKEN.into(), self.bridge.token_for(&thread)),
                 (fx_bridge::ENV_THREAD.into(), thread),
             ]),
+            tool_timeout: None,
         })
     }
 
