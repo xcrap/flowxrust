@@ -6,7 +6,8 @@ use super::{Timestamp, now};
 /// A named group of threads inside one project.
 ///
 /// FlowX's own: no provider knows about it, except that one may mirror a
-/// Codex section (`codex_section`). A thread names the space it is in
+/// provider's grouping (`provider_section`): a Codex section, or a Claude
+/// desktop project. A thread names the space it is in
 /// (`Agent::space`), so a thread is in at most one space by construction,
 /// and deleting the thread takes its membership with it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -22,15 +23,18 @@ pub struct Space {
         deserialize_with = "string_or_none"
     )]
     pub color: Option<String>,
-    /// The Codex section this space mirrors, by its id. Codex sections are
-    /// account-wide, so each project that has threads in one gets a space of
-    /// its own for it.
+    /// The provider grouping this space mirrors, by its id: a Codex
+    /// section's, or a Claude desktop project's behind
+    /// [`Self::CLAUDE_PROJECT`]. Both are account-wide, so each project that
+    /// has threads in one gets a space of its own for it. Saved under its
+    /// first name, `codex_section`, which every build so far reads.
     #[serde(
+        rename = "codex_section",
         default,
         skip_serializing_if = "Option::is_none",
         deserialize_with = "string_or_none"
     )]
-    pub codex_section: Option<String>,
+    pub provider_section: Option<String>,
     pub created_at: Timestamp,
 }
 
@@ -43,12 +47,27 @@ impl Space {
     /// The longest name a space keeps, in characters.
     pub const MAX_NAME: usize = 120;
 
+    /// What a Claude desktop project's id is prefixed with as a mirrored
+    /// section, so it can never be taken for a Codex section's.
+    pub const CLAUDE_PROJECT: &'static str = "claude-project:";
+
+    /// What the provider calls the grouping this space mirrors, for the
+    /// reader; `None` for a space of the reader's own.
+    pub fn mirror_kind(&self) -> Option<&'static str> {
+        let section = self.provider_section.as_deref()?;
+        Some(if section.starts_with(Self::CLAUDE_PROJECT) {
+            "Claude project"
+        } else {
+            "Codex section"
+        })
+    }
+
     pub fn new(name: impl Into<String>) -> Self {
         Self {
             id: Uuid::new_v4(),
             name: name.into(),
             color: None,
-            codex_section: None,
+            provider_section: None,
             created_at: now(),
         }
     }
@@ -119,7 +138,7 @@ mod tests {
         .unwrap();
         assert_eq!(space.name, "Pinned");
         assert_eq!(space.color, None);
-        assert_eq!(space.codex_section, None);
+        assert_eq!(space.provider_section, None);
         // An unknown colour name is a string, so it is kept as written.
         let space: Space = serde_json::from_value(serde_json::json!({
             "id": Uuid::from_u128(7), "name": "P", "color": "teal",
@@ -127,6 +146,19 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(space.color.as_deref(), Some("teal"));
+    }
+
+    #[test]
+    fn a_mirror_says_whose_grouping_it_is() {
+        let mut space = Space::new("Pinned");
+        assert_eq!(space.mirror_kind(), None);
+        space.provider_section = Some("pinned".into());
+        assert_eq!(space.mirror_kind(), Some("Codex section"));
+        space.provider_section = Some(format!("{}chan_1", Space::CLAUDE_PROJECT));
+        assert_eq!(space.mirror_kind(), Some("Claude project"));
+        // Saved under the name every earlier build reads.
+        let value = serde_json::to_value(&space).unwrap();
+        assert_eq!(value["codex_section"], "claude-project:chan_1");
     }
 
     #[test]

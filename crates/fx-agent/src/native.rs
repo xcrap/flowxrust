@@ -22,7 +22,8 @@ pub struct NativeThreadSummary {
     pub running_elsewhere: bool,
     /// The section the provider files the thread under, when it has them:
     /// Codex's, which are account-wide and named by the user (the Codex app
-    /// keeps its pins as one). Claude has none.
+    /// keeps its pins as one), and the Claude desktop project that started a
+    /// Claude thread, which the thread's own messages name.
     pub section: Option<NativeSection>,
 }
 

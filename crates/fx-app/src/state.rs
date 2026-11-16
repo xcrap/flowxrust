@@ -3584,12 +3584,13 @@ impl AppState {
                     .collect();
                 let mut archived_ids: HashSet<Uuid> =
                     record.archived_agent_ids.iter().copied().collect();
-                // The space here that mirrors each Codex section, the first
-                // if two do, and every space that mirrors one.
+                // The space here that mirrors each provider section (a Codex
+                // section, a Claude project), the first if two do, and every
+                // space that mirrors one.
                 let mut mirrors: HashMap<String, Uuid> = HashMap::new();
                 let mut mirrored: HashSet<Uuid> = HashSet::new();
                 for space in &record.spaces {
-                    if let Some(section) = &space.space.codex_section {
+                    if let Some(section) = &space.space.provider_section {
                         mirrors.entry(section.clone()).or_insert(space.space.id);
                         mirrored.insert(space.space.id);
                     }
@@ -3745,7 +3746,7 @@ impl AppState {
                             Some(section) => Some(match mirrors.get(&section.id) {
                                 Some(space) => *space,
                                 None => {
-                                    let space = mirror_space(section);
+                                    let space = mirror_space(section, &record.spaces);
                                     let space_id = space.space.id;
                                     record.spaces.push(space);
                                     mirrors.insert(section.id.clone(), space_id);
@@ -3855,7 +3856,7 @@ impl AppState {
                         )
                         .collect();
                     record.spaces.retain(|space| {
-                        space.space.codex_section.is_none() || named.contains(&space.space.id)
+                        space.space.provider_section.is_none() || named.contains(&space.space.id)
                     });
                 }
                 record
@@ -5207,13 +5208,26 @@ fn index_bindings(
     (bound, slots, repeated)
 }
 
-/// A new space for a Codex section, named and coloured as Codex has it,
-/// where the colour is one the sidebar draws.
-fn mirror_space(section: &fx_agent::native::NativeSection) -> fx_store::PersistedSpace {
-    let mut space = fx_core::Space::new(
-        fx_core::Space::clean_name(&section.name).unwrap_or_else(|| "Codex section".into()),
-    );
-    space.codex_section = Some(section.id.clone());
+/// A new space for a provider's section, named and coloured as the
+/// provider has it, where the colour is one the sidebar draws. A name a
+/// space here already has is numbered: Claude does not say what its
+/// projects are called, so two of them both arrive as "Claude project".
+fn mirror_space(
+    section: &fx_agent::native::NativeSection,
+    spaces: &[fx_store::PersistedSpace],
+) -> fx_store::PersistedSpace {
+    let name = fx_core::Space::clean_name(&section.name).unwrap_or_else(|| "Codex section".into());
+    let taken = |name: &str| spaces.iter().any(|space| space.space.name == name);
+    let name = if taken(&name) {
+        (2..)
+            .map(|count| format!("{name} {count}"))
+            .find(|numbered| !taken(numbered))
+            .expect("an unbounded range finds a free name")
+    } else {
+        name
+    };
+    let mut space = fx_core::Space::new(name);
+    space.provider_section = Some(section.id.clone());
     space.color = section
         .color
         .as_deref()
@@ -5308,6 +5322,13 @@ fn carry_message_ids<'a>(
             } => Some((
                 message.role,
                 format!("compaction:{trigger:?}:{pre_tokens:?}:{post_tokens:?}"),
+            )),
+            fx_core::MessageContent::ProjectNote { text } => Some((
+                message.role,
+                format!(
+                    "project-note:{}",
+                    normalized(std::iter::once(text.as_str()))
+                ),
             )),
             _ => None,
         })
@@ -9860,7 +9881,7 @@ mod native_sync_tests {
                 let here = state.spaces_of(project).to_vec();
                 assert_eq!(here.len(), 1);
                 assert_eq!(here[0].space.name, "Pinned");
-                assert_eq!(here[0].space.codex_section.as_deref(), Some("pinned"));
+                assert_eq!(here[0].space.provider_section.as_deref(), Some("pinned"));
                 assert_eq!(here[0].space.color.as_deref(), Some("blue"));
                 let space = here[0].space.id;
                 assert_eq!(space_of(state, agent(state, "a")), Some(space));
@@ -9888,6 +9909,65 @@ mod native_sync_tests {
     }
 
     #[test]
+    fn each_claude_project_gets_a_space_of_its_own_numbered_when_names_meet() {
+        // Claude does not say what its projects are called, so two of them
+        // both arrive as "Claude project"; a name the reader gave stays.
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("game");
+        std::fs::create_dir_all(&root).unwrap();
+        let root = root.to_string_lossy().to_string();
+        let test = gpui::TestAppContext::single();
+        let (state, project) =
+            test.update(|cx| setup(cx, AppPaths::at(temp.path().join("store")), &root));
+        test.update(|cx| {
+            state.update(cx, |state, _| {
+                let in_project = |session: &str, channel: &str| NativeThreadSummary {
+                    section: Some(fx_agent::native::NativeSection {
+                        id: format!("{}{channel}", fx_core::Space::CLAUDE_PROJECT),
+                        name: "Claude project".into(),
+                        color: None,
+                    }),
+                    ..entry(&root, "claude", session, session)
+                };
+                let listed = vec![
+                    in_project("a", "chan_1"),
+                    in_project("b", "chan_1"),
+                    in_project("c", "chan_2"),
+                    entry(&root, "claude", "d", "Mine"),
+                ];
+                index(state, project, "claude", listed.clone(), Vec::new());
+                let spaces = state.spaces_of(project).to_vec();
+                let names: Vec<_> = spaces
+                    .iter()
+                    .map(|space| space.space.name.as_str())
+                    .collect();
+                assert_eq!(names, ["Claude project", "Claude project 2"]);
+                assert!(
+                    spaces
+                        .iter()
+                        .all(|space| space.space.mirror_kind() == Some("Claude project"))
+                );
+                let agent = |state: &AppState, session: &str| {
+                    state.snapshot.projects[0]
+                        .native_bindings
+                        .iter()
+                        .find(|binding| binding.session_id == session)
+                        .unwrap()
+                        .agent_id
+                };
+                assert_eq!(space_of(state, agent(state, "a")), Some(spaces[0].space.id));
+                assert_eq!(space_of(state, agent(state, "b")), Some(spaces[0].space.id));
+                assert_eq!(space_of(state, agent(state, "c")), Some(spaces[1].space.id));
+                assert_eq!(space_of(state, agent(state, "d")), None);
+                // Renamed by the reader, and kept through the next pass.
+                state.snapshot.projects[0].spaces[0].space.name = "Azores".into();
+                index(state, project, "claude", listed, Vec::new());
+                assert_eq!(state.spaces_of(project)[0].space.name, "Azores");
+            })
+        });
+    }
+
+    #[test]
     fn a_section_the_provider_changes_wins_and_one_it_keeps_leaves_the_readers_placement() {
         // As an archive does: FlowX's own choice holds until the provider's
         // value moves, which is newer.
@@ -9910,7 +9990,7 @@ mod native_sync_tests {
                     state
                         .spaces_of(project)
                         .iter()
-                        .find(|space| space.space.codex_section.as_deref() == Some(section))
+                        .find(|space| space.space.provider_section.as_deref() == Some(section))
                         .map(|space| space.space.id)
                 };
                 pass(state, Some(("pinned", "Pinned")));

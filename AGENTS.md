@@ -502,11 +502,13 @@ the palette, a restore), as its project already did. `Space::COLORS` is the
 accent names, because `fx-core` cannot see the design system; a sidebar test
 checks the two agree.
 
-Claude has no sections; its projects are folders, which FlowX projects
-already are. Codex files threads in account-wide sections (`thread/list`'s
-`section {id, name, appearance}`), and each project index pass mirrors them,
-read-only, as one space per section in each project that has threads in it
-(`Space::codex_section`). Three rules:
+Codex files threads in account-wide sections (`thread/list`'s `section {id,
+name, appearance}`), and a Claude desktop project (Projects, beta) starts
+Claude Code threads on the Mac from a chat on claude.ai. Each project index
+pass mirrors both, read-only, as one space per section or project in each
+project that has threads in it (`Space::provider_section`, saved under its
+first name `codex_section`; a Claude project's id is behind
+`Space::CLAUDE_PROJECT`). Four rules:
 
 - **The provider moves a thread only when its section changed.** The binding
   records the section the provider last listed (`PersistedBinding::section`);
@@ -515,8 +517,14 @@ read-only, as one space per section in each project that has threads in it
   archive does.
 - **A mirror no thread names is removed**; a space the reader made is never
   removed by a pass.
-- **Nothing is written back to Codex.** Codex's sections are its own
-  account's, and FlowX does not move or rename them.
+- **Nothing is written back.** Codex's sections and Claude's projects are
+  their accounts', and FlowX does not move or rename them.
+- **A Claude project is named "Claude project" until the reader renames
+  it.** Claude keeps neither the project's name nor its chat on the Mac (the
+  chat is the coordinator, a session on claude.ai; the app's Local Storage
+  holds only analytics about it), so the project is known by the id its
+  threads' messages carry, and two in one folder are numbered. A pass names
+  a mirror only when it makes one, so a rename holds.
 
 ## Orchestrators
 
@@ -624,7 +632,24 @@ archive or restore gives way once the provider's own flag changes.
 
 Claude desktop's archive flag is mirrored, so a project worked on there can
 have every thread archived. The sidebar then says "No open threads" over a row
-that opens the archive, not "No threads yet".
+that opens the archive, not "No threads yet". So is its title
+(`claude-code-sessions/…/local_*.json`'s `title`), which names the thread
+over the transcript's own title and its first prompt: it is what the reader
+knows the thread by there.
+
+A thread a Claude desktop project started carries the project's traffic as
+user records in three shapes (`claude::project`, read from 2.1.325's files):
+the coordinator's brief, a meta `<relay reason="spawn">`; the reader's own
+message, a `<wake>` whose `<message from="human">` is verbatim and whose
+`<project id="chan_…">` names the project; and a relayed message, a task
+notification (`subkind: projects-relay`) wrapping `<cited author="user">`
+words and the coordinator's `<note>`. The reader's words are a prompt; the
+coordinator's are `MessageContent::ProjectNote`, a System row drawn as a
+compaction is ("Note from the project chat", the note behind a disclosure),
+which `as_text()` does not read. Read as plain prompts, the brief and every
+relay were hidden as meta and task notifications, and the wake was the
+thread's prompt and title as raw markup (`<wake reason="mention" cu…`). A
+wake that carries none of the reader's words is shown as written.
 
 ## Runtime discovery
 

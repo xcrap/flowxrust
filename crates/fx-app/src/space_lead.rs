@@ -505,7 +505,7 @@ mod tests {
         test.update(|cx| {
             state.update(cx, |state, _| {
                 let mut mirror = fx_core::Space::new("Pinned");
-                mirror.codex_section = Some("pinned".into());
+                mirror.provider_section = Some("pinned".into());
                 let mirror_id = mirror.id;
                 state.snapshot.projects[0]
                     .spaces

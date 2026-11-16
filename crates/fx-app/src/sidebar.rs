@@ -1629,10 +1629,9 @@ pub(crate) fn space_picker_menu(spaces: &[PersistedSpace], current: Option<Uuid>
                         space.space.name.clone(),
                     )
                     .selected(current == Some(space.space.id));
-                    if space.space.codex_section.is_some() {
-                        item.subtitle("Codex section")
-                    } else {
-                        item
+                    match space.space.mirror_kind() {
+                        Some(kind) => item.subtitle(kind),
+                        None => item,
                     }
                 })
                 .collect(),
@@ -3142,11 +3141,14 @@ mod tests {
         assert!(item(&menu, "move-to-space").is_some_and(|item| item.submenu));
 
         let mut mirrored = fx_core::Space::new("Pinned");
-        mirrored.codex_section = Some("pinned".into());
+        mirrored.provider_section = Some("pinned".into());
+        let mut project = fx_core::Space::new("Claude project");
+        project.provider_section = Some(format!("{}chan_1", fx_core::Space::CLAUDE_PROJECT));
         let own = fx_core::Space::new("Mine");
         let spaces = [
             PersistedSpace::new(own.clone()),
             PersistedSpace::new(mirrored.clone()),
+            PersistedSpace::new(project.clone()),
         ];
         let picker = space_picker_menu(&spaces, Some(own.id));
         let mine = item(&picker, &format!("space:{}", own.id)).unwrap();
@@ -3158,6 +3160,13 @@ mod tests {
                 .subtitle
                 .as_deref(),
             Some("Codex section")
+        );
+        assert_eq!(
+            item(&picker, &format!("space:{}", project.id))
+                .unwrap()
+                .subtitle
+                .as_deref(),
+            Some("Claude project")
         );
         assert!(item(&picker, "new-space").is_some());
         assert!(item(&picker, "remove-from-space").unwrap().enabled);

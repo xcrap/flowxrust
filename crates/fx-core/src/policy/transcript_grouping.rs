@@ -116,6 +116,9 @@ impl TranscriptActivityGroupingPolicy {
                 // work: it closes the group before it and opens the one after,
                 // so the reader can see which calls the model still remembers.
                 MessageContent::Compaction { .. } => false,
+                // Another session's words to this one, between turns: a
+                // boundary, as a compaction is.
+                MessageContent::ProjectNote { .. } => false,
                 // Any prose at all — even in the same message as a tool call —
                 // keeps the message narrative. Collapsing the two together
                 // would bury the words the model just said.

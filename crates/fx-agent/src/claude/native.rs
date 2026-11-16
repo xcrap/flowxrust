@@ -19,7 +19,8 @@ use fx_core::{
 use serde_json::Value;
 use uuid::Uuid;
 
-use crate::native::{NativeThread, NativeThreadIndex, NativeThreadSummary};
+use super::project;
+use crate::native::{NativeSection, NativeThread, NativeThreadIndex, NativeThreadSummary};
 use crate::{ProviderError, ThreadIdentity, ThreadSummary};
 
 const MAX_TRANSCRIPT_BYTES: u64 = 128 * 1024 * 1024;
@@ -54,7 +55,7 @@ pub struct ClaudeNativeStore {
 struct Cache {
     summaries: HashMap<PathBuf, CachedSummary>,
     transcripts: HashMap<PathBuf, CachedTranscript>,
-    desktop: HashMap<PathBuf, (Fingerprint, Option<(String, bool)>)>,
+    desktop: HashMap<PathBuf, (Fingerprint, Option<DesktopRecord>)>,
     tick: u64,
     #[cfg(test)]
     parses: usize,
@@ -124,12 +125,32 @@ struct ParsedSummary {
     /// and were not there when it was read. Its place here rests on their
     /// absence, so it is read again if one comes back.
     gone: Vec<PathBuf>,
+    /// The Claude desktop project that started the thread, by Claude's id,
+    /// as the first of its messages to name one says.
+    project: Option<String>,
 }
 
 #[derive(Default)]
 struct DesktopState {
-    sessions: HashMap<String, (bool, String, Option<SystemTime>)>,
+    sessions: HashMap<String, DesktopSession>,
     warnings: Vec<String>,
+}
+
+/// What the Claude desktop app keeps about one of its sessions.
+#[derive(Clone, Debug, PartialEq)]
+struct DesktopRecord {
+    session: String,
+    archived: bool,
+    /// The title the Claude app shows, its own or the reader's.
+    title: Option<String>,
+}
+
+/// A session's desktop record as a pass uses it: the newest file's.
+struct DesktopSession {
+    archived: bool,
+    title: Option<String>,
+    revision: String,
+    modified: Option<SystemTime>,
 }
 
 impl Default for ClaudeNativeStore {
@@ -613,10 +634,19 @@ impl ClaudeNativeStore {
                             }
                         }
                     };
-                    if let Some((id, archived)) = metadata {
-                        let next = (archived, fingerprint.revision(&file), fingerprint.modified);
-                        if state.sessions.get(&id).is_none_or(|old| old.2 <= next.2) {
-                            state.sessions.insert(id, next);
+                    if let Some(record) = metadata {
+                        let next = DesktopSession {
+                            archived: record.archived,
+                            title: record.title,
+                            revision: fingerprint.revision(&file),
+                            modified: fingerprint.modified,
+                        };
+                        if state
+                            .sessions
+                            .get(&record.session)
+                            .is_none_or(|old| old.modified <= next.modified)
+                        {
+                            state.sessions.insert(record.session, next);
                         }
                     }
                 }
@@ -636,9 +666,13 @@ fn make_entry(
     desktop: &DesktopState,
 ) -> NativeThreadSummary {
     let desktop = desktop.sessions.get(id);
-    let title = parsed
-        .title
-        .as_deref()
+    // The Claude app's title where it keeps one, since that is the name the
+    // reader knows the thread by there. A thread a Claude project started
+    // opens with the project's markup, so its first prompt read as a title
+    // was `<wake reason="mention" …`.
+    let title = desktop
+        .and_then(|state| state.title.as_deref())
+        .or(parsed.title.as_deref())
         .or(parsed.first_prompt.as_deref())
         .or(parsed.last_prompt.as_deref())
         .unwrap_or("Claude thread");
@@ -662,17 +696,24 @@ fn make_entry(
                     .map(DateTime::<Utc>::from)
                     .unwrap_or(DateTime::<Utc>::UNIX_EPOCH)
             }),
-            is_archived: desktop.is_some_and(|state| state.0),
+            is_archived: desktop.is_some_and(|state| state.archived),
         },
         defaults: parsed.defaults.clone(),
         waiting_elsewhere: None,
         running_elsewhere: false,
-        section: None,
+        // A Claude project is a grouping the reader made, as a Codex section
+        // is. Claude does not write down what it is called, so the space
+        // mirroring it is named for what it is until the reader renames it.
+        section: parsed.project.as_ref().map(|project| NativeSection {
+            id: format!("{}{project}", fx_core::Space::CLAUDE_PROJECT),
+            name: "Claude project".into(),
+            color: None,
+        }),
         revision: format!(
             "{}:{}",
             fingerprint.revision(path),
             desktop
-                .map(|state| state.1.as_str())
+                .map(|state| state.revision.as_str())
                 .unwrap_or("no-desktop-metadata")
         ),
     }
@@ -849,7 +890,18 @@ fn parse_file(
                 }
             }
             "last-prompt" => {
-                parsed.last_prompt = nonempty(&object["lastPrompt"]);
+                if let Some(prompt) = nonempty(&object["lastPrompt"]) {
+                    match project::read(&prompt) {
+                        // A project's message is the reader's words in it; a
+                        // coordinator's note alone is nobody's prompt.
+                        Some(envelope) => {
+                            if let Some(words) = envelope.prompt {
+                                parsed.last_prompt = Some(preview(&words));
+                            }
+                        }
+                        None => parsed.last_prompt = Some(prompt),
+                    }
+                }
             }
             // The context was compacted here. The record carries the trigger
             // and the counts either side; the summary is the next user record,
@@ -882,6 +934,68 @@ fn parse_file(
                     timestamp: parse_timestamp(&object["timestamp"])
                         .unwrap_or(DateTime::<Utc>::UNIX_EPOCH),
                 });
+            }
+            // A Claude project's traffic: the reader's words are their
+            // prompt and the coordinator's are its note, whichever shape
+            // the record took. Its brief is meta and its relays are task
+            // notifications, so this comes before either is passed over.
+            "user"
+                if let Some(envelope) = full_text(&object["message"]["content"])
+                    .filter(|text| text.starts_with('<'))
+                    .and_then(|text| project::read(&text)) =>
+            {
+                if parsed.project.is_none() {
+                    parsed.project = envelope.project.clone();
+                }
+                if let Some(prompt) = &envelope.prompt {
+                    if parsed.first_prompt.is_none() {
+                        parsed.first_prompt = Some(preview(prompt));
+                    }
+                    parsed.last_prompt = Some(preview(prompt));
+                }
+                if !include_messages {
+                    continue;
+                }
+                let native_id = object["uuid"].as_str();
+                let message_id = native_id
+                    .and_then(|id| Uuid::parse_str(id).ok())
+                    .unwrap_or_else(|| {
+                        let namespace = Uuid::parse_str(id).expect("validated session ID");
+                        Uuid::new_v5(&namespace, native_id.map(str::as_bytes).unwrap_or(&line))
+                    });
+                let timestamp =
+                    parse_timestamp(&object["timestamp"]).unwrap_or(DateTime::<Utc>::UNIX_EPOCH);
+                let mut push = |message: ConversationMessage| {
+                    if let Some(index) = positions.get(&message.id).copied() {
+                        messages[index] = message;
+                    } else {
+                        positions.insert(message.id, messages.len());
+                        messages.push(message);
+                    }
+                };
+                let worded = envelope.prompt.is_some();
+                if let Some(text) = envelope.prompt {
+                    push(ConversationMessage {
+                        id: message_id,
+                        role: MessageRole::User,
+                        content: vec![MessageContent::Text { text }],
+                        timestamp,
+                    });
+                }
+                if let Some(text) = envelope.note {
+                    push(ConversationMessage {
+                        // Beside the reader's words from the same record,
+                        // an id of its own, derived so it holds across reads.
+                        id: if worded {
+                            Uuid::new_v5(&message_id, b"project-note")
+                        } else {
+                            message_id
+                        },
+                        role: MessageRole::System,
+                        content: vec![MessageContent::ProjectNote { text }],
+                        timestamp,
+                    });
+                }
             }
             kind @ ("user" | "assistant" | "attachment") => {
                 let assistant = kind == "assistant";
@@ -1262,15 +1376,17 @@ fn full_text(value: &Value) -> Option<String> {
 
 /// A prompt's first line, as the sidebar previews it.
 fn prompt_text(value: &Value) -> Option<String> {
-    let text = full_text(value)?;
-    Some(
-        text.lines()
-            .next()
-            .unwrap_or(&text)
-            .chars()
-            .take(200)
-            .collect(),
-    )
+    full_text(value).map(|text| preview(&text))
+}
+
+/// A prompt's first line, bounded.
+fn preview(text: &str) -> String {
+    text.lines()
+        .next()
+        .unwrap_or(text)
+        .chars()
+        .take(200)
+        .collect()
 }
 
 /// How large a conversation a reply answered: everything sent, cached or not,
@@ -1613,7 +1729,7 @@ fn record_is_its_process(record: &Value, pid: i32) -> bool {
 fn read_metadata(
     path: &Path,
     fingerprint: &Fingerprint,
-) -> Result<Option<(String, bool)>, ProviderError> {
+) -> Result<Option<DesktopRecord>, ProviderError> {
     if fingerprint.size > MAX_METADATA_BYTES {
         return Err(protocol("Claude desktop metadata exceeds the 1 MiB limit"));
     }
@@ -1634,7 +1750,11 @@ fn read_metadata(
     let Some(id) = object["cliSessionId"].as_str().and_then(safe_session_id) else {
         return Ok(None);
     };
-    Ok(Some((id, object["isArchived"].as_bool().unwrap_or(false))))
+    Ok(Some(DesktopRecord {
+        session: id,
+        archived: object["isArchived"].as_bool().unwrap_or(false),
+        title: nonempty(&object["title"]),
+    }))
 }
 
 #[cfg(test)]
@@ -2318,6 +2438,137 @@ mod tests {
                 .summary
                 .is_archived
         );
+    }
+
+    #[test]
+    fn the_claude_app_s_title_names_the_thread() {
+        // The name the reader knows the thread by in the Claude app, over
+        // the transcript's own title and its first prompt.
+        let fixture = Fixture::new();
+        let mut titled = json!({"type": "ai-title", "aiTitle": "Transcript title"});
+        titled["sessionId"] = json!(SESSION);
+        fixture.write(&[
+            fixture.record("user", "First prompt", Uuid::new_v4()),
+            titled,
+        ]);
+        let store = fixture.store();
+        let title = |store: &ClaudeNativeStore| {
+            store.list(fixture.root()).unwrap().threads[0]
+                .summary
+                .title
+                .clone()
+        };
+        assert_eq!(title(&store), "Transcript title");
+        fs::write(
+            fixture.desktop_file(),
+            json!({"cliSessionId": SESSION, "isArchived": false,
+                   "title": "Continue the TypeScript migration", "titleSource": "auto"})
+            .to_string(),
+        )
+        .unwrap();
+        assert_eq!(title(&store), "Continue the TypeScript migration");
+        // A blank one says nothing.
+        fs::write(
+            fixture.desktop_file(),
+            json!({"cliSessionId": SESSION, "title": "  "}).to_string(),
+        )
+        .unwrap();
+        assert_eq!(title(&store), "Transcript title");
+    }
+
+    #[test]
+    fn a_claude_project_s_thread_reads_as_the_reader_and_the_coordinator_wrote_it() {
+        // As Claude Code 2.1.325 records a thread a Claude desktop project
+        // started: the coordinator's brief (meta), the reader's message in
+        // a wake, the reply, then a relay quoting the reader beside the
+        // coordinator's note (a task notification).
+        let fixture = Fixture::new();
+        let mut brief = fixture.record(
+            "user",
+            "<relay from=\"coordinator\" session=\"session_1\" reason=\"spawn\">\n  \
+             The note below was written by the coordinator session.\n  <note>\n      \
+             Migrate the game to TypeScript &amp; deploy.\n  </note>\n</relay>",
+            Uuid::new_v4(),
+        );
+        brief["isMeta"] = json!(true);
+        let mut wake = fixture.record("user", "", Uuid::new_v4());
+        wake["message"]["content"] = json!(
+            "<wake reason=\"mention\" current-time=\"2026-11-16T09:22:46Z\">\n  \
+             <project id=\"chan_012r\" type=\"project\">\n    \
+             <message trigger=\"true\" from=\"human\" id=\"cmsg_1\">Keep going, and tell me \
+             the percentage.</message>\n  </project>\n</wake>\n"
+        );
+        wake["origin"] = json!({"kind": "human"});
+        let reply = fixture.record("assistant", "Batch one is live: 20%.", Uuid::new_v4());
+        let relay_id = Uuid::new_v4();
+        let mut relay = fixture.record(
+            "user",
+            "<project_claude_message session=\"session_1\" thread_id=\"cmsg_1\">\n\
+             <relay from=\"coordinator\" session=\"session_1\">\n  \
+             <cited id=\"cmsg_2\" author=\"user\" name=\"R\" where=\"timeline\">\n      \
+             keep going\n  </cited>\n  <note>\n      Start the next batch.\n  </note>\n\
+             </relay>\n</project_claude_message>\n",
+            relay_id,
+        );
+        relay["origin"] = json!({"kind": "task-notification", "subkind": "projects-relay"});
+        fixture.write(&[brief, wake, reply, relay]);
+        let store = fixture.store();
+        let listed = store.list(fixture.root()).unwrap();
+        let entry = &listed.threads[0];
+        // Not `<wake reason="mention" …`.
+        assert_eq!(
+            entry.summary.title,
+            "Keep going, and tell me the percentage."
+        );
+        assert_eq!(
+            entry.section,
+            Some(NativeSection {
+                id: "claude-project:chan_012r".into(),
+                name: "Claude project".into(),
+                color: None,
+            })
+        );
+        let thread = store.read(fixture.root(), SESSION).unwrap();
+        let shown: Vec<(MessageRole, String)> = thread
+            .messages
+            .iter()
+            .map(|message| {
+                let text = match &message.content[..] {
+                    [MessageContent::ProjectNote { text }] => format!("note: {text}"),
+                    _ => message.text_content(),
+                };
+                (message.role, text)
+            })
+            .collect();
+        assert_eq!(
+            shown,
+            vec![
+                (
+                    MessageRole::System,
+                    "note: Migrate the game to TypeScript & deploy.".into()
+                ),
+                (
+                    MessageRole::User,
+                    "Keep going, and tell me the percentage.".into()
+                ),
+                (MessageRole::Assistant, "Batch one is live: 20%.".into()),
+                (MessageRole::User, "keep going".into()),
+                (MessageRole::System, "note: Start the next batch.".into()),
+            ]
+        );
+        // The relay's two rows each have an id that holds across reads.
+        assert_eq!(thread.messages[3].id, relay_id);
+        assert_ne!(thread.messages[4].id, relay_id);
+        assert_eq!(
+            store.read(fixture.root(), SESSION).unwrap().messages,
+            thread.messages
+        );
+        // A thread no project started has no section.
+        let plain = Fixture::new();
+        plain.write(&[plain.record("user", "<b>bold</b> prompt", Uuid::new_v4())]);
+        let listed = plain.store().list(plain.root()).unwrap();
+        assert_eq!(listed.threads[0].section, None);
+        assert_eq!(listed.threads[0].summary.title, "<b>bold</b> prompt");
     }
 
     #[test]

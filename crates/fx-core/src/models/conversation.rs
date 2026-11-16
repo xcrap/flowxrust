@@ -214,6 +214,15 @@ pub enum MessageContent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         summary: Option<String>,
     },
+    /// What a Claude desktop project's coordinator wrote to a thread it
+    /// started or relayed to: the brief it began the thread with, or its
+    /// note beside the reader's words. Another Claude session wrote it, not
+    /// the reader and not this thread's model, so it is neither a prompt
+    /// nor a reply. Not prose: [`Self::as_text`] does not read it, and the
+    /// transcript draws it as a boundary, with the note behind a disclosure.
+    ProjectNote {
+        text: String,
+    },
 }
 
 /// What started a compaction.
@@ -274,6 +283,11 @@ impl MessageContent {
     /// Whether this block marks a compaction of the context.
     pub fn is_compaction(&self) -> bool {
         matches!(self, Self::Compaction { .. })
+    }
+
+    /// Whether this block is a Claude project coordinator's note.
+    pub fn is_project_note(&self) -> bool {
+        matches!(self, Self::ProjectNote { .. })
     }
 }
 

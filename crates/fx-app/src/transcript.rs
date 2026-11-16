@@ -111,6 +111,14 @@ const COMPACTION_SELECTOR: &str = "transcript.compaction";
 const COMPACTION_SUMMARY_SELECTOR: &str = "transcript.compaction-summary";
 /// The disclosure that opens and closes that summary.
 const COMPACTION_TOGGLE_SELECTOR: &str = "transcript.compaction-toggle";
+/// A Claude project coordinator's note, drawn as a compaction is.
+const PROJECT_NOTE_SELECTOR: &str = "transcript.project-note";
+/// The note's text, shown while its disclosure is open.
+const PROJECT_NOTE_BODY_SELECTOR: &str = "transcript.project-note-body";
+/// The disclosure that opens and closes the note.
+const PROJECT_NOTE_TOGGLE_SELECTOR: &str = "transcript.project-note-toggle";
+/// What the row says a coordinator's note is.
+const PROJECT_NOTE_CAPTION: &str = "Note from the project chat";
 /// What a running call has printed so far, under its row.
 const LIVE_OUTPUT_SELECTOR: &str = "transcript.live-output";
 const HELD_STEER_SELECTOR: &str = "transcript.held-steer";
@@ -2664,6 +2672,18 @@ fn content_block(
             summary.as_deref(),
             place,
         )),
+        MessageContent::ProjectNote { text } => Some(boundary_row(Boundary {
+            key: place.key("project-note"),
+            body_key: place.key("project-note-body"),
+            caption: PROJECT_NOTE_CAPTION.into(),
+            body: Some(text),
+            labels: ("Show note", "Hide note"),
+            selectors: [
+                PROJECT_NOTE_SELECTOR,
+                PROJECT_NOTE_TOGGLE_SELECTOR,
+                PROJECT_NOTE_BODY_SELECTOR,
+            ],
+        })),
     }
 }
 
@@ -2679,11 +2699,48 @@ fn compaction_row(
     summary: Option<&str>,
     place: Place,
 ) -> AnyElement {
+    boundary_row(Boundary {
+        key: place.key("compaction"),
+        body_key: place.key("summary"),
+        caption: compaction_caption(trigger, pre_tokens, post_tokens),
+        body: summary,
+        labels: ("Show summary", "Hide summary"),
+        selectors: [
+            COMPACTION_SELECTOR,
+            COMPACTION_TOGGLE_SELECTOR,
+            COMPACTION_SUMMARY_SELECTOR,
+        ],
+    })
+}
+
+/// A row that stands between the rows around it rather than in either turn:
+/// a rule across the column with a caption, and what it carries behind a
+/// disclosure, dimmed as a thought is. A compaction and a project's note.
+struct Boundary<'a> {
+    /// The disclosure's, and the caption's in a selection.
+    key: SharedString,
+    /// The body's, in a selection.
+    body_key: SharedString,
+    caption: SharedString,
+    body: Option<&'a str>,
+    /// What the disclosure says while closed and while open.
+    labels: (&'static str, &'static str),
+    /// The row's, the disclosure's and the body's.
+    selectors: [&'static str; 3],
+}
+
+fn boundary_row(boundary: Boundary) -> AnyElement {
     let theme = global::current();
-    let key = place.key("compaction");
-    let summary = summary.filter(|summary| !summary.trim().is_empty());
-    let open = summary.is_some() && is_disclosed(&key);
-    let caption = compaction_caption(trigger, pre_tokens, post_tokens);
+    let Boundary {
+        key,
+        body_key,
+        caption,
+        body,
+        labels,
+        selectors: [selector, toggle_selector, body_selector],
+    } = boundary;
+    let body = body.filter(|body| !body.trim().is_empty());
+    let open = body.is_some() && is_disclosed(&key);
     let rule = || {
         div()
             .flex_1()
@@ -2709,15 +2766,15 @@ fn compaction_row(
                     StyledText::new(caption),
                 )),
         );
-    if summary.is_some() {
+    if body.is_some() {
         // The row's id has to be its own: `text_disclosure` names its element
         // after its label, and a thread compacted twice has two of these.
         header = header.child(
             div()
                 .id(SharedString::from(format!("{key}:toggle")))
-                .debug_selector(|| COMPACTION_TOGGLE_SELECTOR.to_string())
+                .debug_selector(move || toggle_selector.to_string())
                 .child(text_disclosure(
-                    if open { "Hide summary" } else { "Show summary" },
+                    if open { labels.1 } else { labels.0 },
                     open,
                     {
                         let key = key.clone();
@@ -2731,7 +2788,7 @@ fn compaction_row(
     }
     header = header.child(rule());
     let mut row = div()
-        .debug_selector(|| COMPACTION_SELECTOR.to_string())
+        .debug_selector(move || selector.to_string())
         .w_full()
         .min_w_0()
         .flex()
@@ -2739,13 +2796,13 @@ fn compaction_row(
         .gap(px_len(Spacing::SM))
         .py(px_len(Spacing::XS))
         .child(header);
-    if let Some(summary) = summary.filter(|_| open) {
+    if let Some(body) = body.filter(|_| open) {
         row = row.child(
             div()
-                .debug_selector(|| COMPACTION_SUMMARY_SELECTOR.to_string())
+                .debug_selector(move || body_selector.to_string())
                 .w_full()
                 .min_w_0()
-                .child(thought_block(summary, place.key("summary"))),
+                .child(thought_block(body, body_key)),
         );
     }
     row.into_any_element()
@@ -2981,7 +3038,8 @@ fn has_copyable_text(message: &ConversationMessage) -> bool {
         MessageContent::Image { .. }
         | MessageContent::ImageAsset(_)
         | MessageContent::Thinking { .. }
-        | MessageContent::Compaction { .. } => false,
+        | MessageContent::Compaction { .. }
+        | MessageContent::ProjectNote { .. } => false,
     })
 }
 
@@ -3004,7 +3062,8 @@ fn copyable_text(message: &ConversationMessage) -> String {
             MessageContent::Image { .. }
             | MessageContent::ImageAsset(_)
             | MessageContent::Thinking { .. }
-            | MessageContent::Compaction { .. } => None,
+            | MessageContent::Compaction { .. }
+            | MessageContent::ProjectNote { .. } => None,
         })
         .filter(|part| !part.trim().is_empty())
         .collect();
@@ -3284,6 +3343,21 @@ fn message_paragraphs(message: &ConversationMessage, conversation: Uuid) -> Vec<
                 });
                 if let Some(summary) = summary.filter(|_| is_disclosed(&key)) {
                     paragraphs.extend(crate::markdown::paragraphs(summary, place.key("summary")));
+                }
+                continue;
+            }
+            MessageContent::ProjectNote { text } => {
+                let key = place.key("project-note");
+                paragraphs.push(Paragraph {
+                    key: key.clone(),
+                    text: PROJECT_NOTE_CAPTION.into(),
+                    tight: false,
+                });
+                if !text.trim().is_empty() && is_disclosed(&key) {
+                    paragraphs.extend(crate::markdown::paragraphs(
+                        text,
+                        place.key("project-note-body"),
+                    ));
                 }
                 continue;
             }
@@ -8423,6 +8497,76 @@ mod tests {
         // the model said: a copy of the thread skips it.
         assert!(!has_copyable_text(&messages[3]));
         assert_eq!(copyable_text(&messages[3]), "");
+    }
+
+    #[test]
+    fn a_project_s_note_is_a_row_of_its_own_that_opens_to_what_it_said() {
+        // A Claude project's coordinator wrote it, not the reader and not
+        // the model: a boundary between turns, never prose or a prompt.
+        let note = message(
+            MessageRole::System,
+            vec![MessageContent::ProjectNote {
+                text: "Start the next batch under the same rules.".into(),
+            }],
+        );
+        let messages = [
+            text(MessageRole::User, "keep going"),
+            note.clone(),
+            tool_use("t1", "Bash", r#"{"command":"ls"}"#),
+            tool_result("t1", "a", false),
+            text(MessageRole::Assistant, "Batch two started."),
+        ];
+        let rows = build_rows(&borrowed(&messages), false, CONVERSATION);
+        let shape: Vec<&str> = rows
+            .iter()
+            .map(|row| match row {
+                Row::Activity(_) => "work",
+                Row::Message(message) if message.content[0].is_project_note() => "note",
+                Row::Message(_) => "message",
+            })
+            .collect();
+        assert_eq!(shape, ["message", "note", "work", "message"]);
+        assert!(!has_copyable_text(&note));
+        assert_eq!(copyable_text(&note), "");
+
+        let mut conversation = Conversation::new(Uuid::new_v4());
+        for message in messages {
+            conversation.append(message);
+        }
+        let (mut test, mut visual) = open(conversation, 900.0, 2_000.0);
+        assert!(visual.debug_bounds(PROJECT_NOTE_SELECTOR).is_some());
+        let painted = crate::selection::tests::painted_paragraphs();
+        assert!(
+            painted
+                .iter()
+                .any(|(_, text, _)| text == PROJECT_NOTE_CAPTION),
+            "{painted:#?}"
+        );
+        assert!(
+            !painted
+                .iter()
+                .any(|(key, ..)| key.contains(":project-note-body")),
+            "{painted:#?}"
+        );
+        assert_eq!(crate::selection::tests::document_paragraphs(), painted);
+
+        let toggle = visual
+            .debug_bounds(PROJECT_NOTE_TOGGLE_SELECTOR)
+            .unwrap()
+            .center();
+        visual.simulate_mouse_down(toggle, gpui::MouseButton::Left, Default::default());
+        visual.simulate_mouse_up(toggle, gpui::MouseButton::Left, Default::default());
+        test.refresh().unwrap();
+        assert!(visual.debug_bounds(PROJECT_NOTE_BODY_SELECTOR).is_some());
+        let painted = crate::selection::tests::painted_paragraphs();
+        assert!(
+            painted
+                .iter()
+                .any(|(key, text, _)| key.contains(":project-note-body")
+                    && text.contains("Start the next batch")),
+            "{painted:#?}"
+        );
+        assert_eq!(crate::selection::tests::document_paragraphs(), painted);
     }
 
     #[test]

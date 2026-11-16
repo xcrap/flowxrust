@@ -1775,7 +1775,7 @@ mod tests {
         );
 
         let mut mirrored = Space::new("Pinned");
-        mirrored.codex_section = Some("section-1".into());
+        mirrored.provider_section = Some("section-1".into());
         mirrored.color = Some("blue".into());
         let mut agent = Agent::new("Grouped");
         agent.space = Some(mirrored.id);

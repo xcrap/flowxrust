@@ -202,7 +202,7 @@ impl SnapshotIndex {
                 // A mirror with a lead keeps its header: the lead's
                 // conversation is under it.
                 space_slots.get(&space.space.id) == Some(slot)
-                    && (space.space.codex_section.is_none()
+                    && (space.space.provider_section.is_none()
                         || !threads.is_empty()
                         || leads.contains_key(&space.space.id))
             })
@@ -443,9 +443,9 @@ mod tests {
         let work = fx_core::Space::new("Work");
         let empty = fx_core::Space::new("Empty");
         let mut mirrored = fx_core::Space::new("Pinned");
-        mirrored.codex_section = Some("pinned".into());
+        mirrored.provider_section = Some("pinned".into());
         let mut drained = fx_core::Space::new("Drained");
-        drained.codex_section = Some("drained".into());
+        drained.provider_section = Some("drained".into());
         agents[0].space = Some(work.id);
         agents[2].space = Some(work.id);
         agents[3].space = Some(mirrored.id);
