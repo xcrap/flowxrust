@@ -1680,6 +1680,15 @@ pub fn is_read_only_tool(tool_name: &str, input: &Value) -> bool {
         // `TodoWrite` writes only Claude's own task list, which FlowX draws as
         // the turn's plan: Read Only keeps it.
         "Read" | "Grep" | "Glob" | "LS" | "NotebookRead" | "TodoWrite" => true,
+        // What Read Only offers beside the reads (`READ_ONLY_TOOLS`), each
+        // a read here so that offering it means something. A search sends
+        // only its query out, as Codex's `webSearch` does under Read Only;
+        // Claude Code 2.1.325 asks for every one, and refused here, every
+        // search failed. `ToolSearch` loads a deferred tool's schema. An
+        // `Agent` does nothing itself, and a sub-agent's own calls are asked
+        // of FlowX like the turn's: 2.1.325 asks for one only in `auto`
+        // mode, which FlowX never runs, so this holds if that changes.
+        "WebSearch" | "ToolSearch" | "Agent" => true,
         "Bash" => input
             .get("command")
             .and_then(Value::as_str)
@@ -4117,6 +4126,24 @@ mod tests {
             ("mcp__flowx__read_thread", json!({})),
         ] {
             assert!(!is_read_only_tool(tool, &input), "{tool} {input}");
+        }
+    }
+
+    #[test]
+    fn every_tool_read_only_offers_is_a_read_when_claude_asks_for_it() {
+        // Offered and then refused is the same as not offered: Read Only
+        // offered `WebSearch`, Claude Code 2.1.325 asks for every search, and
+        // every one was refused.
+        for tool in crate::claude::transport::READ_ONLY_TOOLS.split(',') {
+            let input = match tool {
+                // A question is the reader's to answer, never the policy's:
+                // it is parsed as one before any policy sees it.
+                "AskUserQuestion" => continue,
+                // As read-only as its command.
+                "Bash" => json!({ "command": "git status" }),
+                _ => json!({}),
+            };
+            assert!(is_read_only_tool(tool, &input), "{tool}");
         }
     }
 
