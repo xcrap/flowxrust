@@ -238,6 +238,7 @@ mod tests {
             context_window_size: None,
             local_history_pending: false,
             local_start: None,
+            section: None,
         };
         let snapshot = Versioned::new(PersistedApp {
             projects: vec![

@@ -10,6 +10,7 @@ pub mod conversation;
 pub mod git;
 pub mod goal;
 pub mod project;
+pub mod space;
 pub mod tool_approval;
 
 pub use agent::{
@@ -24,6 +25,7 @@ pub use conversation::{
 pub use git::{GitFileStatus, GitRepositoryInfo};
 pub use goal::{ConversationGoal, GoalStatus};
 pub use project::Project;
+pub use space::Space;
 pub use tool_approval::{
     ApprovalStatus, ToolApprovalRequest, ToolRiskLevel, UserInputOption, UserInputQuestion,
     UserInputRequest, UserInputResponse,

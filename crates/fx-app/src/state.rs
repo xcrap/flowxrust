@@ -3737,6 +3737,7 @@ impl AppState {
             context_window_size: None,
             local_history_pending: false,
             local_start: self.session_starts.remove(&agent_id),
+            section: None,
         });
     }
 
@@ -4800,6 +4801,7 @@ fn native_binding(
         context_window_size: entry.defaults.context_window_size,
         local_history_pending: false,
         local_start: None,
+        section: None,
     }
 }
 
@@ -6163,6 +6165,7 @@ mod persistence_tests {
                     context_window_size: None,
                     local_history_pending: false,
                     local_start: None,
+                    section: None,
                 });
                 record
                     .native_presentation_ids

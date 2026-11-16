@@ -15,8 +15,8 @@ pub use models::{
     Agent, AgentAccess, AgentConfiguration, AgentExecutionState, AppDefaults, ApprovalStatus,
     Attachment, CompactionTrigger, Conversation, ConversationImageAssetReference,
     ConversationMessage, GitFileStatus, GitRepositoryInfo, MessageContent, MessageRole,
-    NativeDefaults, Project, ResolvedConfiguration, Timestamp, ToolApprovalRequest, ToolRiskLevel,
-    UserInputOption, UserInputQuestion, UserInputRequest, UserInputResponse,
+    NativeDefaults, Project, ResolvedConfiguration, Space, Timestamp, ToolApprovalRequest,
+    ToolRiskLevel, UserInputOption, UserInputQuestion, UserInputRequest, UserInputResponse,
 };
 
 /// Provider and model identifiers used when a thread states none.

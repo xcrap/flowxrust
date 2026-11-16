@@ -12,7 +12,7 @@
 
 use std::collections::BTreeMap;
 
-use fx_core::{Agent, AgentAccess, ConversationMessage, Project, Timestamp};
+use fx_core::{Agent, AgentAccess, ConversationMessage, Project, Space, Timestamp};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -283,10 +283,12 @@ impl<'de> Deserialize<'de> for PersistedProject {
         let agents = unreadable.take(&mut value, "agents");
         let workspaces = unreadable.take(&mut value, "workspaces");
         let native_bindings = unreadable.take(&mut value, "native_bindings");
+        let spaces = unreadable.take(&mut value, "spaces");
         let mut record = Self::deserialize(value).map_err(serde::de::Error::custom)?;
         record.agents = agents;
         record.workspaces = workspaces;
         record.native_bindings = native_bindings;
+        record.spaces = spaces;
         record.unreadable = unreadable;
         Ok(record)
     }
@@ -535,6 +537,31 @@ pub struct PersistedProject {
     /// sidebar marks each one until it is opened, including after a relaunch.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub unseen_completion_ids: Vec<Uuid>,
+    /// The project's spaces, in the order the sidebar draws them. Which
+    /// space a thread is in is the thread's own (`Agent::space`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub spaces: Vec<PersistedSpace>,
+}
+
+/// One space and whether its threads are showing.
+///
+/// The domain half is `fx_core::Space`, flattened, so the file reads as one
+/// record; whether it is open is layout, as a project's is.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PersistedSpace {
+    #[serde(flatten)]
+    pub space: Space,
+    #[serde(default = "default_true", deserialize_with = "deserialize_or_true")]
+    pub is_expanded: bool,
+}
+
+impl PersistedSpace {
+    pub fn new(space: Space) -> Self {
+        Self {
+            space,
+            is_expanded: true,
+        }
+    }
 }
 
 /// Per-thread layout.
@@ -640,6 +667,16 @@ pub struct PersistedBinding {
     /// the provider's history is the whole thread.
     #[serde(default)]
     pub local_start: Option<Uuid>,
+    /// The provider's section for this thread when it last listed it, by
+    /// id: Codex's. What tells a section the provider changed, which moves
+    /// the thread, from one it did not, which leaves the reader's own
+    /// placement alone.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_or_default"
+    )]
+    pub section: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -715,6 +752,28 @@ impl PersistedApp {
                 .is_some_and(|id| !agents.contains(&id) || record.archived_agent_ids.contains(&id))
             {
                 record.last_selected_agent_id = None;
+            }
+            // A space is its id's first record. A membership naming no space
+            // this file holds, read or carried, is ungrouped: the space went
+            // with a build that did not clear it.
+            seen.clear();
+            record.spaces.retain(|space| seen.insert(space.space.id));
+            let spaces: std::collections::HashSet<Uuid> = record
+                .spaces
+                .iter()
+                .map(|space| space.space.id)
+                .chain(
+                    record
+                        .unreadable
+                        .elements("spaces")
+                        .iter()
+                        .filter_map(|space| space.get("id")?.as_str()?.parse().ok()),
+                )
+                .collect();
+            for agent in &mut record.agents {
+                if agent.space.is_some_and(|space| !spaces.contains(&space)) {
+                    agent.space = None;
+                }
             }
             // Native indexes can contain thousands of threads. File byte limits
             // bound input; normalization must never silently discard history.
@@ -1627,6 +1686,13 @@ mod tests {
                         {"agentId": agent, "providerId": "codex", "sessionId": "s1",
                          "updatedAt": "2026-01-01T00:00:00Z", "agentAccess": "planOnly"},
                         {"agentId": agent, "providerId": "codex"}
+                    ],
+                    "spaces": [
+                        {"id": Uuid::from_u128(2), "name": "Readable",
+                         "created_at": "2026-01-01T00:00:00Z", "color": "teal",
+                         "is_expanded": "folded"},
+                        {"id": Uuid::from_u128(3), "name": {"localized": "Later"},
+                         "created_at": "2026-01-01T00:00:00Z"}
                     ]
                 },
                 {"project": {"id": 7, "rootPath": ["not", "a", "path"]}}
@@ -1665,7 +1731,12 @@ mod tests {
             record.native_bindings[0].agent_access,
             Some(AgentAccess::Supervised)
         );
-        for key in ["agents", "workspaces", "native_bindings"] {
+        // A space reads with what it can: an unknown colour is kept as
+        // written, and a malformed disclosure reads as open.
+        assert_eq!(record.spaces.len(), 1);
+        assert_eq!(record.spaces[0].space.color.as_deref(), Some("teal"));
+        assert!(record.spaces[0].is_expanded);
+        for key in ["agents", "workspaces", "native_bindings", "spaces"] {
             assert_eq!(record.unreadable.elements(key).len(), 1, "{key}");
         }
     }
@@ -1683,13 +1754,115 @@ mod tests {
         assert_eq!(written["projects"][1], original["projects"][1]);
         let project = &written["projects"][0];
         assert_eq!(project["agents"][0]["title"], "Renamed here");
-        for key in ["agents", "workspaces", "native_bindings"] {
+        for key in ["agents", "workspaces", "native_bindings", "spaces"] {
             assert_eq!(project[key][1], original["projects"][0][key][1], "{key}");
         }
 
         // And again, as a second save reads the first one back.
         let reread: PersistedApp = serde_json::from_value(written.clone()).unwrap();
         assert_eq!(serde_json::to_value(&reread).unwrap(), written);
+    }
+
+    #[test]
+    fn spaces_round_trip_with_their_disclosure_and_old_files_have_none() {
+        let legacy: PersistedProject = serde_json::from_str("{}").unwrap();
+        assert!(legacy.spaces.is_empty());
+        assert!(
+            serde_json::to_value(&legacy)
+                .unwrap()
+                .get("spaces")
+                .is_none()
+        );
+
+        let mut mirrored = Space::new("Pinned");
+        mirrored.codex_section = Some("section-1".into());
+        mirrored.color = Some("blue".into());
+        let mut agent = Agent::new("Grouped");
+        agent.space = Some(mirrored.id);
+        let record = PersistedProject {
+            agents: vec![agent.clone()],
+            spaces: vec![
+                PersistedSpace::new(mirrored.clone()),
+                PersistedSpace {
+                    space: Space::new("Folded"),
+                    is_expanded: false,
+                },
+            ],
+            ..Default::default()
+        };
+        let value = serde_json::to_value(&record).unwrap();
+        // One flat record per space, as the rest of the file reads.
+        assert_eq!(value["spaces"][0]["name"], "Pinned");
+        assert_eq!(value["spaces"][0]["codex_section"], "section-1");
+        assert_eq!(value["spaces"][1]["is_expanded"], false);
+        let back: PersistedProject = serde_json::from_value(value).unwrap();
+        assert_eq!(back, record);
+        assert_eq!(back.agents[0].space, Some(mirrored.id));
+    }
+
+    #[test]
+    fn a_membership_survives_normalizing_only_while_its_space_is_held() {
+        // Carried, a newer build's space keeps its threads: they read as
+        // ungrouped here and go back to it there.
+        let kept = Space::new("Kept");
+        let carried = Uuid::new_v4();
+        let mut threads: Vec<Agent> = (0..3).map(|i| Agent::new(format!("T{i}"))).collect();
+        threads[0].space = Some(kept.id);
+        threads[1].space = Some(carried);
+        threads[2].space = Some(Uuid::new_v4());
+        let mut value = serde_json::to_value(PersistedProject {
+            agents: threads.clone(),
+            spaces: vec![
+                PersistedSpace::new(kept.clone()),
+                // A repeated id is the first record's.
+                PersistedSpace::new(Space {
+                    name: "Duplicate".into(),
+                    ..kept.clone()
+                }),
+            ],
+            ..Default::default()
+        })
+        .unwrap();
+        value["spaces"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!({"id": carried, "name": 7}));
+        let project: PersistedProject = serde_json::from_value(value).unwrap();
+        let mut app = PersistedApp {
+            projects: vec![project],
+            ..Default::default()
+        };
+        app.normalize();
+        let record = &app.projects[0];
+        assert_eq!(record.spaces.len(), 1);
+        assert_eq!(record.spaces[0].space.name, "Kept");
+        assert_eq!(record.agents[0].space, Some(kept.id));
+        assert_eq!(record.agents[1].space, Some(carried));
+        assert_eq!(record.agents[2].space, None, "a gone space groups nothing");
+    }
+
+    #[test]
+    fn a_bindings_section_is_optional_and_a_bad_one_costs_only_itself() {
+        let binding = serde_json::json!({
+            "agentId": Uuid::from_u128(1), "providerId": "codex", "sessionId": "s",
+            "updatedAt": "2026-01-01T00:00:00Z",
+        });
+        let read: PersistedBinding = serde_json::from_value(binding.clone()).unwrap();
+        assert_eq!(read.section, None);
+        assert!(
+            serde_json::to_value(&read)
+                .unwrap()
+                .get("section")
+                .is_none()
+        );
+        let mut with = binding.clone();
+        with["section"] = serde_json::json!("pinned");
+        let read: PersistedBinding = serde_json::from_value(with).unwrap();
+        assert_eq!(read.section.as_deref(), Some("pinned"));
+        let mut bad = binding;
+        bad["section"] = serde_json::json!({"id": 1});
+        let read: PersistedBinding = serde_json::from_value(bad).expect("the binding reads");
+        assert_eq!(read.section, None);
     }
 
     #[test]

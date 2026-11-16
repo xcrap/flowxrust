@@ -22,6 +22,16 @@ pub struct Agent {
     /// go back to this one when the reader sends them.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub review_of: Option<Uuid>,
+    /// The space this thread is grouped in, in its own project. Unset is
+    /// ungrouped. An id that names no space reads as ungrouped too, and a
+    /// value this build cannot read as unset, so one bad value never costs
+    /// the thread.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "uuid_or_none"
+    )]
+    pub space: Option<Uuid>,
     #[serde(default)]
     pub configuration: AgentConfiguration,
     #[serde(default)]
@@ -36,6 +46,7 @@ impl Agent {
             title: title.into(),
             workspace: None,
             review_of: None,
+            space: None,
             configuration: AgentConfiguration::default(),
             execution_state: AgentExecutionState::Idle,
             created_at: now(),
@@ -48,6 +59,7 @@ impl Agent {
             title: title.into(),
             workspace: None,
             review_of: None,
+            space: None,
             configuration: AgentConfiguration::default(),
             execution_state: AgentExecutionState::Idle,
             created_at: now(),
@@ -97,6 +109,14 @@ impl<'de> Deserialize<'de> for AgentExecutionState {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         known_or_default(deserializer, &Self::ALL)
     }
+}
+
+/// An optional id, and anything that is not one as absent.
+fn uuid_or_none<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<Uuid>, D::Error> {
+    let value = serde_json::Value::deserialize(deserializer)?;
+    Ok(value.as_str().and_then(|id| id.parse().ok()))
 }
 
 /// Read a unit variant by the name its `Serialize` writes, and anything else as
@@ -322,6 +342,30 @@ pub const ALL_EFFORTS: [&str; 8] = [
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_threads_space_is_optional_and_a_bad_value_costs_only_the_membership() {
+        let mut agent = Agent::new("Grouped");
+        assert!(
+            serde_json::to_value(&agent).unwrap().get("space").is_none(),
+            "an ungrouped thread writes nothing"
+        );
+        let space = Uuid::new_v4();
+        agent.space = Some(space);
+        let back: Agent = serde_json::from_value(serde_json::to_value(&agent).unwrap()).unwrap();
+        assert_eq!(back.space, Some(space));
+        for bad in [
+            serde_json::json!(7),
+            serde_json::json!("not-an-id"),
+            serde_json::json!({}),
+        ] {
+            let mut value = serde_json::to_value(&agent).unwrap();
+            value["space"] = bad;
+            let read: Agent = serde_json::from_value(value).expect("the thread still reads");
+            assert_eq!(read.title, "Grouped");
+            assert_eq!(read.space, None);
+        }
+    }
 
     #[test]
     fn a_default_configuration_inherits_everything() {
