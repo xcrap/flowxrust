@@ -181,16 +181,54 @@ before styling a screen ad hoc.
 | `checkbox` | A labelled checkbox whose whole row toggles. |
 | `checklist` | A read-only checklist: done, active (spinning while live) and pending rows on one surface. |
 | `surface` | Card, panel, divider, banner, empty state, section header, and `floating`/`floating_scroll`: a popover's shadow, hairline edge and corner around content that may scroll. |
-| `status` | Badge, activity dot, typing indicator, context-usage ring, and `status_glyph` (running, done, failed, stopped) at one size. |
+| `status` | Badge, activity dot, typing indicator, context-usage ring, and `status_glyph` (running, done, failed, stopped): the finished marks share one Small slot, and running is the spinner at its own size. |
 | `segmented` | Segmented control for exclusive choices. |
 | `settings` | The preferences vocabulary: a section heading over a group card whose rows (title, description, trailing control) are split by hairlines, the navigation's group label and search field, a breadcrumb, and an on/off `switch`. |
 | `tooltip` | Hover tooltip body. |
 | `menu` | Dropdown and context-menu panels, plus `MenuLayer`, the one-open-menu-at-a-time owner. |
 | `menu_model` | `MenuItem` / `MenuSection` / `MenuModel`, and the highlight and keyboard-navigation rules. |
+| `dialog` | Every modal: the dialog shadow on the surface (never on a padded wrapper), one title role, a ghost close, a footer; its `capture_key_down` calls `cycle_focus` first, so Tab and Shift-Tab move between its controls and Space presses the focused one. |
+| `loading` | `loading_spinner(id)` for work whose end FlowX cannot see coming, on the shared beat. |
+| `motion` | `request_activity_frame` and the activity `Beat`: every continuous phase is read from one `Instant`, 12 beats a second (half that in a window that is not key), and an element asks for its next beat only while it is drawn. |
 
 Color decisions live in the `*_palette` and `*_ink` helpers rather than inline
 in the element tree, so they can be asserted without a window. Prefer those
 functions; the element builders just apply them.
+
+A few layout rules the views keep:
+
+- **GPUI's overflow mask is a plain rectangle**, so a filled row inside a
+  rounded panel takes the panel's corners itself (`fx_inner_corners`).
+- **A control that shows on hover changes its opacity**
+  (`revealed_on_hover`), never its visibility: a hidden element gets no
+  hitbox, and the row's actions must stay reachable.
+- **A path is drawn with `path_label`**, which gives up folders before the
+  file name; GPUI 0.2.2 can only truncate at the end.
+- **A selected row keeps its fill under the pointer** (`list_row_fill`).
+- **A finished call's status mark is Small (11pt).** At Medium (14pt) it made
+  GPUI's list reserve about 5,300pt for an activity group once it was opened,
+  in the real app on two threads: the group sat at the top of that slot and
+  the prompt above it was pushed out of view, so the transcript read as
+  blank above the reply. Bisected to that one size, and gone at 11pt. The
+  test platform's text system does not reproduce it, so check a change to a
+  row's marks in the running app.
+
+### Motion
+
+Continuous motion (spinners, the waiting pulse, typing dots, the caret) asks
+for its next beat from the element that draws it, through
+`request_activity_frame`; it never counts render passes and never uses GPUI's
+`with_animation`, which asks for a frame on every refresh and loses its clock
+when its element is not drawn. Timers that are not motion use `on_the_beat`,
+so they share a frame with the spinner. A one-shot entrance (menus, the
+palette, the @ picker, approval and question cards) stores its own start and
+asks for frames only until it settles; closing is instant. A panel slide lays
+the centre out at its widest width for the whole slide and clips it, because
+`gpui::list` drops every row height when its width changes. Reduce Motion is
+read from `NSWorkspace` in `fx-app` (`motion_preference.rs`) at first draw and
+on each activation and stored on the theme: offsets and slides go, spinners
+still, fades stay. State a timer reads back belongs in an app `Global`, never a
+thread-local: two test apps on one thread share thread-locals and window ids.
 
 ### Menus
 
@@ -1354,6 +1392,11 @@ Each view test builds its own `TestAppContext` and its own `TempDir`. Sharing on
 store directory across tests is a race: they run concurrently in one process and
 overwrite each other's snapshot, which surfaces as a test that fails only in a
 full run.
+
+Test windows are not key, so motion in them runs at half the beat unless a
+test activates the window, and an update and a refresh each draw a frame:
+compare debug bounds taken from the same frame. `debug_bounds` takes only a
+`&'static str`, so a selector built with `format!` is found by a literal.
 
 `VisualTestContext::debug_bounds` proves something was drawn, never that it
 went away: GPUI 0.2.2's `Frame::clear` does not clear the frame's debug

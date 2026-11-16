@@ -321,9 +321,16 @@ impl StatusGlyph {
 }
 
 /// The one size every status glyph is drawn at, so a done mark, a failure
-/// and the spinner beside them line up. The spinner's ring is 14pt, which is
-/// this size's edge at the standard text size.
-pub const STATUS_GLYPH_SIZE: IconSize = IconSize::Medium;
+/// and a stopped mark line up.
+///
+/// Small, not Medium. At 14pt, a finished call's mark made GPUI's list
+/// reserve about 5,300pt for an activity group once it was opened: the group
+/// was laid out at the top of that slot and everything above it, the prompt
+/// included, was pushed out of view, leaving the transcript blank above the
+/// reply. Seen in the real app on two threads and gone at 11pt; the test
+/// platform's text system does not reproduce it, so no view test can catch
+/// a change back.
+pub const STATUS_GLYPH_SIZE: IconSize = IconSize::Small;
 
 /// The colour of a status glyph.
 ///
@@ -355,8 +362,10 @@ pub fn status_glyph(glyph: StatusGlyph, live: bool) -> gpui::AnyElement {
     let ink = status_glyph_ink(glyph, &theme);
     let slot = Typography::icon(STATUS_GLYPH_SIZE, &theme).size;
     let mark = match glyph {
-        StatusGlyph::Running if live => super::spinner(ink).into_any_element(),
-        StatusGlyph::Running => static_ring(ink).into_any_element(),
+        // The spinner keeps its own size: squeezed into the marks' slot, its
+        // ring spilled over the edges.
+        StatusGlyph::Running if live => return super::spinner(ink).into_any_element(),
+        StatusGlyph::Running => return static_ring(ink).into_any_element(),
         StatusGlyph::Done => Icon::CHECKMARK_CIRCLE_FILL.render(STATUS_GLYPH_SIZE, ink, &theme),
         StatusGlyph::Failed => Icon::XMARK_CIRCLE_FILL.render(STATUS_GLYPH_SIZE, ink, &theme),
         StatusGlyph::Stopped => Icon::STOP_CIRCLE_FILL.render(STATUS_GLYPH_SIZE, ink, &theme),
@@ -802,14 +811,14 @@ mod tests {
     }
 
     #[test]
-    fn every_status_glyph_shares_the_spinners_size() {
-        // The transcript drew a 9pt check, an 11pt failure and a 14pt
-        // spinner side by side. One slot, the spinner's, holds all four.
+    fn every_finished_mark_shares_one_size_no_larger_than_the_spinner() {
+        // The transcript drew a 9pt check and an 11pt failure side by side.
+        // They share one slot now, and at 14pt that slot made GPUI's list
+        // mis-measure an opened group of finished calls, so it stays at
+        // Small; the spinner keeps its own ring.
         let theme = Theme::default();
-        assert_eq!(
-            Typography::icon(STATUS_GLYPH_SIZE, &theme).size,
-            SPINNER_RING_SIZE
-        );
+        assert_eq!(STATUS_GLYPH_SIZE, IconSize::Small);
+        assert!(Typography::icon(STATUS_GLYPH_SIZE, &theme).size <= SPINNER_RING_SIZE);
     }
 
     #[test]
