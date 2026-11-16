@@ -14,6 +14,7 @@ pub mod flowx_tools;
 pub mod image_correlation;
 pub mod mention;
 pub mod message_search;
+pub mod orchestrator;
 pub mod prompt_context;
 pub mod review;
 pub mod transcript_grouping;
