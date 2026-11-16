@@ -11,6 +11,7 @@ fx-agent.workspace = true
 fx-core.workspace = true
 fx-design.workspace = true
 fx-store.workspace = true
+fx-bridge.workspace = true
 gpui.workspace = true
 uuid.workspace = true
 serde_json.workspace = true

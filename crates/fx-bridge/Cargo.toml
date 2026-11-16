@@ -1,0 +1,23 @@
+[package]
+name = "fx-bridge"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "FlowX's MCP bridge: the stdio server agents launch, and the app's socket it forwards to."
+
+[dependencies]
+fx-core.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+# `net` for the Unix socket and `io-std` for the server's stdio. Neither is
+# in the workspace's own feature list, because nothing else needs them.
+tokio = { workspace = true, features = ["net", "io-std", "rt", "time", "io-util", "sync", "macros"] }
+sha2.workspace = true
+tempfile.workspace = true
+libc.workspace = true
+uuid.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["net", "io-std", "rt", "rt-multi-thread", "time", "io-util", "sync", "macros", "test-util"] }

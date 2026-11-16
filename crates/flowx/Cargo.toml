@@ -10,11 +10,17 @@ name = "flowx"
 path = "src/main.rs"
 
 [dependencies]
-# The binary's only job is to resolve state from disk and open the window.
-# Everything else is in `fx-app`, which is where the tests reach it from.
+# The binary's only jobs are to resolve state from disk and open the window,
+# or to serve FlowX's tools over MCP. Everything else is in `fx-app` and
+# `fx-bridge`, which is where the tests reach it from.
 fx-app.workspace = true
+fx-bridge.workspace = true
 fx-store.workspace = true
 gpui.workspace = true
-anyhow.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
+tempfile.workspace = true
+uuid.workspace = true

@@ -1,14 +1,27 @@
 //! FlowX.
 //!
-//! A `main` that opens the window. Everything else lives in `fx-app`; keeping
-//! this file empty of policy is what lets the whole app be driven from a test.
+//! A `main` that opens the window, or, given `--mcp-server`, serves FlowX's
+//! tools to the agent that launched it. Everything else lives in `fx-app` and
+//! `fx-bridge`; keeping this file empty of policy is what lets the whole app
+//! be driven from a test.
+
+use std::process::ExitCode;
 
 use fx_app::{AppState, open_window};
 use fx_store::AppPaths;
 use gpui::{App, AppContext, Application};
 use tracing_subscriber::EnvFilter;
 
-fn main() -> anyhow::Result<()> {
+fn main() -> ExitCode {
+    // Before anything else: stdout is the MCP channel in that mode, and the
+    // app must not start a window, a log subscriber or anything that writes.
+    if std::env::args_os()
+        .nth(1)
+        .is_some_and(|argument| argument == fx_bridge::SERVER_FLAG)
+    {
+        return fx_bridge::server::run_from_env();
+    }
+
     // Logs go to stderr so a launch from a terminal is still diagnosable, and
     // the filter is overridable because provider failures are the thing people
     // need to see when something goes wrong.
@@ -39,5 +52,5 @@ fn main() -> anyhow::Result<()> {
             }
         });
 
-    Ok(())
+    ExitCode::SUCCESS
 }

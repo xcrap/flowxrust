@@ -5,6 +5,7 @@ members = [
     "crates/fx-design",
     "crates/fx-agent",
     "crates/fx-store",
+    "crates/fx-bridge",
     "crates/fx-term",
     "crates/fx-app",
     "crates/flowx",
@@ -24,6 +25,7 @@ fx-core = { path = "crates/fx-core" }
 fx-design = { path = "crates/fx-design" }
 fx-agent = { path = "crates/fx-agent" }
 fx-store = { path = "crates/fx-store" }
+fx-bridge = { path = "crates/fx-bridge" }
 fx-term = { path = "crates/fx-term" }
 fx-app = { path = "crates/fx-app" }
 
