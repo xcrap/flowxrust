@@ -82,6 +82,26 @@ pub struct RecordIndex {
     /// order.
     pub archived: Rc<[usize]>,
     pub unseen: HashSet<Uuid>,
+    /// The spaces the sidebar draws, in their order, each with its listed
+    /// threads. A space mirroring a provider's section is drawn only while
+    /// it lists a thread; one of the reader's own is drawn empty too, since
+    /// they just made it to put threads in.
+    pub spaces: Rc<[SpaceIndex]>,
+    /// The listed threads in no space the sidebar draws, in its order.
+    pub ungrouped: Rc<[usize]>,
+    /// Each listed thread's space, for the threads in one that is drawn.
+    pub space_of: HashMap<Uuid, Uuid>,
+}
+
+/// One space's share of its record's index.
+#[derive(Debug, Clone)]
+pub struct SpaceIndex {
+    /// Where the space is in the record's `spaces`.
+    pub slot: usize,
+    pub id: Uuid,
+    /// Its listed threads, as positions in the record's `agents`, in the
+    /// sidebar's order: newest first, as everywhere.
+    pub threads: Rc<[usize]>,
 }
 
 /// Maps over one generation of the snapshot.
@@ -139,13 +159,49 @@ impl SnapshotIndex {
             .project
             .as_ref()
             .map_or(&[][..], |project| project.agent_order.as_slice());
-        let visible = order
+        let visible: Rc<[usize]> = order
             .iter()
             .filter(|id| !archived.contains(id) && !missing.contains(id))
             .filter_map(|id| slots.get(id).copied())
             .collect();
+        // One pass over the listed threads, whatever the number of spaces.
+        let mut space_slots: HashMap<Uuid, usize> = HashMap::with_capacity(record.spaces.len());
+        for (slot, space) in record.spaces.iter().enumerate() {
+            space_slots.entry(space.space.id).or_insert(slot);
+        }
+        let mut grouped: Vec<Vec<usize>> = vec![Vec::new(); record.spaces.len()];
+        let mut ungrouped = Vec::new();
+        let mut space_of = HashMap::new();
+        for &slot in visible.iter() {
+            let agent = &record.agents[slot];
+            match agent.space.and_then(|space| space_slots.get(&space)) {
+                Some(&at) => {
+                    grouped[at].push(slot);
+                    space_of.insert(agent.id, record.spaces[at].space.id);
+                }
+                None => ungrouped.push(slot),
+            }
+        }
+        let spaces = record
+            .spaces
+            .iter()
+            .enumerate()
+            .zip(grouped)
+            .filter(|((slot, space), threads)| {
+                space_slots.get(&space.space.id) == Some(slot)
+                    && (space.space.codex_section.is_none() || !threads.is_empty())
+            })
+            .map(|((slot, space), threads)| SpaceIndex {
+                slot,
+                id: space.space.id,
+                threads: threads.into(),
+            })
+            .collect();
         RecordIndex {
             visible,
+            spaces,
+            ungrouped: ungrouped.into(),
+            space_of,
             ordered: order.iter().copied().collect(),
             archived: record
                 .agents
@@ -282,5 +338,73 @@ mod tests {
             "first"
         );
         assert!(index.binding(&snapshot, ids[1]).is_none());
+    }
+
+    #[test]
+    fn spaces_list_their_threads_in_the_sidebars_order_and_the_rest_are_ungrouped() {
+        use fx_store::PersistedSpace;
+        let mut agents: Vec<Agent> = (0..6).map(|i| Agent::new(format!("T{i}"))).collect();
+        let ids: Vec<Uuid> = agents.iter().map(|agent| agent.id).collect();
+        let work = fx_core::Space::new("Work");
+        let empty = fx_core::Space::new("Empty");
+        let mut mirrored = fx_core::Space::new("Pinned");
+        mirrored.codex_section = Some("pinned".into());
+        let mut drained = fx_core::Space::new("Drained");
+        drained.codex_section = Some("drained".into());
+        agents[0].space = Some(work.id);
+        agents[2].space = Some(work.id);
+        agents[3].space = Some(mirrored.id);
+        // Archived, so the mirrored space it is in lists nothing.
+        agents[4].space = Some(drained.id);
+        // A space that is not there groups nothing.
+        agents[5].space = Some(Uuid::new_v4());
+        let mut project = Project::new("/tmp/spaces");
+        project.agent_order = vec![ids[2], ids[5], ids[0], ids[1], ids[3], ids[4]];
+        let snapshot = Versioned::new(PersistedApp {
+            projects: vec![PersistedProject {
+                project: Some(project),
+                agents: agents.clone(),
+                archived_agent_ids: vec![ids[4]],
+                spaces: vec![
+                    PersistedSpace::new(work.clone()),
+                    PersistedSpace::new(empty.clone()),
+                    PersistedSpace::new(mirrored.clone()),
+                    PersistedSpace::new(drained.clone()),
+                ],
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
+        let index = SnapshotIndex::build(&snapshot);
+        let record = &index.records[0];
+        let names = |slots: &[usize]| -> Vec<Uuid> {
+            slots
+                .iter()
+                .map(|&slot| snapshot.projects[0].agents[slot].id)
+                .collect()
+        };
+        let drawn: Vec<(Uuid, Vec<Uuid>)> = record
+            .spaces
+            .iter()
+            .map(|space| (space.id, names(&space.threads)))
+            .collect();
+        assert_eq!(
+            drawn,
+            vec![
+                (work.id, vec![ids[2], ids[0]]),
+                (empty.id, vec![]),
+                (mirrored.id, vec![ids[3]]),
+            ]
+        );
+        assert_eq!(record.spaces[2].slot, 2);
+        assert_eq!(names(&record.ungrouped), vec![ids[5], ids[1]]);
+        assert_eq!(record.space_of.get(&ids[0]), Some(&work.id));
+        assert_eq!(record.space_of.get(&ids[5]), None);
+        assert_eq!(record.space_of.get(&ids[4]), None, "archived is not listed");
+        // The flat list is what it was: search and ⌘1–9 read it.
+        assert_eq!(
+            names(&record.visible),
+            vec![ids[2], ids[5], ids[0], ids[1], ids[3]]
+        );
     }
 }

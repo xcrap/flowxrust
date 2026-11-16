@@ -979,6 +979,7 @@ impl AppState {
         let project_id = self.project_for_agent(agent_id)?;
         let source = self.thread(agent_id)?.clone();
         let workspace = source.workspace.clone();
+        let space = source.space;
         self.composer.reference_picks.remove(&agent_id);
         if self
             .find
@@ -1016,6 +1017,8 @@ impl AppState {
             {
                 agent.configuration = configuration;
                 agent.workspace = workspace;
+                // Its replacement takes its place in the space too.
+                agent.space = space;
             }
             self.save();
             return Some(fresh);
@@ -1264,6 +1267,199 @@ impl AppState {
             ));
         }
         true
+    }
+
+    // ── Spaces ──────────────────────────────────────────────────────────
+
+    /// A space, and the project it is in.
+    pub fn space(&self, space_id: Uuid) -> Option<(Uuid, &fx_store::PersistedSpace)> {
+        self.snapshot.projects.iter().find_map(|record| {
+            let space = record
+                .spaces
+                .iter()
+                .find(|space| space.space.id == space_id)?;
+            Some((record.project.as_ref()?.id, space))
+        })
+    }
+
+    /// The spaces of a project, in the order the sidebar draws them.
+    pub fn spaces_of(&self, project_id: Uuid) -> &[fx_store::PersistedSpace] {
+        self.snapshot
+            .projects
+            .iter()
+            .find(|record| record.project.as_ref().is_some_and(|p| p.id == project_id))
+            .map_or(&[], |record| record.spaces.as_slice())
+    }
+
+    /// Whether the workspace may be edited at all, saying why not.
+    fn spaces_can_change(&mut self) -> bool {
+        if !self.snapshot_writable {
+            self.last_error = Some(
+                "The saved workspace could not be read. Restore its files before changing spaces."
+                    .into(),
+            );
+            return false;
+        }
+        true
+    }
+
+    /// Make a space in a project and, when `thread` names one of the
+    /// project's threads, move that thread into it, saved in one write.
+    /// Returns the new space; `None`, with `last_error` saying why, when the
+    /// name is blank, the project or thread is gone, or the save failed.
+    ///
+    /// A new space goes last: spaces keep the order they were made in, so a
+    /// space the reader has learned the place of does not move.
+    pub fn create_space(
+        &mut self,
+        project_id: Uuid,
+        name: &str,
+        thread: Option<Uuid>,
+    ) -> Option<Uuid> {
+        if !self.spaces_can_change() {
+            return None;
+        }
+        let Some(name) = fx_core::Space::clean_name(name) else {
+            self.last_error = Some("Enter a name for this space.".into());
+            return None;
+        };
+        let mut next = self.snapshot.clone();
+        let Some(record) = next
+            .projects
+            .iter_mut()
+            .find(|record| record.project.as_ref().is_some_and(|p| p.id == project_id))
+        else {
+            self.last_error = Some("This project is no longer open.".into());
+            return None;
+        };
+        let space = fx_core::Space::new(name);
+        let id = space.id;
+        record.spaces.push(fx_store::PersistedSpace::new(space));
+        if let Some(thread) = thread {
+            let Some(agent) = record.agents.iter_mut().find(|agent| agent.id == thread) else {
+                self.last_error = Some("This thread is no longer available.".into());
+                return None;
+            };
+            agent.space = Some(id);
+        }
+        // Where the reader can see it.
+        record.is_expanded = true;
+        self.commit_thread_change(next, "save this space")
+            .then_some(id)
+    }
+
+    /// Change one space in place and save it.
+    fn change_space(
+        &mut self,
+        space_id: Uuid,
+        action: &str,
+        edit: impl FnOnce(&mut fx_store::PersistedProject, usize),
+    ) -> bool {
+        if !self.spaces_can_change() {
+            return false;
+        }
+        let mut next = self.snapshot.clone();
+        let Some((record, at)) = next.projects.iter_mut().find_map(|record| {
+            let at = record
+                .spaces
+                .iter()
+                .position(|space| space.space.id == space_id)?;
+            Some((record, at))
+        }) else {
+            self.last_error = Some("This space no longer exists.".into());
+            return false;
+        };
+        edit(record, at);
+        self.commit_thread_change(next, action)
+    }
+
+    pub fn rename_space(&mut self, space_id: Uuid, name: &str) -> bool {
+        let Some(name) = fx_core::Space::clean_name(name) else {
+            self.last_error = Some("Enter a name for this space.".into());
+            return false;
+        };
+        self.change_space(space_id, "rename this space", |record, at| {
+            record.spaces[at].space.name = name;
+        })
+    }
+
+    /// Colour a space with one of the accent names, or clear it with `None`.
+    pub fn set_space_color(&mut self, space_id: Uuid, color: Option<&str>) -> bool {
+        let color = match color {
+            Some(name) => match fx_core::Space::known_color(name) {
+                Some(known) => Some(known.to_string()),
+                None => {
+                    self.last_error = Some(format!("{name} is not a space colour."));
+                    return false;
+                }
+            },
+            None => None,
+        };
+        self.change_space(space_id, "colour this space", |record, at| {
+            record.spaces[at].space.color = color;
+        })
+    }
+
+    /// Remove a space. Its threads stay where they are in the project,
+    /// ungrouped; nothing else is deleted.
+    pub fn delete_space(&mut self, space_id: Uuid) -> bool {
+        self.change_space(space_id, "delete this space", |record, at| {
+            record.spaces.remove(at);
+            for agent in &mut record.agents {
+                if agent.space == Some(space_id) {
+                    agent.space = None;
+                }
+            }
+        })
+    }
+
+    /// Put a thread in one of its project's spaces, or, with `None`, in
+    /// none. A running thread may move: a space is where it is listed, not
+    /// anything its turn reads.
+    pub fn move_thread_to_space(&mut self, agent_id: Uuid, space: Option<Uuid>) -> bool {
+        if !self.spaces_can_change() {
+            return false;
+        }
+        let mut next = self.snapshot.clone();
+        let Some(record) = next
+            .projects
+            .iter_mut()
+            .find(|record| record.agents.iter().any(|agent| agent.id == agent_id))
+        else {
+            self.last_error = Some("This thread is no longer available.".into());
+            return false;
+        };
+        if let Some(space) = space
+            && !record.spaces.iter().any(|held| held.space.id == space)
+        {
+            self.last_error = Some("That space is not in this thread's project.".into());
+            return false;
+        }
+        let agent = record
+            .agents
+            .iter_mut()
+            .find(|agent| agent.id == agent_id)
+            .unwrap();
+        if agent.space == space {
+            return true;
+        }
+        agent.space = space;
+        self.commit_thread_change(next, "move this thread")
+    }
+
+    /// Show or hide a space's threads, as a project's disclosure does.
+    pub fn toggle_space_expansion(&mut self, space_id: Uuid) {
+        let Some(space) = self
+            .snapshot
+            .projects
+            .iter_mut()
+            .flat_map(|record| record.spaces.iter_mut())
+            .find(|space| space.space.id == space_id)
+        else {
+            return;
+        };
+        space.is_expanded = !space.is_expanded;
+        self.save();
     }
 
     pub fn toggle_sidebar(&mut self) {
@@ -11375,6 +11571,272 @@ mod reset_tests {
                 assert!(state.last_error.is_some());
                 let conversation = state.conversation_by_agent(first).unwrap();
                 assert_eq!(conversation.lock().unwrap().message_count(), 1);
+            })
+        });
+    }
+}
+
+#[cfg(test)]
+mod space_tests {
+    use super::*;
+    use fx_store::PersistedProject;
+
+    /// Two projects: one with three threads, one with one.
+    fn workspace(cx: &mut App, root: &std::path::Path) -> (Entity<AppState>, [Uuid; 2], Vec<Uuid>) {
+        let first = root.join("first");
+        let second = root.join("second");
+        std::fs::create_dir_all(&first).unwrap();
+        std::fs::create_dir_all(&second).unwrap();
+        let agents: Vec<Agent> = (0..4).map(|i| Agent::new(format!("T{i}"))).collect();
+        let record = |root: &std::path::Path, agents: &[Agent]| {
+            let mut project = Project::new(root.to_string_lossy());
+            project.agent_order = agents.iter().map(|agent| agent.id).collect();
+            PersistedProject {
+                project: Some(project),
+                agents: agents.to_vec(),
+                is_expanded: true,
+                ..Default::default()
+            }
+        };
+        let snapshot = PersistedApp {
+            projects: vec![record(&first, &agents[..3]), record(&second, &agents[3..])],
+            ..Default::default()
+        };
+        let projects = [0, 1].map(|at| snapshot.projects[at].project.as_ref().unwrap().id);
+        let paths = AppPaths::at(root.join("state"));
+        Store::new(paths.clone()).save_app(&snapshot).unwrap();
+        (
+            cx.new(|cx| AppState::restore(paths, cx)),
+            projects,
+            agents.iter().map(|agent| agent.id).collect(),
+        )
+    }
+
+    fn saved(root: &std::path::Path) -> PersistedApp {
+        Store::new(AppPaths::at(root.join("state")))
+            .load_app()
+            .unwrap()
+    }
+
+    fn space_of(app: &PersistedApp, agent: Uuid) -> Option<Uuid> {
+        app.projects
+            .iter()
+            .flat_map(|record| &record.agents)
+            .find(|candidate| candidate.id == agent)
+            .unwrap()
+            .space
+    }
+
+    #[test]
+    fn a_space_is_made_renamed_coloured_and_deleted_and_each_change_is_saved() {
+        let temp = tempfile::tempdir().unwrap();
+        let test = gpui::TestAppContext::single();
+        let (state, [project, _], threads) = test.update(|cx| workspace(cx, temp.path()));
+        test.update(|cx| {
+            state.update(cx, |state, _| {
+                assert_eq!(state.create_space(project, "  \n ", None), None);
+                assert!(state.last_error.as_deref().unwrap().contains("name"));
+                let space = state.create_space(project, " Auth\nwork ", None).unwrap();
+                let first = &saved(temp.path()).projects[0];
+                assert_eq!(first.spaces.len(), 1);
+                assert_eq!(first.spaces[0].space.name, "Auth work");
+                assert!(first.spaces[0].is_expanded);
+                // A second goes after it.
+                let later = state.create_space(project, "Later", None).unwrap();
+                assert_eq!(
+                    state
+                        .spaces_of(project)
+                        .iter()
+                        .map(|space| space.space.id)
+                        .collect::<Vec<_>>(),
+                    vec![space, later]
+                );
+
+                assert!(!state.rename_space(space, " "));
+                assert!(state.rename_space(space, "Auth"));
+                assert!(state.set_space_color(space, Some("Emerald")));
+                assert!(!state.set_space_color(space, Some("teal")));
+                let held = &saved(temp.path()).projects[0].spaces[0].space;
+                assert_eq!(held.name, "Auth");
+                assert_eq!(held.color.as_deref(), Some("emerald"));
+                assert!(state.set_space_color(space, None));
+                assert_eq!(saved(temp.path()).projects[0].spaces[0].space.color, None);
+
+                // Deleting it ungroups its threads and deletes nothing else.
+                assert!(state.move_thread_to_space(threads[0], Some(space)));
+                assert!(state.move_thread_to_space(threads[1], Some(space)));
+                assert!(state.delete_space(space));
+                let after = saved(temp.path());
+                assert_eq!(after.projects[0].spaces.len(), 1);
+                assert_eq!(after.projects[0].agents.len(), 3);
+                assert_eq!(space_of(&after, threads[0]), None);
+                assert_eq!(space_of(&after, threads[1]), None);
+                assert!(!state.delete_space(space));
+                assert!(state.last_error.as_deref().unwrap().contains("no longer"));
+            })
+        });
+    }
+
+    #[test]
+    fn a_thread_moves_between_its_own_projects_spaces_even_while_running() {
+        let temp = tempfile::tempdir().unwrap();
+        let test = gpui::TestAppContext::single();
+        let (state, [project, other], threads) = test.update(|cx| workspace(cx, temp.path()));
+        test.update(|cx| {
+            state.update(cx, |state, _| {
+                let here = state.create_space(project, "Here", None).unwrap();
+                let there = state.create_space(other, "There", None).unwrap();
+                assert!(!state.move_thread_to_space(threads[0], Some(there)));
+                assert!(state.last_error.as_deref().unwrap().contains("project"));
+                assert_eq!(space_of(&saved(temp.path()), threads[0]), None);
+                // A turn running is no reason to refuse: nothing it reads moves.
+                state
+                    .conversation(project, threads[0])
+                    .lock()
+                    .unwrap()
+                    .set_phase(fx_agent::conversation::Phase::Running);
+                assert!(state.move_thread_to_space(threads[0], Some(here)));
+                assert_eq!(space_of(&saved(temp.path()), threads[0]), Some(here));
+                assert!(state.move_thread_to_space(threads[0], None));
+                assert_eq!(space_of(&saved(temp.path()), threads[0]), None);
+                // A new space made from a thread's menu takes the thread in
+                // the same save.
+                let made = state
+                    .create_space(project, "Made for it", Some(threads[1]))
+                    .unwrap();
+                assert_eq!(space_of(&saved(temp.path()), threads[1]), Some(made));
+                assert_eq!(
+                    state.create_space(project, "Stray", Some(threads[3])),
+                    None,
+                    "a thread of another project"
+                );
+                assert_eq!(state.spaces_of(project).len(), 2);
+            })
+        });
+    }
+
+    #[test]
+    fn archiving_keeps_a_threads_space_for_its_restore_and_deleting_takes_only_the_thread() {
+        let temp = tempfile::tempdir().unwrap();
+        let test = gpui::TestAppContext::single();
+        let (state, [project, _], threads) = test.update(|cx| workspace(cx, temp.path()));
+        test.update(|cx| {
+            state.update(cx, |state, _| {
+                let space = state.create_space(project, "Space", None).unwrap();
+                assert!(state.move_thread_to_space(threads[0], Some(space)));
+                assert!(state.move_thread_to_space(threads[1], Some(space)));
+                let listed = |state: &AppState| {
+                    let index = state.snapshot_index();
+                    index.records[0].spaces[0].threads.len()
+                };
+                assert_eq!(listed(state), 2);
+                assert!(state.set_thread_archived(threads[0], true));
+                assert_eq!(listed(state), 1, "an archived thread is not listed");
+                assert!(state.set_thread_archived(threads[0], false));
+                assert_eq!(listed(state), 2, "and comes back to its space");
+                assert!(state.delete_thread(threads[1]));
+                assert_eq!(listed(state), 1);
+                assert_eq!(saved(temp.path()).projects[0].spaces.len(), 1);
+            })
+        });
+    }
+
+    #[test]
+    fn a_removed_projects_spaces_go_with_it() {
+        let temp = tempfile::tempdir().unwrap();
+        let test = gpui::TestAppContext::single();
+        let (state, [project, other], _) = test.update(|cx| workspace(cx, temp.path()));
+        test.update(|cx| {
+            state.update(cx, |state, _| {
+                let root = state.project(project).unwrap().root_path.clone();
+                let gone = state.create_space(project, "Gone", None).unwrap();
+                state.create_space(other, "Stays", None).unwrap();
+                state.remove_project(project);
+                assert!(state.space(gone).is_none());
+                // Opened again, the folder is a new project with none.
+                let again = state.add_project(&root);
+                assert!(state.spaces_of(again).is_empty());
+                assert_eq!(state.spaces_of(other).len(), 1);
+            })
+        });
+        let after = saved(temp.path());
+        assert_eq!(
+            after
+                .projects
+                .iter()
+                .map(|record| record.spaces.len())
+                .sum::<usize>(),
+            1
+        );
+    }
+
+    #[test]
+    fn a_space_folds_and_unfolds_and_stays_as_it_was_left() {
+        let temp = tempfile::tempdir().unwrap();
+        let test = gpui::TestAppContext::single();
+        let (state, [project, _], _) = test.update(|cx| workspace(cx, temp.path()));
+        let space = test.update(|cx| {
+            state.update(cx, |state, _| {
+                let space = state.create_space(project, "Folded", None).unwrap();
+                state.toggle_space_expansion(space);
+                space
+            })
+        });
+        assert!(!saved(temp.path()).projects[0].spaces[0].is_expanded);
+        test.update(|cx| {
+            let reopened =
+                cx.new(|cx| AppState::restore(AppPaths::at(temp.path().join("state")), cx));
+            reopened.update(cx, |state, _| {
+                assert!(!state.space(space).unwrap().1.is_expanded);
+                state.toggle_space_expansion(space);
+            });
+        });
+        assert!(saved(temp.path()).projects[0].spaces[0].is_expanded);
+    }
+
+    #[test]
+    fn resetting_a_provider_thread_starts_its_replacement_in_the_same_space() {
+        let temp = tempfile::tempdir().unwrap();
+        let test = gpui::TestAppContext::single();
+        let (state, [project, _], threads) = test.update(|cx| workspace(cx, temp.path()));
+        let (space, fresh) = test.update(|cx| {
+            state.update(cx, |state, cx| {
+                let space = state.create_space(project, "Space", None).unwrap();
+                assert!(state.move_thread_to_space(threads[0], Some(space)));
+                state.select_agent(threads[0]);
+                state
+                    .conversation(project, threads[0])
+                    .lock()
+                    .unwrap()
+                    .set_session_id("provider-session");
+                state.bind_local_session(threads[0]);
+                (space, state.reset_conversation(threads[0], cx).unwrap())
+            })
+        });
+        assert_ne!(fresh, threads[0]);
+        let after = saved(temp.path());
+        assert_eq!(space_of(&after, fresh), Some(space));
+        assert_eq!(space_of(&after, threads[0]), Some(space));
+    }
+
+    #[test]
+    fn spaces_refuse_changes_while_the_saved_workspace_is_unreadable() {
+        let temp = tempfile::tempdir().unwrap();
+        let test = gpui::TestAppContext::single();
+        let (state, _, _) = test.update(|cx| workspace(cx, temp.path()));
+        test.update(|cx| {
+            state.update(cx, |state, _| {
+                let project = state.snapshot.projects[0].project.as_ref().unwrap().id;
+                state.snapshot_writable = false;
+                assert_eq!(state.create_space(project, "No", None), None);
+                assert!(
+                    state
+                        .last_error
+                        .as_deref()
+                        .unwrap()
+                        .contains("could not be read")
+                );
+                assert!(saved(temp.path()).projects[0].spaces.is_empty());
             })
         });
     }
