@@ -206,6 +206,17 @@ A few layout rules the views keep:
 - **A path is drawn with `path_label`**, which gives up folders before the
   file name; GPUI 0.2.2 can only truncate at the end.
 - **A selected row keeps its fill under the pointer** (`list_row_fill`).
+- **A turn's rows share one rhythm.** Prose, a group of calls, a plan and
+  the live tail are `Layout::TRANSCRIPT_ROW_GAP` apart, the same as a
+  paragraph inside one reply (markdown's block gap is that constant), and
+  the reader's prompt keeps `TRANSCRIPT_TURN_GAP` either side. No row adds
+  vertical padding of its own: each once padded itself and then added 24pt
+  below, and replies read 30 to 38pt apart against Claude's 16. A group's
+  header lines its words up with the prose and gives its hover padding back
+  on the leading side.
+- **A prompt's images are thumbnails above its words** (`image_thumbnail`,
+  the Swift original's 176pt at 1.6, cropped), never previews inside the
+  bubble, and the bubble takes the composer's fill (`user_message_bg`).
 - **A finished call's status mark is Small (11pt).** At Medium (14pt) it made
   GPUI's list reserve about 5,300pt for an activity group once it was opened,
   in the real app on two threads: the group sat at the top of that slot and
@@ -1129,7 +1140,18 @@ conversation rather than kept by the view:
   Codex's `update_plan` alike. Codex reports the latter only as
   `turn/plan/updated`, so the conversation records it as the `update_plan`
   call it stands for, and one checklist card per turn follows the turn's last
-  burst of work. Plan calls are not rows or counted actions.
+  burst of work. Plan calls are not rows or counted actions. Claude Code
+  2.1.325 offers newer models no task list at all unless asked, so every
+  Claude launch sets `CLAUDE_CODE_ENABLE_TODO_TOOLS=1` and
+  `CLAUDE_CODE_ENABLE_TASKS=0` (`PLAN_TOOL_ENVIRONMENT`, unless the user set
+  either): the first offers the list, the second makes it `TodoWrite`, the
+  whole list per call, rather than the `Task*` tools, which change one task
+  by an id only their results carry. Checked live: with them `TodoWrite` is
+  offered, deferred; without them it is not. The Claude desktop app keeps a
+  session's plan with its own `mcp__ccd_turn__update_plan`, mostly steps on
+  from the last list (`advance`, `done`/`start`, 1-based); the history
+  reader folds those into the whole list each left
+  (`TurnPlan::apply_desktop_update`), so a thread run there shows its plan.
 
 ## Two queues, and why they are bounded
 
