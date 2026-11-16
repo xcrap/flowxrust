@@ -133,8 +133,8 @@ pub enum TextFieldEvent {
     /// looking whole: a 45,000-character log in a 32,000-character composer
     /// lost its last third with nothing on screen to say so.
     PasteTruncated {
-        /// Characters of the paste left out, counted after its line breaks
-        /// were normalised.
+        /// Characters of the paste left out, as grapheme clusters, counted
+        /// after its line breaks were normalised.
         dropped: usize,
         /// The cap that left them out.
         max_len: usize,
@@ -492,10 +492,11 @@ impl TextField {
     /// Every rule that constrains what may live in a field lives here rather
     /// than in each caller, so a single-line field can never gain a newline, a
     /// '\r' never reaches the value, and the length cap never splits a
-    /// character. Recovered text above the cap may be edited without growing.
+    /// character, a grapheme cluster included. Recovered text above the cap
+    /// may be edited without growing.
     ///
-    /// Returns how many characters of `insert` the cap left out, so a caller
-    /// that can tell the user does.
+    /// Returns how many characters of `insert`, as grapheme clusters, the cap
+    /// left out, so a caller that can tell the user does.
     fn edit(&mut self, range: Range<usize>, insert: &str) -> usize {
         if !self.enabled {
             return 0;
@@ -511,8 +512,9 @@ impl TextField {
             self.max_len.max(self.value.chars().count())
         };
         let kept = truncate_to_max_len(&self.value, &range, &insert, limit);
-        // What is kept is always a prefix, so the rest is what was dropped.
-        let dropped = insert[kept.len()..].chars().count();
+        // What is kept is always a prefix, so the rest is what was dropped,
+        // counted as the reader counts characters: a flag left out is one.
+        let dropped = insert[kept.len()..].graphemes(true).count();
 
         let head = range.start + kept.len();
         self.value.replace_range(range, &kept);
@@ -2362,7 +2364,10 @@ fn normalise_line_breaks(insert: &str, multiline: bool) -> Cow<'_, str> {
 /// What a replacement may be, once `max_len` has had its say.
 ///
 /// The cap counts characters, not bytes: a field capped at ten has room for ten
-/// emoji, and truncating by bytes would cut one in half.
+/// emoji, and truncating by bytes would cut one in half. What it keeps is
+/// whole grapheme clusters, as many as fit: cut by `char`, a flag at the cap
+/// kept one of its two regional indicators, and a family emoji a person or two
+/// of its members.
 fn truncate_to_max_len(value: &str, range: &Range<usize>, insert: &str, max_len: usize) -> String {
     if max_len == 0 {
         return insert.to_string();
@@ -2372,7 +2377,16 @@ fn truncate_to_max_len(value: &str, range: &Range<usize>, insert: &str, max_len:
     if insert.chars().count() <= room {
         return insert.to_string();
     }
-    insert.chars().take(room).collect()
+    let mut used = 0;
+    let mut end = 0;
+    for (at, grapheme) in insert.grapheme_indices(true) {
+        used += grapheme.chars().count();
+        if used > room {
+            break;
+        }
+        end = at + grapheme.len();
+    }
+    insert[..end].to_string()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3131,6 +3145,29 @@ mod tests {
             let field = cx.new(|cx| TextField::new(cx).max_len(2));
             field.update(cx, |field, _| field.edit(0..0, "a🜁b"));
             assert_eq!(field.read(cx).value(), "a🜁");
+        });
+    }
+
+    #[test]
+    fn a_cap_never_splits_a_grapheme_cluster_and_counts_them_left_out() {
+        // Cut by `char`, a flag at the cap kept one of its two regional
+        // indicators, a letter on its own, and a family kept a member or two.
+        let test = gpui::TestAppContext::single();
+        test.update(|cx| {
+            let edit = |max_len: usize, insert: &str, cx: &mut App| {
+                let field = cx.new(|cx| TextField::new(cx).max_len(max_len));
+                let dropped = field.update(cx, |field, _| field.edit(0..0, insert));
+                (field.read(cx).value().to_string(), dropped)
+            };
+            // Three characters fit: the letter and the flag's two.
+            assert_eq!(edit(3, "a🇵🇹b", cx), ("a🇵🇹".into(), 1));
+            // Two do not hold the flag, so it is left out whole, and counted
+            // as the one character a reader sees.
+            assert_eq!(edit(2, "a🇵🇹b", cx), ("a".into(), 2));
+            assert_eq!(edit(3, "🇵🇹🇪🇸", cx), ("🇵🇹".into(), 1));
+            // A family is five code points: three people and two joiners.
+            assert_eq!(edit(4, "👨‍👩‍👧", cx), (String::new(), 1));
+            assert_eq!(edit(6, "x👨‍👩‍👧", cx), ("x👨‍👩‍👧".into(), 0));
         });
     }
 
