@@ -287,7 +287,7 @@ fn row(
     show_selection: bool,
     on_choose: impl Fn(String, String, &mut Window, &mut App) + 'static,
     on_hover: impl Fn(String, &mut Window, &mut App) + 'static,
-) -> AnyElement {
+) -> gpui::Stateful<gpui::Div> {
     let theme = global::current();
     let palette = row_palette(item, hovered, &theme);
     let key = MenuModel::key_for(section_id, &item.id);
@@ -382,13 +382,12 @@ fn row(
         } else {
             CursorStyle::default()
         })
-        .hover(move |s: StyleRefinement| {
-            if enabled {
-                s.fx_background(Colors::bg_hover(&theme))
-            } else {
-                s
-            }
-        })
+        // No hover fill of its own: the pointer lights a row by moving the
+        // model's highlight, so it and the keyboard share one. A wash of the
+        // pointer's own lit a second row wherever the highlight was not under
+        // it, as in a submenu that opens with its first row highlighted under
+        // a pointer resting on another, and Return chose the one of the two
+        // the pointer was not on.
         .on_mouse_move(move |_, window, cx| {
             if enabled {
                 on_hover(hover_key.clone(), window, cx);
@@ -404,7 +403,6 @@ fn row(
                 }
             },
         )
-        .into_any_element()
 }
 
 /// Render the panel: sections, headers, rows, and the dividers between them.
@@ -985,6 +983,132 @@ mod tests {
         let theme = Theme::default();
         let disabled = MenuItem::new("x", "X").enabled(false);
         assert_eq!(row_palette(&disabled, true, &theme).background.a, 0.0);
+    }
+
+    /// Whether the pointer was on the row, and the fill it paints there and
+    /// at rest.
+    type Seen = Rc<std::cell::RefCell<Option<(bool, Option<gpui::Fill>, Option<gpui::Fill>)>>>;
+
+    /// Lays a row over the whole window and records the fill it would paint
+    /// with the pointer on it, beside the fill it paints at rest.
+    struct UnderPointer {
+        row: Option<gpui::Stateful<gpui::Div>>,
+        seen: Seen,
+    }
+
+    impl IntoElement for UnderPointer {
+        type Element = Self;
+
+        fn into_element(self) -> Self {
+            self
+        }
+    }
+
+    impl gpui::Element for UnderPointer {
+        type RequestLayoutState = ();
+        type PrepaintState = gpui::Hitbox;
+
+        fn id(&self) -> Option<gpui::ElementId> {
+            None
+        }
+
+        fn source_location(&self) -> Option<&'static core::panic::Location<'static>> {
+            None
+        }
+
+        fn request_layout(
+            &mut self,
+            _: Option<&gpui::GlobalElementId>,
+            _: Option<&gpui::InspectorElementId>,
+            window: &mut Window,
+            cx: &mut App,
+        ) -> (gpui::LayoutId, ()) {
+            let style = gpui::Style {
+                size: gpui::size(gpui::relative(1.0).into(), gpui::relative(1.0).into()),
+                ..Default::default()
+            };
+            (window.request_layout(style, [], cx), ())
+        }
+
+        fn prepaint(
+            &mut self,
+            _: Option<&gpui::GlobalElementId>,
+            _: Option<&gpui::InspectorElementId>,
+            bounds: gpui::Bounds<Pixels>,
+            _: &mut (),
+            window: &mut Window,
+            _: &mut App,
+        ) -> gpui::Hitbox {
+            window.insert_hitbox(bounds, gpui::HitboxBehavior::Normal)
+        }
+
+        fn paint(
+            &mut self,
+            _: Option<&gpui::GlobalElementId>,
+            _: Option<&gpui::InspectorElementId>,
+            _: gpui::Bounds<Pixels>,
+            _: &mut (),
+            hitbox: &mut gpui::Hitbox,
+            window: &mut Window,
+            cx: &mut App,
+        ) {
+            let mut row = self.row.take().expect("painted once");
+            let style = row.interactivity();
+            let pointed = style.compute_style(None, Some(hitbox), window, cx);
+            let resting = style.compute_style(None, None, window, cx);
+            *self.seen.borrow_mut() = Some((
+                hitbox.is_hovered(window),
+                pointed.background,
+                resting.background,
+            ));
+        }
+    }
+
+    struct RowProbe {
+        seen: Seen,
+    }
+
+    impl gpui::Render for RowProbe {
+        fn render(&mut self, _: &mut Window, _: &mut gpui::Context<Self>) -> impl IntoElement {
+            // Not the highlighted row: the one a resting pointer is on when a
+            // submenu opens with its first row highlighted.
+            let row = row(
+                "rows",
+                &items()[1],
+                false,
+                false,
+                |_, _, _, _| {},
+                |_, _, _| {},
+            );
+            UnderPointer {
+                row: Some(row),
+                seen: self.seen.clone(),
+            }
+        }
+    }
+
+    #[test]
+    fn the_pointer_lights_a_row_only_through_the_highlight() {
+        // Pointer and keyboard share one highlight, which a row's mouse move
+        // moves. A hover wash of the row's own lit a second row wherever the
+        // pointer rested off the highlight: a submenu opens with its first row
+        // highlighted under a pointer on another, and Return chose the lit
+        // row the pointer was not on.
+        let mut test = gpui::TestAppContext::single();
+        let seen = Rc::new(std::cell::RefCell::new(None));
+        let window = test.add_window({
+            let seen = seen.clone();
+            move |_, _| RowProbe { seen }
+        });
+        let mut visual = gpui::VisualTestContext::from_window(window.into(), &test);
+        visual.simulate_mouse_move(gpui::point(px(40.0), px(40.0)), None, Default::default());
+        test.refresh().unwrap();
+        let (hovered, pointed, resting) = seen.borrow_mut().take().expect("the row was painted");
+        assert!(hovered, "the pointer is not on the row");
+        assert_eq!(
+            pointed, resting,
+            "the pointer lit a row the highlight is not on"
+        );
     }
 
     #[test]
