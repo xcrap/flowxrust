@@ -631,6 +631,7 @@ fn make_entry(
         },
         defaults: parsed.defaults.clone(),
         waiting_elsewhere: None,
+        section: None,
         revision: format!(
             "{}:{}",
             fingerprint.revision(path),

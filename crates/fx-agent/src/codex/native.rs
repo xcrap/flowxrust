@@ -19,7 +19,7 @@ use uuid::Uuid;
 use super::session::{self, ItemKind, item_kind};
 use super::{CodexProvider, ServerEvent, Transport, TransportError};
 use crate::conversation::state::TRIVIAL_TOOL_RESULT;
-use crate::native::{NativeThread, NativeThreadIndex, NativeThreadSummary};
+use crate::native::{NativeSection, NativeThread, NativeThreadIndex, NativeThreadSummary};
 use crate::{ProviderError, ThreadIdentity, ThreadSummary};
 
 const LIST_TIMEOUT: Duration = Duration::from_secs(45);
@@ -662,7 +662,35 @@ fn summary(
         defaults: native_defaults(raw),
         revision: format!("{revision}|archive:{archived}"),
         waiting_elsewhere: waiting_on_user(raw),
+        section: section_of(raw),
     }))
+}
+
+/// The section a thread is filed under (`section: {id, name, appearance:
+/// {color, icon}}`), or none.
+///
+/// A section that cannot be read is none, never an error: a grouping is not
+/// worth a thread, and refusing the entry would hide the thread.
+fn section_of(raw: &Value) -> Option<NativeSection> {
+    let section = raw.get("section")?;
+    let id = section["id"]
+        .as_str()
+        .map(str::trim)
+        .filter(|id| !id.is_empty())?;
+    let name = section["name"]
+        .as_str()
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .unwrap_or("Codex section");
+    Some(NativeSection {
+        id: id.into(),
+        name: name.into(),
+        color: section["appearance"]["color"]
+            .as_str()
+            .map(str::trim)
+            .filter(|color| !color.is_empty())
+            .map(str::to_owned),
+    })
 }
 
 /// What a thread loaded by another app-server client is blocked on, from the
@@ -1153,8 +1181,9 @@ import json, os, sys
 root, log = sys.argv[1:3]
 def record(obj):
  with open(log,'a') as f: f.write(json.dumps(obj)+'\n')
+PINNED={'id':'019a-pinned','name':'Pinned','appearance':{'color':'blue','icon':'pin'}}
 def row(id, foreign=False):
- return {'id':id,'cwd':'/' if foreign else root,'name':id,'preview':'Preview','createdAt':1791485000,'updatedAt':1791486055,'recencyAt':1791486054,'model':'gpt-native','reasoningEffort':'high','status':{'type':'notLoaded'},'historyMode':'paginated','path':os.path.join(root,id+'.jsonl') if id.startswith('cached') else None,'turns':[]}
+ return {'id':id,'cwd':'/' if foreign else root,'name':id,'preview':'Preview','createdAt':1791485000,'updatedAt':1791486055,'recencyAt':1791486054,'model':'gpt-native','reasoningEffort':'high','status':{'type':'notLoaded'},'historyMode':'paginated','path':os.path.join(root,id+'.jsonl') if id.startswith('cached') else None,'section':PINNED if id in ('thread-1','archived-0') else None,'turns':[]}
 def turns(page):
  return [{'id':'turn-'+str(n),'startedAt':1791485000+n,'completedAt':1791485001+n,'itemsView':'full','items':[{'id':'message-'+str(n),'type':'agentMessage','text':'answer '+str(n)}]} for n in reversed(range(max(0,280-(page+1)*8),280-page*8))]
 def reply(id,result): print(json.dumps({'id':id,'result':result}),flush=True)
@@ -1166,6 +1195,8 @@ for line in sys.stdin:
  elif method=='thread/list':
   assert p['useStateDbOnly'] and p['modelProviders']==[]
   assert p['sourceKinds']==['cli','vscode','exec','appServer','unknown']
+  # Every section, unsectioned included: naming one would list only it.
+  assert 'sectionId' not in p
   page=int(p.get('cursor') or 0)
   if page==0:
    for n in range(1100): print(json.dumps({'method':'fixture/notification','params':{}}))
@@ -1402,6 +1433,28 @@ for line in sys.stdin:
                 .iter()
                 .all(|entry| entry.summary.working_directory == fixture.cwd())
         );
+        // The section each thread is filed under, archived ones included.
+        let filed: Vec<(&str, &NativeSection)> = index
+            .threads
+            .iter()
+            .filter_map(|entry| {
+                Some((
+                    entry.summary.identity.session_id.as_str(),
+                    entry.section.as_ref()?,
+                ))
+            })
+            .collect();
+        let pinned = NativeSection {
+            id: "019a-pinned".into(),
+            name: "Pinned".into(),
+            color: Some("blue".into()),
+        };
+        assert_eq!(filed.len(), 2);
+        assert!(
+            filed
+                .iter()
+                .all(|(id, section)| ["thread-1", "archived-0"].contains(id) && **section == pinned)
+        );
         let history = fixture.store.read(fixture.cwd(), "thread-0").await.unwrap();
         assert_eq!(
             history.messages.len(),
@@ -1499,6 +1552,43 @@ for line in sys.stdin:
         ] {
             assert_eq!(waiting_on_user(&json!({ "status": status })), None);
         }
+    }
+
+    #[test]
+    fn a_section_is_read_from_the_thread_and_a_malformed_one_is_none() {
+        // The shape `codex app-server generate-json-schema` gives for
+        // `Thread.section` (0.167): `{id, name, appearance: {color, icon}}`,
+        // or null.
+        let read = |section: Value| section_of(&json!({ "section": section }));
+        assert_eq!(
+            read(
+                json!({"id": "s1", "name": " Pinned ", "appearance": {"color": "rose", "icon": "pin"}})
+            ),
+            Some(NativeSection {
+                id: "s1".into(),
+                name: "Pinned".into(),
+                color: Some("rose".into()),
+            })
+        );
+        // An appearance is optional, and a section with no name is still one.
+        assert_eq!(
+            read(json!({"id": "s2", "name": "", "appearance": null})),
+            Some(NativeSection {
+                id: "s2".into(),
+                name: "Codex section".into(),
+                color: None,
+            })
+        );
+        for nothing in [
+            Value::Null,
+            json!("s3"),
+            json!({"name": "No id"}),
+            json!({"id": "  ", "name": "Blank id"}),
+            json!({"id": 4, "name": "Numeric id"}),
+        ] {
+            assert_eq!(read(nothing), None);
+        }
+        assert_eq!(section_of(&json!({})), None);
     }
 
     #[test]

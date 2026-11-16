@@ -4801,7 +4801,7 @@ fn native_binding(
         context_window_size: entry.defaults.context_window_size,
         local_history_pending: false,
         local_start: None,
-        section: None,
+        section: entry.section.as_ref().map(|section| section.id.clone()),
     }
 }
 
@@ -9064,6 +9064,7 @@ mod native_sync_tests {
             },
             revision: "revision-1".into(),
             waiting_elsewhere: None,
+            section: None,
         }
     }
 
