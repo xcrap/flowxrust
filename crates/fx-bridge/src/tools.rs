@@ -44,9 +44,13 @@ pub const MAX_RUNNING_WORKERS: usize = 4;
 /// How long the app has to answer an ordinary call.
 pub const DEFAULT_ANSWER_TIMEOUT: Duration = Duration::from_secs(20);
 /// How long a `start_thread` may take: making a worktree runs `git worktree
-/// add`, which FlowX gives two minutes, and finding the provider may ask a
-/// login shell.
-pub const START_ANSWER_TIMEOUT: Duration = Duration::from_secs(150);
+/// add`, which FlowX gives two minutes, and five checks around it ten
+/// seconds each, and finding the provider may ask a login shell for ten
+/// more. Every step's own bound fits inside it. At 150 s it could cut a
+/// start that was still within them short: the worktree, or the thread,
+/// was made after the lead had been told to try again, and a retry made
+/// another.
+pub const START_ANSWER_TIMEOUT: Duration = Duration::from_secs(240);
 /// How long `stop_thread` waits for the stopped turn to settle before it
 /// answers with what it sees.
 pub const STOP_SETTLE: Duration = Duration::from_secs(10);

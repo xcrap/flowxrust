@@ -1380,6 +1380,16 @@ impl AppState {
                 self.last_error = Some("This thread is no longer available.".into());
                 return None;
             };
+            // As `move_thread_to_space` refuses: moved, a lead would be
+            // listed in neither space, and another space's lead could reach
+            // it as a worker.
+            if agent
+                .lead_of
+                .is_some_and(|led| self.space_lead(led) == Some(thread))
+            {
+                self.last_error = Some("A space's lead stays in the space it leads.".into());
+                return None;
+            }
             agent.space = Some(id);
         }
         // Where the reader can see it.
@@ -3695,7 +3705,14 @@ impl AppState {
                         Some(last) => last.as_deref() != section.map(|section| section.id.as_str()),
                         None => section.is_some(),
                     };
-                    if section_moved {
+                    // A space's lead stays in the space it leads, as a move
+                    // made here keeps it: filed elsewhere, it was listed in
+                    // neither, and another space's lead could reach it as a
+                    // worker.
+                    let leads = record.agents[slot]
+                        .lead_of
+                        .is_some_and(|led| self.space_lead(led) == Some(id));
+                    if section_moved && !leads {
                         record.agents[slot].space = match section {
                             Some(section) => Some(match mirrors.get(&section.id) {
                                 Some(space) => *space,

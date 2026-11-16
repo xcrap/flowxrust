@@ -93,6 +93,30 @@ impl AppState {
                     .into(),
             );
         }
+        // One lead per space, by the one rule its header follows. A second
+        // thread naming the space is drawn as an ordinary row, and as a lead
+        // it could send to or stop the one the reader sees.
+        if self.space_lead(space) != Some(asking) {
+            return Err(format!(
+                "{tool} is only for a FlowX space's orchestrator, and another thread now \
+                 leads this space. Ask the user to open the space's orchestrator."
+            ));
+        }
+        // Only inside a turn the reader started: a start still being made
+        // when the reader pressed Stop, finished afterwards, would run a
+        // thread nobody asked for.
+        let stopping = self.conversations.get(&asking).is_some_and(|conversation| {
+            conversation
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .phase()
+                == fx_agent::Phase::Cancelling
+        });
+        if !self.is_thread_busy(asking) || stopping {
+            return Err(format!(
+                "{tool} works only while this thread's own turn runs, and it has ended."
+            ));
+        }
         let project = record.project.as_ref().expect("filtered on a project");
         let resolved =
             crate::configuration::with_native_defaults(agent.clone(), self.native_defaults(asking));
@@ -146,6 +170,11 @@ impl AppState {
                     agent.id != lead
                         && agent.space == Some(space)
                         && !record.missing_native_agent_ids.contains(&agent.id)
+                        // Another space's lead is never a worker, wherever
+                        // it is filed.
+                        && !agent
+                            .lead_of
+                            .is_some_and(|led| self.space_lead(led) == Some(agent.id))
                 })
             })
     }
@@ -189,7 +218,10 @@ impl AppState {
                 .collect(),
             ..limits.clone()
         };
-        let (windows, limited) = crate::thread_presentation::usage_limits(&current, now);
+        // Whether a refusal still holds is read from every window it was
+        // reported with, the ones that have reset since included.
+        let (_, limited) = crate::thread_presentation::usage_limits(limits, now);
+        let (windows, _) = crate::thread_presentation::usage_limits(&current, now);
         let hottest = windows
             .iter()
             .max_by(|a, b| a.fraction.total_cmp(&b.fraction));
@@ -265,6 +297,12 @@ impl AppState {
                 WorkerStatus::Waiting,
                 Some(format!("the user, in another app: {elsewhere}")),
             );
+        }
+        // A turn the provider's own app runs is running, whatever FlowX
+        // last saved: read as settled, a wait ended at once on a thread
+        // still at work.
+        if self.running_elsewhere(id) {
+            return (WorkerStatus::Running, None);
         }
         let status = match agent.execution_state {
             AgentExecutionState::Success => WorkerStatus::Completed,
@@ -698,8 +736,9 @@ pub(crate) fn launch(state: &Entity<AppState>, launch: Launch, cx: &mut App) -> 
         Ok(lead) => lead,
         Err(why) => return Reply::refused(format!("{why}{kept}")),
     };
+    // The thread is saved as it is made; the transcripts streaming
+    // meanwhile are the writer thread's, never flushed from here.
     let created = state.update(cx, |state, cx| {
-        state.save_all(cx);
         let created = state.create_worker(&lead, &plan, workspace.clone());
         cx.notify();
         created
@@ -748,7 +787,12 @@ fn send(state: &Entity<AppState>, asking: Uuid, thread: Uuid, prompt: &str, cx: 
             .and_then(|lead| {
                 let worker = state.worker(&lead, thread)?;
                 let title = worker.title.trim().to_owned();
-                if state.is_thread_busy(thread) {
+                // A turn in another app holds the session too: a second
+                // process resuming it would answer beside it.
+                if state.is_thread_busy(thread)
+                    || state.running_elsewhere(thread)
+                    || state.waiting_elsewhere(thread).is_some()
+                {
                     return Err(match state.worker_status(worker) {
                         (WorkerStatus::Waiting, Some(what)) => format!(
                             "\"{title}\" is waiting for the user ({what}), so it takes no \
@@ -761,13 +805,26 @@ fn send(state: &Entity<AppState>, asking: Uuid, thread: Uuid, prompt: &str, cx: 
                 let root = state.project_root_for(thread).ok_or(
                     "That thread's folder is no longer available. Ask the user to look at it.",
                 )?;
-                Ok((worker.clone(), root))
+                Ok((worker.clone(), root, lead.project_id))
             })
     };
-    let (agent, root) = match checked {
+    let (agent, root, project_id) = match checked {
         Ok(target) => target,
         Err(why) => return Reply::refused(why),
     };
+    // A turn starts from the loaded transcript. One nothing has loaded is
+    // read in the background, as opening it does, never here on the UI
+    // thread, and the lead asks again.
+    let loaded = state.update(cx, |state, cx| {
+        state.request_conversation(project_id, thread, cx).is_some()
+    });
+    if !loaded {
+        return Reply::refused(format!(
+            "FlowX is opening \"{}\"'s saved transcript. Call send_to_thread again in a \
+             moment.",
+            agent.title.trim()
+        ));
+    }
     if !crate::start_turn_with(state, &root, agent, prompt.to_owned(), Vec::new(), cx) {
         return Reply::refused(
             "FlowX could not start a turn on that thread. Call wait_for_threads to see what \
@@ -990,6 +1047,12 @@ mod tests {
             .unwrap();
         let test = gpui::TestAppContext::single();
         let state = test.update(|cx| cx.new(|cx| AppState::restore(paths, cx)));
+        // A lead's calls arrive during a turn the reader started.
+        test.update(|cx| {
+            state.update(cx, |state, _| {
+                state.register_runner(lead.id, TurnRunner::detached().0)
+            })
+        });
         Fixture {
             dir,
             test,
@@ -1282,6 +1345,139 @@ mod tests {
         );
         let why = refused(ask(&fixture, fixture.lead.id, start("t")));
         assert!(why.starts_with("Claude refused its last request"), "{why}");
+        // Until the window that refused resets: held after it, every start
+        // on that provider was refused until its next turn.
+        set_limits(
+            &fixture,
+            "claude",
+            limits(1.0, -1, RateLimitStatus::Rejected),
+        );
+        plan(ask(&fixture, fixture.lead.id, start("t")));
+    }
+
+    #[test]
+    fn a_lead_acts_only_as_its_space_s_one_lead_and_only_while_its_turn_runs() {
+        let fixture = seeded();
+        // A second thread naming the space is drawn as an ordinary row, and
+        // is no lead: as one it could send to or stop the lead the reader
+        // sees.
+        let second = fixture.test.update(|cx| {
+            fixture.state.update(cx, |state, _| {
+                let mut second = agent("Old orchestrator", "claude");
+                second.lead_of = Some(fixture.space);
+                second.space = Some(fixture.space);
+                let id = second.id;
+                state.snapshot.projects[0].agents.push(second);
+                state.register_runner(id, TurnRunner::detached().0);
+                id
+            })
+        });
+        for call in [send(fixture.codex.id), stop(fixture.lead.id), start("t")] {
+            let why = refused(ask(&fixture, second, call));
+            assert!(why.contains("another thread now leads this space"), "{why}");
+        }
+        // Stopped while a start was being made: checked again as the thread
+        // is made, it makes none.
+        let raced = plan(ask(&fixture, fixture.lead.id, start("Late")));
+        fixture.test.update(|cx| {
+            fixture.state.update(cx, |state, _| {
+                state.runners.remove(&fixture.lead.id);
+            })
+        });
+        let before = thread_count(&fixture);
+        let reply = fixture.test.update(|cx| {
+            launch(
+                &fixture.state,
+                Launch {
+                    plan: *raced,
+                    workspace: None,
+                },
+                cx,
+            )
+        });
+        assert!(!reply.ok);
+        assert!(reply.text.contains("has ended"), "{}", reply.text);
+        assert_eq!(thread_count(&fixture), before);
+        let why = refused(ask(&fixture, fixture.lead.id, send(fixture.codex.id)));
+        assert!(why.contains("has ended"), "{why}");
+    }
+
+    #[test]
+    fn another_space_s_lead_is_never_a_worker_wherever_it_is_filed() {
+        let fixture = seeded();
+        let other_lead = fixture.test.update(|cx| {
+            fixture.state.update(cx, |state, _| {
+                let mut other = agent("Docs orchestrator", "codex");
+                other.lead_of = fixture.elsewhere.space;
+                other.space = Some(fixture.space);
+                let id = other.id;
+                let record = &mut state.snapshot.projects[0];
+                record.agents.push(other);
+                record.project.as_mut().unwrap().agent_order.push(id);
+                assert_eq!(state.space_lead(fixture.elsewhere.space.unwrap()), Some(id));
+                id
+            })
+        });
+        for call in [send(other_lead), stop(other_lead)] {
+            let why = refused(ask(&fixture, fixture.lead.id, call));
+            assert!(why.contains("in your space"), "{why}");
+        }
+    }
+
+    #[test]
+    fn a_worker_running_in_another_app_is_running_and_takes_no_prompt() {
+        // Read from its saved outcome, it settled a wait at once, and a
+        // prompt resumed its session in a second process beside the app's.
+        let fixture = seeded();
+        fixture.test.update(|cx| {
+            fixture.state.update(cx, |state, _| {
+                state.running_elsewhere.insert(fixture.claude.id);
+            })
+        });
+        let why = refused(ask(&fixture, fixture.lead.id, send(fixture.claude.id)));
+        assert_eq!(
+            why,
+            "\"Grammar\" is still running: call wait_for_threads first."
+        );
+        let status = fixture.test.read(|cx| {
+            let state = fixture.state.read(cx);
+            state
+                .worker_status(state.thread(fixture.claude.id).unwrap())
+                .0
+        });
+        assert_eq!(status, WorkerStatus::Running);
+    }
+
+    #[test]
+    fn a_prompt_to_a_worker_nothing_has_loaded_reads_its_transcript_in_the_background() {
+        // Read on the UI thread, a long transcript held the window while it
+        // was parsed.
+        let mut fixture = seeded();
+        let (project, worker) = (fixture.project.id, fixture.claude.id);
+        fixture.test.update(|cx| {
+            fixture.state.update(cx, |state, _| {
+                let saved = fx_store::PersistedConversation::from_messages(
+                    worker,
+                    vec![ConversationMessage::text(MessageRole::User, "Earlier")],
+                );
+                state
+                    .store
+                    .save_conversation(project, worker, &saved)
+                    .unwrap();
+                assert!(!state.conversations.contains_key(&worker));
+            })
+        });
+        let why = refused(ask(&fixture, fixture.lead.id, send(worker)));
+        assert!(why.contains("Call send_to_thread again"), "{why}");
+        fixture.test.read(|cx| {
+            let state = fixture.state.read(cx);
+            assert!(state.is_loading_conversation(worker));
+            assert!(!state.conversations.contains_key(&worker));
+        });
+        fixture.test.run_until_parked();
+        fixture.test.read(|cx| {
+            assert!(fixture.state.read(cx).conversations.contains_key(&worker));
+        });
     }
 
     #[test]

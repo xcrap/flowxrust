@@ -108,6 +108,11 @@ pub(crate) fn context_detail(
 
 /// The account's limits as the gauge shows them, and whether the provider
 /// has refused a request for them.
+///
+/// A refusal holds until the window that caused it resets: a full one, or,
+/// when none reads full, the first to reset. Held for good, it outlived its
+/// reset until the next turn on that provider, which an orchestrator was
+/// then refused leave to start.
 pub(crate) fn usage_limits(limits: &RateLimits, now: Timestamp) -> (Vec<UsageLimit>, bool) {
     let windows = limits
         .windows
@@ -120,7 +125,32 @@ pub(crate) fn usage_limits(limits: &RateLimits, now: Timestamp) -> (Vec<UsageLim
                 .map(|resets_at| resets_label(resets_at, now).into()),
         })
         .collect();
-    (windows, limits.status == RateLimitStatus::Rejected)
+    (
+        windows,
+        limits.status == RateLimitStatus::Rejected && !refusal_has_reset(limits, now),
+    )
+}
+
+/// Whether every window a refusal can be blamed on has reset since.
+fn refusal_has_reset(limits: &RateLimits, now: Timestamp) -> bool {
+    let reset = |window: &&fx_agent::provider::RateLimitWindow| {
+        window.resets_at.is_some_and(|resets| resets <= now)
+    };
+    let full: Vec<_> = limits
+        .windows
+        .iter()
+        .filter(|window| window.used >= 1.0)
+        .collect();
+    if full.is_empty() {
+        limits
+            .windows
+            .iter()
+            .filter_map(|window| window.resets_at)
+            .min()
+            .is_some_and(|resets| resets <= now)
+    } else {
+        full.iter().all(reset)
+    }
 }
 
 /// When a window resets, relative to now: "resets in 2h 10m", "resets in 3d
@@ -321,6 +351,47 @@ mod tests {
                 Some(5_904)
             );
         });
+    }
+
+    #[test]
+    fn a_refusal_for_the_limit_holds_until_the_window_behind_it_resets() {
+        // Held for good, it outlived its reset until the next turn on that
+        // provider, and an orchestrator was refused leave to start one.
+        use fx_agent::provider::{RateLimitKind, RateLimitWindow};
+        let now = Timestamp::from_timestamp(1_700_000_000, 0).unwrap();
+        let window = |kind, used, minutes: i64| RateLimitWindow {
+            kind,
+            used,
+            resets_at: Some(now + chrono::Duration::minutes(minutes)),
+        };
+        let refused = |windows| RateLimits {
+            status: RateLimitStatus::Rejected,
+            windows,
+            plan: None,
+        };
+        let limited = |limits: &RateLimits| usage_limits(limits, now).1;
+        // The full window has not reset: still refused.
+        assert!(limited(&refused(vec![
+            window(RateLimitKind::FiveHour, 1.0, 30),
+            window(RateLimitKind::SevenDay, 0.4, 3000),
+        ])));
+        // It has: the week still open says nothing about the refusal.
+        assert!(!limited(&refused(vec![
+            window(RateLimitKind::FiveHour, 1.0, -1),
+            window(RateLimitKind::SevenDay, 0.4, 3000),
+        ])));
+        // None reads full: the first to reset ends it.
+        assert!(limited(&refused(vec![window(
+            RateLimitKind::FiveHour,
+            0.6,
+            5
+        )])));
+        assert!(!limited(&refused(vec![
+            window(RateLimitKind::FiveHour, 0.6, -5),
+            window(RateLimitKind::SevenDay, 0.4, 3000),
+        ])));
+        // Nothing says when: it holds.
+        assert!(limited(&refused(Vec::new())));
     }
 
     #[test]
