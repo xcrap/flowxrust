@@ -8,7 +8,7 @@ use gpui::{
     Pixels, SharedString, Window, div, px,
 };
 
-use crate::theme::animation::PanelTransition;
+use crate::theme::{animation::PanelTransition, global};
 
 /// Reveal or conceal content at its natural height. The content remains mounted
 /// while clipped, so callers must disable actions when `expanded` is false.
@@ -72,6 +72,11 @@ impl Element for Collapsible {
                     natural_height: Rc::new(Cell::new(None)),
                 });
                 state.transition.set_expanded(self.expanded, now);
+                // Reduced motion opens and closes a section at once, as it
+                // turns a panel's slide into a change of width.
+                if global::current().reduce_motion {
+                    state.transition.settle();
+                }
                 let progress = state.transition.progress(now);
                 if state.transition.is_animating(now) {
                     // This is an element layout pass, not a view's render function.

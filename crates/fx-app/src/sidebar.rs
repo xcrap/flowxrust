@@ -3858,4 +3858,42 @@ mod tests {
         assert_eq!(hits(&test), 121);
         assert!(thread_regions(&test, &state).contains(&format!("thread:{}", ids[2])));
     }
+
+    /// A project's or a space's threads, under the disclosure the sidebar
+    /// folds them with.
+    struct Section {
+        expanded: bool,
+    }
+
+    impl Render for Section {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div().child(collapsible("threads", self.expanded, div().h(px(120.0))))
+        }
+    }
+
+    #[test]
+    fn a_section_opens_and_closes_at_once_under_reduced_motion() {
+        // The panels settle their slide under Reduce Motion; the sidebar's
+        // sections never asked, so every fold still slid for the panel's
+        // whole duration.
+        let _theme = fx_design::theme::ThemeGuard::install(fx_design::theme::Theme {
+            reduce_motion: true,
+            ..global::current()
+        });
+        let mut test = TestAppContext::single();
+        let window = test.add_window(|_, _| Section { expanded: false });
+        test.refresh().unwrap();
+        let mut visual = VisualTestContext::from_window(window.into(), &test);
+        for (expanded, height) in [(true, 120.0), (false, 0.0)] {
+            window
+                .update(&mut test, |section, _, cx| {
+                    section.expanded = expanded;
+                    cx.notify();
+                })
+                .unwrap();
+            test.refresh().unwrap();
+            let drawn = visual.debug_bounds("collapsible:threads").unwrap();
+            assert_eq!(drawn.size.height, px(height), "expanded: {expanded}");
+        }
+    }
 }
