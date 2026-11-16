@@ -3454,6 +3454,16 @@ impl AppState {
                 }
                 let mut archived_ids: HashSet<Uuid> =
                     record.archived_agent_ids.iter().copied().collect();
+                // The space here that mirrors each Codex section, the first
+                // if two do, and every space that mirrors one.
+                let mut mirrors: HashMap<String, Uuid> = HashMap::new();
+                let mut mirrored: HashSet<Uuid> = HashSet::new();
+                for space in &record.spaces {
+                    if let Some(section) = &space.space.codex_section {
+                        mirrors.entry(section.clone()).or_insert(space.space.id);
+                        mirrored.insert(space.space.id);
+                    }
+                }
                 // The thread a session belongs to when no binding says: the
                 // first of this provider's whose loaded conversation, or
                 // saved one, is on it.
@@ -3554,6 +3564,15 @@ impl AppState {
                                 && binding.session_id == identity.session_id
                         })
                         .map(|binding| binding.is_archived);
+                    // Read from the same binding, before it is replaced.
+                    let reported_section = binding_slots
+                        .get(&id)
+                        .map(|&at| &record.native_bindings[at])
+                        .filter(|binding| {
+                            !binding.revision.is_empty()
+                                && binding.session_id == identity.session_id
+                        })
+                        .map(|binding| binding.section.clone());
                     let mut archived = entry.summary.is_archived;
                     if let Some(local) = overrides.get(&id).and_then(|(_, archived)| *archived) {
                         if local == archived || reported.is_some_and(|last| last != archived) {
@@ -3570,6 +3589,35 @@ impl AppState {
                         } else {
                             archived = local;
                         }
+                    }
+                    // The provider's section places the thread when it
+                    // moved, or when the provider files a thread FlowX has
+                    // not seen it file before. One it did not move leaves
+                    // the reader's own placement, as an archive does.
+                    let section = entry.section.as_ref();
+                    let section_moved = match &reported_section {
+                        Some(last) => last.as_deref() != section.map(|section| section.id.as_str()),
+                        None => section.is_some(),
+                    };
+                    if section_moved {
+                        record.agents[slot].space = match section {
+                            Some(section) => Some(match mirrors.get(&section.id) {
+                                Some(space) => *space,
+                                None => {
+                                    let space = mirror_space(section);
+                                    let space_id = space.space.id;
+                                    record.spaces.push(space);
+                                    mirrors.insert(section.id.clone(), space_id);
+                                    mirrored.insert(space_id);
+                                    space_id
+                                }
+                            }),
+                            // Out of every section: out of the space that
+                            // mirrored one, never out of the reader's own.
+                            None => record.agents[slot]
+                                .space
+                                .filter(|space| !mirrored.contains(space)),
+                        };
                     }
                     let agent = &mut record.agents[slot];
                     agent.title = title;
@@ -3639,6 +3687,26 @@ impl AppState {
                     .unwrap()
                     .agent_order
                     .splice(0..0, discovered);
+                // A mirrored space no thread is in goes: it was the
+                // provider's grouping, and it now groups nothing. A thread
+                // this build cannot read still counts.
+                if !mirrored.is_empty() {
+                    let named: HashSet<Uuid> = record
+                        .agents
+                        .iter()
+                        .filter_map(|agent| agent.space)
+                        .chain(
+                            record
+                                .unreadable
+                                .elements("agents")
+                                .iter()
+                                .filter_map(|agent| agent.get("space")?.as_str()?.parse().ok()),
+                        )
+                        .collect();
+                    record.spaces.retain(|space| {
+                        space.space.codex_section.is_none() || named.contains(&space.space.id)
+                    });
+                }
                 record
                     .missing_native_agent_ids
                     .retain(|agent| !found.contains(agent));
@@ -4976,6 +5044,21 @@ fn index_bindings(
         }
     }
     (bound, slots, repeated)
+}
+
+/// A new space for a Codex section, named and coloured as Codex has it,
+/// where the colour is one the sidebar draws.
+fn mirror_space(section: &fx_agent::native::NativeSection) -> fx_store::PersistedSpace {
+    let mut space = fx_core::Space::new(
+        fx_core::Space::clean_name(&section.name).unwrap_or_else(|| "Codex section".into()),
+    );
+    space.codex_section = Some(section.id.clone());
+    space.color = section
+        .color
+        .as_deref()
+        .and_then(fx_core::Space::known_color)
+        .map(str::to_owned);
+    fx_store::PersistedSpace::new(space)
 }
 
 fn native_binding(
@@ -9515,6 +9598,210 @@ mod native_sync_tests {
                 pass(state, true);
                 pass(state, false);
                 assert!(!state.is_thread_archived(agent));
+            })
+        });
+    }
+
+    fn filed(entry: NativeThreadSummary, id: &str, name: &str) -> NativeThreadSummary {
+        NativeThreadSummary {
+            section: Some(fx_agent::native::NativeSection {
+                id: id.into(),
+                name: name.into(),
+                color: Some("Blue".into()),
+            }),
+            ..entry
+        }
+    }
+
+    fn space_of(state: &AppState, agent: Uuid) -> Option<Uuid> {
+        state.thread(agent).unwrap().space
+    }
+
+    #[test]
+    fn a_codex_section_is_mirrored_by_one_space_in_each_project_it_has_threads_in() {
+        // Codex sections are account-wide: the Codex app's pins are one
+        // section across every folder.
+        let temp = tempfile::tempdir().unwrap();
+        let first = temp.path().join("first");
+        let second = temp.path().join("second");
+        std::fs::create_dir_all(&first).unwrap();
+        std::fs::create_dir_all(&second).unwrap();
+        let (first, second) = (
+            first.to_string_lossy().to_string(),
+            second.to_string_lossy().to_string(),
+        );
+        let test = gpui::TestAppContext::single();
+        let (state, project) =
+            test.update(|cx| setup(cx, AppPaths::at(temp.path().join("store")), &first));
+        test.update(|cx| {
+            state.update(cx, |state, _| {
+                let other = state.add_project(&second);
+                let pinned = |root: &str, session: &str| {
+                    filed(entry(root, "codex", session, session), "pinned", "Pinned")
+                };
+                let listed = vec![
+                    pinned(&first, "a"),
+                    pinned(&first, "b"),
+                    entry(&first, "codex", "c", "Unfiled"),
+                ];
+                index(state, project, "codex", listed.clone(), Vec::new());
+                index(
+                    state,
+                    other,
+                    "codex",
+                    vec![pinned(&second, "d")],
+                    Vec::new(),
+                );
+                let agent = |state: &AppState, session: &str| {
+                    state
+                        .snapshot
+                        .projects
+                        .iter()
+                        .flat_map(|record| &record.native_bindings)
+                        .find(|binding| binding.session_id == session)
+                        .unwrap()
+                        .agent_id
+                };
+                let here = state.spaces_of(project).to_vec();
+                assert_eq!(here.len(), 1);
+                assert_eq!(here[0].space.name, "Pinned");
+                assert_eq!(here[0].space.codex_section.as_deref(), Some("pinned"));
+                assert_eq!(here[0].space.color.as_deref(), Some("blue"));
+                let space = here[0].space.id;
+                assert_eq!(space_of(state, agent(state, "a")), Some(space));
+                assert_eq!(space_of(state, agent(state, "b")), Some(space));
+                assert_eq!(space_of(state, agent(state, "c")), None);
+                let there = state.spaces_of(other);
+                assert_eq!(there.len(), 1);
+                assert_ne!(there[0].space.id, space, "a space per project");
+                assert_eq!(space_of(state, agent(state, "d")), Some(there[0].space.id));
+                // A pass that changes nothing writes nothing new.
+                let generation = state.snapshot.generation();
+                index(state, project, "codex", listed, Vec::new());
+                assert_eq!(state.snapshot.generation(), generation);
+                assert_eq!(state.spaces_of(project).len(), 1);
+            })
+        });
+        let saved = Store::new(AppPaths::at(temp.path().join("store")))
+            .load_app()
+            .unwrap();
+        assert_eq!(saved.projects[0].spaces[0].space.name, "Pinned");
+        assert_eq!(
+            saved.projects[0].native_bindings[0].section.as_deref(),
+            Some("pinned")
+        );
+    }
+
+    #[test]
+    fn a_section_the_provider_changes_wins_and_one_it_keeps_leaves_the_readers_placement() {
+        // As an archive does: FlowX's own choice holds until the provider's
+        // value moves, which is newer.
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().to_string_lossy().to_string();
+        let test = gpui::TestAppContext::single();
+        let (state, project) =
+            test.update(|cx| setup(cx, AppPaths::at(temp.path().join("store")), &root));
+        test.update(|cx| {
+            state.update(cx, |state, _| {
+                let plain = entry(&root, "codex", "native", "Native");
+                let pass = |state: &mut AppState, section: Option<(&str, &str)>| {
+                    let entry = match section {
+                        Some((id, name)) => filed(plain.clone(), id, name),
+                        None => plain.clone(),
+                    };
+                    index(state, project, "codex", vec![entry], Vec::new());
+                };
+                let mirror = |state: &AppState, section: &str| {
+                    state
+                        .spaces_of(project)
+                        .iter()
+                        .find(|space| space.space.codex_section.as_deref() == Some(section))
+                        .map(|space| space.space.id)
+                };
+                pass(state, Some(("pinned", "Pinned")));
+                let agent = state.snapshot.projects[0].native_bindings[0].agent_id;
+                let pinned = mirror(state, "pinned").unwrap();
+                assert_eq!(space_of(state, agent), Some(pinned));
+
+                // Moved in FlowX: the provider's unchanged section leaves it,
+                // and the mirror it left, now empty, goes.
+                let own = state.create_space(project, "Mine", None).unwrap();
+                assert!(state.move_thread_to_space(agent, Some(own)));
+                pass(state, Some(("pinned", "Pinned")));
+                assert_eq!(space_of(state, agent), Some(own));
+                assert_eq!(mirror(state, "pinned"), None);
+                assert!(state.space(own).is_some(), "the reader's own stays");
+
+                // Filed elsewhere in Codex: that is newer, and wins.
+                pass(state, Some(("review", "Review")));
+                let review = mirror(state, "review").unwrap();
+                assert_eq!(state.space(review).unwrap().1.space.name, "Review");
+                assert_eq!(space_of(state, agent), Some(review));
+
+                // Out of every section: out of the mirror, into no space.
+                pass(state, None);
+                assert_eq!(space_of(state, agent), None);
+                assert_eq!(mirror(state, "review"), None);
+
+                // Unfiled in Codex while in a space of the reader's own: the
+                // reader's placement is not a section, so nothing undoes it.
+                assert!(state.move_thread_to_space(agent, Some(own)));
+                pass(state, None);
+                assert_eq!(space_of(state, agent), Some(own));
+                pass(state, Some(("pinned", "Pinned")));
+                pass(state, None);
+                assert_eq!(
+                    space_of(state, agent),
+                    None,
+                    "it left the mirror Codex put it in"
+                );
+
+                // Taken out of a mirror in FlowX, it stays out until Codex
+                // files it again.
+                pass(state, Some(("pinned", "Pinned")));
+                assert!(state.move_thread_to_space(agent, None));
+                pass(state, Some(("pinned", "Pinned")));
+                assert_eq!(space_of(state, agent), None);
+                // A mirror the reader deletes is not made again for the
+                // same section either.
+                pass(state, Some(("review", "Review")));
+                let review = mirror(state, "review").unwrap();
+                assert!(state.delete_space(review));
+                pass(state, Some(("review", "Review")));
+                assert_eq!(mirror(state, "review"), None);
+                assert_eq!(space_of(state, agent), None);
+            })
+        });
+    }
+
+    #[test]
+    fn a_mirrored_space_keeps_its_readers_name_and_its_archived_threads() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().to_string_lossy().to_string();
+        let test = gpui::TestAppContext::single();
+        let (state, project) =
+            test.update(|cx| setup(cx, AppPaths::at(temp.path().join("store")), &root));
+        test.update(|cx| {
+            state.update(cx, |state, _| {
+                let mut pinned = filed(
+                    entry(&root, "codex", "native", "Native"),
+                    "pinned",
+                    "Pinned",
+                );
+                index(state, project, "codex", vec![pinned.clone()], Vec::new());
+                let space = state.spaces_of(project)[0].space.id;
+                assert!(state.rename_space(space, "Favourites"));
+                pinned.summary.is_archived = true;
+                index(state, project, "codex", vec![pinned.clone()], Vec::new());
+                // Archived, its thread still names it, so it is kept for the
+                // thread's restore, and drawn only once something is listed.
+                assert_eq!(state.space(space).unwrap().1.space.name, "Favourites");
+                assert!(state.snapshot_index().records[0].spaces.is_empty());
+                pinned.summary.is_archived = false;
+                index(state, project, "codex", vec![pinned], Vec::new());
+                let index = state.snapshot_index();
+                assert_eq!(index.records[0].spaces.len(), 1);
+                assert_eq!(index.records[0].spaces[0].threads.len(), 1);
             })
         });
     }
