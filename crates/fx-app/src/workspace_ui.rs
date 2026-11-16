@@ -1149,6 +1149,93 @@ mod tests {
         );
     }
 
+    /// Press and release `key` in `window`, as the platform sends it.
+    fn press_and_release(
+        test: &mut gpui::TestAppContext,
+        window: gpui::AnyWindowHandle,
+        key: &str,
+    ) {
+        let mut visual = gpui::VisualTestContext::from_window(window, test);
+        visual.simulate_keystrokes(key);
+        visual.simulate_event(gpui::KeyUpEvent {
+            keystroke: gpui::Keystroke::parse(key).unwrap(),
+        });
+        test.refresh().unwrap();
+    }
+
+    #[test]
+    fn return_on_a_focused_cancel_does_not_cancel_the_question() {
+        // GPUI presses a focused control again as Return or Space comes up.
+        // Return belongs to the dialog's default action, and here it pressed
+        // the focused Cancel: the provider's question was withdrawn.
+        let temp = tempfile::tempdir().unwrap();
+        let mut test = gpui::TestAppContext::single();
+        let (window, state, ui, agent, mut received) = mounted_with_runner(&mut test, temp.path());
+        ask(
+            &mut test,
+            window,
+            &state,
+            agent,
+            ProviderEvent::UserInput(UserInputRequest {
+                id: "unanswered".into(),
+                questions: vec![question("name", false)],
+                ..Default::default()
+            }),
+        );
+        // From the field to Cancel; Send is not reachable until it is answered.
+        test.simulate_keystrokes(window.into(), "tab");
+        test.refresh().unwrap();
+        let panel = test.update(|cx| ui.read(cx).request.clone().unwrap());
+        window
+            .update(&mut test, |_, window, cx| {
+                assert!(panel.read(cx).refuse_focus.is_focused(window));
+            })
+            .unwrap();
+        press_and_release(&mut test, window.into(), "enter");
+        assert!(received.try_recv().is_err(), "Return pressed Cancel");
+        // Space still does, once.
+        press_and_release(&mut test, window.into(), "space");
+        assert!(matches!(
+            received.try_recv(),
+            Ok(UserResponse::CancelQuestions { .. })
+        ));
+    }
+
+    #[test]
+    fn space_presses_a_focused_dialog_button_once() {
+        // Once on the way down, and again from GPUI on the way up.
+        struct Probe {
+            focus: gpui::FocusHandle,
+            presses: std::rc::Rc<std::cell::Cell<usize>>,
+        }
+        impl Render for Probe {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                let presses = self.presses.clone();
+                fx_design::components::dialog_button(
+                    DialogAction::new("Press", ButtonStyle::Secondary, move |_, _| {
+                        presses.set(presses.get() + 1)
+                    })
+                    .focus(&self.focus),
+                )
+            }
+        }
+        let mut test = gpui::TestAppContext::single();
+        let presses = std::rc::Rc::new(std::cell::Cell::new(0));
+        let window = test.add_window({
+            let presses = presses.clone();
+            move |window, cx| {
+                let focus = cx.focus_handle();
+                focus.focus(window);
+                Probe { focus, presses }
+            }
+        });
+        test.refresh().unwrap();
+        press_and_release(&mut test, window.into(), "space");
+        assert_eq!(presses.get(), 1);
+        press_and_release(&mut test, window.into(), "enter");
+        assert_eq!(presses.get(), 1, "Return pressed the focused button");
+    }
+
     #[test]
     fn declining_a_confirmation_reaches_the_provider_as_a_decline() {
         let elicitation = fx_agent::elicitation::Elicitation::from_claude(&serde_json::json!({

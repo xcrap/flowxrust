@@ -16,7 +16,9 @@
 use std::rc::Rc;
 
 use gpui::prelude::*;
-use gpui::{AnyElement, App, FocusHandle, KeyDownEvent, MouseButton, SharedString, Window, div};
+use gpui::{
+    AnyElement, App, FocusHandle, KeyDownEvent, KeyUpEvent, MouseButton, SharedString, Window, div,
+};
 
 use super::button::{ButtonStyle, IconButtonProps, button_with_icon, icon_button};
 use super::surface::divider;
@@ -335,6 +337,12 @@ pub fn dialog_button(action: DialogAction) -> gpui::Stateful<gpui::Div> {
 
 /// Track `focus` on a control, so its focus ring shows, and press it with
 /// Space while it holds the focus.
+///
+/// GPUI presses a focused element that takes clicks once more as Return or
+/// Space is released. Neither release is let through: Space has pressed the
+/// control already, on its way down, and Return is the dialog's default
+/// action, not the focused control's. Let through, Space pressed a button
+/// twice, and Return on a focused Cancel cancelled a provider's question.
 pub(crate) fn focusable(
     control: gpui::Stateful<gpui::Div>,
     focus: Option<FocusHandle>,
@@ -352,6 +360,12 @@ pub(crate) fn focusable(
                 if enabled {
                     on_activate(window, cx);
                 }
+            }
+        })
+        .capture_key_up(|event: &KeyUpEvent, window, _| {
+            let key = event.keystroke.key.as_str();
+            if (key == "enter" || key == "space") && !event.keystroke.modifiers.modified() {
+                window.prevent_default();
             }
         })
 }
