@@ -662,6 +662,9 @@ fn summary(
         defaults: native_defaults(raw),
         revision: format!("{revision}|archive:{archived}"),
         waiting_elsewhere: waiting_on_user(raw),
+        // A thread running in another Codex process reads `notLoaded` here,
+        // so Codex cannot say it runs; see AGENTS.md.
+        running_elsewhere: false,
         section: section_of(raw),
     }))
 }

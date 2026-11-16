@@ -15,6 +15,11 @@ pub struct NativeThreadSummary {
     /// MCP server's request. FlowX cannot answer it — only the process that
     /// asked can hear the answer — so it is shown, not offered.
     pub waiting_elsewhere: Option<String>,
+    /// Whether the thread is running a turn in another app right now, as its
+    /// provider reports it: Claude's `sessions/<pid>.json` with `status:
+    /// "busy"`. Shown, so a thread worked on elsewhere does not read as idle
+    /// while its history grows.
+    pub running_elsewhere: bool,
     /// The section the provider files the thread under, when it has them:
     /// Codex's, which are account-wide and named by the user (the Codex app
     /// keeps its pins as one). Claude has none.

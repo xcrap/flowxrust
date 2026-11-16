@@ -154,6 +154,7 @@ const STREAMING_PREFIX: &str = "streaming-markdown:";
 /// button.
 const USER_ROW_GROUP: &str = "transcript.user-row";
 const USER_IMAGES_SELECTOR: &str = "transcript.user-images";
+const RUNNING_ELSEWHERE_SELECTOR: &str = "transcript.running-elsewhere";
 
 /// Every context-menu owner in the transcript starts with this, so the shell
 /// can route a choice back here without knowing what was clicked.
@@ -5470,7 +5471,10 @@ fn pending_prompts(snapshot: &Snapshot, window: &Window, cx: &App) -> AnyElement
             .waiting_elsewhere(snapshot.agent_id)
             .map(str::to_owned)
     });
-    if approvals.is_empty() && questions.is_empty() && elsewhere.is_none() {
+    let running_elsewhere = state
+        .as_ref()
+        .is_some_and(|handle| handle.0.read(cx).running_elsewhere(snapshot.agent_id));
+    if approvals.is_empty() && questions.is_empty() && elsewhere.is_none() && !running_elsewhere {
         return div().w(px(0.0)).h(px(0.0)).into_any_element();
     }
     let theme = global::current();
@@ -5478,6 +5482,8 @@ fn pending_prompts(snapshot: &Snapshot, window: &Window, cx: &App) -> AnyElement
     let mut cards = div().flex().flex_col().gap(px_len(Spacing::MD));
     if let Some(reason) = elsewhere {
         cards = cards.child(elsewhere_notice(&reason));
+    } else if running_elsewhere {
+        cards = cards.child(running_elsewhere_notice(snapshot.id));
     }
     if !approvals.is_empty() {
         cards = cards.child(tray_title(
@@ -5534,6 +5540,31 @@ fn pending_prompts(snapshot: &Snapshot, window: &Window, cx: &App) -> AnyElement
                 .pt(px_len(Spacing::SM))
                 .pb(px_len(Spacing::MD))
                 .child(cards),
+        )
+        .into_any_element()
+}
+
+/// A quiet line under the transcript while another app runs a turn on this
+/// thread: the rows above grow as that app writes them, and nothing here can
+/// stop or steer it. The spinner is the activity one, on the shared beat.
+fn running_elsewhere_notice(conversation: Uuid) -> AnyElement {
+    let theme = global::current();
+    div()
+        .debug_selector(|| RUNNING_ELSEWHERE_SELECTOR.into())
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap(px_len(Spacing::SM))
+        .child(fx_design::components::loading_spinner(SharedString::from(
+            format!("running-elsewhere:{conversation}"),
+        )))
+        .child(
+            div()
+                .fx_caption()
+                .text_color(Colors::fg_secondary(&theme))
+                .child(SharedString::from(
+                    "Working in another app. Its progress appears here as it is written.",
+                )),
         )
         .into_any_element()
 }

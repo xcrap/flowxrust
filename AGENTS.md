@@ -972,6 +972,15 @@ the thread is waiting and does not offer buttons that reach nobody:
   reads `notLoaded`, so FlowX cannot see that one wait and says nothing rather
   than guessing.
 
+The same record says `status: "busy"` while that process runs a turn, and
+the thread then shows as running: the sidebar row and its space's header,
+the title bar's dot, and a quiet line under the transcript whose rows grow
+as the other app writes them. Without it a thread being worked on in the
+Claude app read as idle here. It is never a turn FlowX runs, so Stop,
+steering and the composer's busy state ignore it; waiting outranks it, and
+a turn FlowX runs on the thread answers for itself. Codex cannot say this
+(a thread another process runs reads `notLoaded`), so only Claude does.
+
 The mark is live state, never saved. Each index pass replaces it for its
 provider and project, a failed pass clears it, and it is reported for the
 projects that keep polling: the active one every five seconds and every

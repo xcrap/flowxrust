@@ -850,7 +850,12 @@ fn title_bar(
         }
     });
     let has_project = project.is_some();
-    let busy = snapshot.is_busy();
+    // A turn another app runs on the thread shows as one of FlowX's own.
+    let busy = snapshot.is_busy()
+        || snapshot
+            .snapshot
+            .active_agent_id
+            .is_some_and(|agent| snapshot.running_elsewhere(agent));
     let waiting = snapshot.is_waiting_on_user();
     let for_sidebar = state.clone();
     let for_inspector = state.clone();

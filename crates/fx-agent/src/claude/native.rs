@@ -31,6 +31,15 @@ const MAX_SUMMARIES: usize = 2_000;
 const MAX_CACHED_TRANSCRIPTS: usize = 4;
 const MAX_CACHE_BYTES: u64 = 64 * 1024 * 1024;
 
+/// What a live Claude process reports its session doing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SessionActivity {
+    /// Working on a turn.
+    Busy,
+    /// Blocked on the user, and what for ("permission prompt").
+    Waiting(String),
+}
+
 /// Keep one instance per history worker so unchanged files reuse their parsing.
 pub struct ClaudeNativeStore {
     config_root: PathBuf,
@@ -221,11 +230,18 @@ impl ClaudeNativeStore {
                 || current_paths.contains(path)
         });
         // Claude's own record of every live session says which are blocked
-        // on the user. Unreadable, it costs only the waiting marks.
-        match self.waiting_sessions() {
-            Ok(waiting) => {
+        // on the user and which are working. Unreadable, it costs only the
+        // marks.
+        match self.live_sessions() {
+            Ok(live) => {
                 for (id, entry) in &mut found {
-                    entry.waiting_elsewhere = waiting.get(id).cloned();
+                    match live.get(id) {
+                        Some(SessionActivity::Waiting(reason)) => {
+                            entry.waiting_elsewhere = Some(reason.clone());
+                        }
+                        Some(SessionActivity::Busy) => entry.running_elsewhere = true,
+                        None => {}
+                    }
                 }
             }
             Err(error) => result
@@ -257,6 +273,19 @@ impl ClaudeNativeStore {
     /// the same record; reading it here costs no process per poll. A file
     /// whose process has exited is ignored, since a crash leaves it behind.
     pub fn waiting_sessions(&self) -> Result<HashMap<String, String>, ProviderError> {
+        Ok(self
+            .live_sessions()?
+            .into_iter()
+            .filter_map(|(session, activity)| match activity {
+                SessionActivity::Waiting(reason) => Some((session, reason)),
+                SessionActivity::Busy => None,
+            })
+            .collect())
+    }
+
+    /// What each live Claude process reports its session doing: busy, or
+    /// waiting on the user and for what. An idle one is left out.
+    pub fn live_sessions(&self) -> Result<HashMap<String, SessionActivity>, ProviderError> {
         let mut waiting = HashMap::new();
         for path in children(&self.config_root.join("sessions"))? {
             let Some(pid) = path
@@ -271,8 +300,9 @@ impl ClaudeNativeStore {
             let Ok(record) = read_session_record(&path) else {
                 continue;
             };
+            let status = record.get("status").and_then(Value::as_str);
             if record.get("pid").and_then(Value::as_i64) != Some(i64::from(pid))
-                || record.get("status").and_then(Value::as_str) != Some("waiting")
+                || !matches!(status, Some("waiting" | "busy"))
                 || !process_alive(pid)
             {
                 continue;
@@ -284,6 +314,10 @@ impl ClaudeNativeStore {
             else {
                 continue;
             };
+            if status == Some("busy") {
+                waiting.insert(session, SessionActivity::Busy);
+                continue;
+            }
             let reason = record
                 .get("waitingFor")
                 .and_then(Value::as_str)
@@ -293,7 +327,7 @@ impl ClaudeNativeStore {
                 .chars()
                 .take(120)
                 .collect();
-            waiting.insert(session, reason);
+            waiting.insert(session, SessionActivity::Waiting(reason));
         }
         Ok(waiting)
     }
@@ -631,6 +665,7 @@ fn make_entry(
         },
         defaults: parsed.defaults.clone(),
         waiting_elsewhere: None,
+        running_elsewhere: false,
         section: None,
         revision: format!(
             "{}:{}",
@@ -1712,7 +1747,7 @@ mod tests {
     }
 
     #[test]
-    fn a_live_session_waiting_on_the_user_marks_its_thread() {
+    fn a_live_session_waiting_on_the_user_or_working_marks_its_thread() {
         let fixture = Fixture::new();
         fixture.write(&[fixture.record("user", "Ship it", Uuid::new_v4())]);
         assert_eq!(
@@ -1735,15 +1770,29 @@ mod tests {
             Some("permission prompt")
         );
 
+        assert!(
+            !index.threads[0].running_elsewhere,
+            "waiting is not running"
+        );
+
+        // Busy is a turn under way in the other app: running, not waiting.
         fs::write(
             sessions.join(format!("{pid}.json")),
             session_record(pid, SESSION, "busy").to_string(),
         )
         .unwrap();
-        assert_eq!(
-            fixture.store().list(fixture.root()).unwrap().threads[0].waiting_elsewhere,
-            None
-        );
+        let busy = fixture.store().list(fixture.root()).unwrap();
+        assert_eq!(busy.threads[0].waiting_elsewhere, None);
+        assert!(busy.threads[0].running_elsewhere);
+
+        // Idle is neither.
+        fs::write(
+            sessions.join(format!("{pid}.json")),
+            session_record(pid, SESSION, "idle").to_string(),
+        )
+        .unwrap();
+        let idle = fixture.store().list(fixture.root()).unwrap();
+        assert!(idle.threads[0].waiting_elsewhere.is_none() && !idle.threads[0].running_elsewhere);
     }
 
     #[test]

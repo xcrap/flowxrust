@@ -952,8 +952,16 @@ fn header_activity(
         .max_by_key(rank)
 }
 
+/// What a row says of a thread running a turn in another app.
+pub(crate) const RUNNING_ELSEWHERE: &str = "Working in another app";
+
 /// A thread's status as its row shows it, and the words for it.
 fn thread_activity(app: &AppState, agent: &Agent) -> (ActivityState, &'static str) {
+    // A turn in another app, as its provider reports it: the thread's
+    // history grows here while it runs, and without the mark it read as idle.
+    if app.running_elsewhere(agent.id) {
+        return (ActivityState::Running, RUNNING_ELSEWHERE);
+    }
     let busy = app.is_thread_busy(agent.id);
     // Read before the conversation is locked: it asks whether the thread is
     // busy, which locks the same conversation, and the lock is not reentrant.
@@ -990,13 +998,14 @@ fn space_activity(app: &AppState, listed: &RecordIndex) -> HashMap<Uuid, Activit
         .keys()
         .chain(app.conversations.keys())
         .chain(app.waiting_elsewhere_threads())
+        .chain(app.running_elsewhere_threads())
         .filter(|id| listed.space_of.contains_key(id))
         .copied()
         .collect();
     for id in live {
         // Read before the conversation is locked, as a thread row does: both
         // lock it, and the lock is not reentrant.
-        let busy = app.is_thread_busy(id);
+        let busy = app.is_thread_busy(id) || app.running_elsewhere(id);
         let elsewhere = app.waiting_elsewhere(id).map(str::to_owned);
         let phase = app.conversation_by_agent(id).map(|conversation| {
             conversation

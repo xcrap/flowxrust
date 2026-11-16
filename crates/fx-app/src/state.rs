@@ -133,6 +133,9 @@ pub struct AppState {
     /// read from each index pass of the thread's project, and dropped when a
     /// pass no longer reports it.
     waiting_elsewhere: HashMap<Uuid, String>,
+    /// Threads a provider reported running a turn in another app, replaced by
+    /// each index pass as the waiting marks are.
+    running_elsewhere: HashSet<Uuid>,
     /// The add-project sheet, while it is open.
     ///
     /// Owned here rather than by the sidebar so that the menu's "New Project"
@@ -264,6 +267,7 @@ impl AppState {
             last_checkpoint: Instant::now(),
             pending_interactions: HashMap::new(),
             waiting_elsewhere: HashMap::new(),
+            running_elsewhere: HashSet::new(),
             picker: None,
             palette: None,
             find: None,
@@ -2627,6 +2631,22 @@ impl AppState {
         self.waiting_elsewhere.get(&agent_id).map(String::as_str)
     }
 
+    /// Whether a thread FlowX does not run is running a turn in another app,
+    /// as its provider reports it. Waiting on the reader there says more, so
+    /// a thread that waits is not also running. Read with the same scope as
+    /// the waiting marks.
+    pub fn running_elsewhere(&self, agent_id: Uuid) -> bool {
+        self.running_elsewhere.contains(&agent_id)
+            && !self.is_thread_busy(agent_id)
+            && self.waiting_elsewhere(agent_id).is_none()
+            && self.project_for_agent(agent_id) == self.snapshot.active_project_id
+    }
+
+    /// Every thread a provider reported running in another app.
+    pub(crate) fn running_elsewhere_threads(&self) -> impl Iterator<Item = &Uuid> {
+        self.running_elsewhere.iter()
+    }
+
     /// Whether the active thread is stopped on the reader: a request FlowX
     /// can answer, or one in another app.
     pub fn is_waiting_on_user(&self) -> bool {
@@ -3126,6 +3146,7 @@ impl AppState {
                 })
                 .collect(),
             waiting_elsewhere: self.waiting_elsewhere.clone(),
+            running_elsewhere: self.running_elsewhere.clone(),
         }
     }
 
@@ -3405,6 +3426,7 @@ impl AppState {
         provider: &str,
         root: &crate::native_sync::ProjectRoot,
         waiting: Vec<(Uuid, String)>,
+        running: Vec<Uuid>,
     ) {
         let threads: HashSet<Uuid> = self
             .snapshot
@@ -3420,6 +3442,9 @@ impl AppState {
         self.waiting_elsewhere
             .retain(|agent, _| !threads.contains(agent));
         self.waiting_elsewhere.extend(waiting);
+        self.running_elsewhere
+            .retain(|agent| !threads.contains(agent));
+        self.running_elsewhere.extend(running);
     }
 
     fn apply_native_completion(&mut self, completion: crate::native_sync::Completion) -> bool {
@@ -3450,6 +3475,7 @@ impl AppState {
                         &ticket.provider,
                         &ProjectRoot::new(&ticket.root),
                         Vec::new(),
+                        Vec::new(),
                     );
                     self.native_sync.warnings.insert(
                         (ticket.project, ticket.provider.clone()),
@@ -3470,6 +3496,7 @@ impl AppState {
                 let mut warnings = index.warnings;
                 let here = ProjectRoot::new(&ticket.root);
                 let mut waiting = Vec::new();
+                let mut running = Vec::new();
                 let present: HashSet<_> = index
                     .threads
                     .iter()
@@ -3580,6 +3607,9 @@ impl AppState {
                         && !self.is_thread_busy(id)
                     {
                         waiting.push((id, reason.clone()));
+                    }
+                    if entry.running_elsewhere && !self.is_thread_busy(id) {
+                        running.push(id);
                     }
                     found.insert(id);
                     if self.is_thread_busy(id)
@@ -3826,7 +3856,13 @@ impl AppState {
                         self.commit_thread_change(next, "save native thread discovery");
                     }
                 }
-                self.forget_waiting_elsewhere(ticket.project, &ticket.provider, &here, waiting);
+                self.forget_waiting_elsewhere(
+                    ticket.project,
+                    &ticket.provider,
+                    &here,
+                    waiting,
+                    running,
+                );
                 self.native_sync
                     .warnings
                     .insert((ticket.project, ticket.provider), warnings);
@@ -3845,6 +3881,7 @@ impl AppState {
                     ticket.project,
                     &ticket.provider,
                     &ProjectRoot::new(&ticket.root),
+                    Vec::new(),
                     Vec::new(),
                 );
                 self.native_sync
@@ -5451,6 +5488,9 @@ struct NativeView {
     history_warnings: HashMap<Uuid, String>,
     revisions: HashMap<Uuid, u64>,
     waiting_elsewhere: HashMap<Uuid, String>,
+    /// Threads a provider reported running a turn in another app, replaced by
+    /// each index pass as the waiting marks are.
+    running_elsewhere: HashSet<Uuid>,
 }
 
 /// What reading a thread's saved transcript produced.
@@ -9403,6 +9443,7 @@ mod native_sync_tests {
             },
             revision: "revision-1".into(),
             waiting_elsewhere: None,
+            running_elsewhere: false,
             section: None,
         }
     }
@@ -10631,6 +10672,89 @@ mod native_sync_tests {
                     .runners
                     .insert(agent, crate::session::TurnRunner::detached().0);
                 assert_eq!(state.waiting_elsewhere(agent), None);
+            })
+        });
+    }
+
+    #[test]
+    fn a_mirrored_thread_running_in_another_app_is_shown_running_until_it_stops() {
+        use gpui::{VisualTestContext, px, size};
+        const SESSION: &str = "12e63679-12f2-422f-ad74-9fe7e9672c28";
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().to_string_lossy().to_string();
+        let mut test = gpui::TestAppContext::single();
+        let (state, project) =
+            test.update(|cx| setup(cx, AppPaths::at(temp.path().join("store")), &root));
+        let running = |running: bool, waiting: Option<&str>| NativeThreadSummary {
+            running_elsewhere: running,
+            waiting_elsewhere: waiting.map(str::to_owned),
+            ..entry(&root, "claude", SESSION, "Mirrored")
+        };
+        let agent = test.update(|cx| {
+            crate::AppHandle::install(state.clone(), cx);
+            state.update(cx, |state, _| {
+                index(
+                    state,
+                    project,
+                    "claude",
+                    vec![running(true, None)],
+                    Vec::new(),
+                );
+                let agent = state.snapshot.active_agent_id.unwrap();
+                assert!(state.running_elsewhere(agent));
+                // Shown, never mistaken for a turn FlowX could stop or steer.
+                assert!(!state.is_busy());
+                assert!(!state.is_thread_busy(agent));
+                state.conversation(project, agent);
+                agent
+            })
+        });
+
+        let for_view = state.clone();
+        let window = test.add_window(move |_, _| crate::FlowX::new(for_view));
+        let mut visual = VisualTestContext::from_window(window.into(), &test);
+        visual.simulate_resize(size(px(1280.0), px(800.0)));
+        test.refresh().unwrap();
+        assert!(
+            visual
+                .debug_bounds("transcript.running-elsewhere")
+                .is_some(),
+            "the transcript did not say the thread is working elsewhere"
+        );
+        assert!(visual.debug_bounds("titlebar-activity:false").is_some());
+
+        test.update(|cx| {
+            state.update(cx, |state, _| {
+                // Waiting on the reader there says more than working.
+                index(
+                    state,
+                    project,
+                    "claude",
+                    vec![running(false, Some("permission prompt"))],
+                    Vec::new(),
+                );
+                assert!(!state.running_elsewhere(agent));
+                // Finished there: the next pass no longer reports it.
+                index(
+                    state,
+                    project,
+                    "claude",
+                    vec![running(false, None)],
+                    Vec::new(),
+                );
+                assert!(!state.running_elsewhere(agent));
+                // And a turn FlowX runs answers for itself.
+                index(
+                    state,
+                    project,
+                    "claude",
+                    vec![running(true, None)],
+                    Vec::new(),
+                );
+                state
+                    .runners
+                    .insert(agent, crate::session::TurnRunner::detached().0);
+                assert!(!state.running_elsewhere(agent));
             })
         });
     }
