@@ -80,7 +80,7 @@ use fx_design::styled::{FxRefinement, FxStyled, px_len};
 use fx_design::theme::animation::on_the_beat;
 use fx_design::theme::{
     BorderWidth, Colors, FxAnimation, IconSize, Layout, Radii, Spacing, TextRole, TextSizePreset,
-    Typography, WithAlpha, global,
+    Typography, global,
 };
 use gpui::prelude::*;
 use gpui::{
@@ -153,6 +153,7 @@ const STREAMING_PREFIX: &str = "streaming-markdown:";
 /// The hover group of one of the reader's prompts, which reveals its copy
 /// button.
 const USER_ROW_GROUP: &str = "transcript.user-row";
+const USER_IMAGES_SELECTOR: &str = "transcript.user-images";
 
 /// Every context-menu owner in the transcript starts with this, so the shell
 /// can route a choice back here without knowing what was clicked.
@@ -2338,6 +2339,9 @@ fn message_row(message: &ConversationMessage, snapshot: &Snapshot, cx: &App) -> 
     let image_mentions: Vec<_> = mentioned.iter().filter(|file| file.is_image).collect();
     let mut image_index = 0;
     let mut blocks = Vec::new();
+    // A prompt's images are a row of thumbnails above its words, as Claude
+    // draws them, rather than previews stacked inside the bubble.
+    let mut images = Vec::new();
     for (index, block) in message.content.iter().enumerate() {
         let clean_text = match block {
             MessageContent::Text { text } if is_user => Some(MessageContent::Text {
@@ -2365,21 +2369,26 @@ fn message_row(message: &ConversationMessage, snapshot: &Snapshot, cx: &App) -> 
             !is_user,
             cx,
         ) {
-            blocks.push(element);
+            if is_user && block.is_image() {
+                images.push(element);
+            } else {
+                blocks.push(element);
+            }
         }
     }
     // Native histories may carry only the attachment envelope. Its explicit
     // local image references recover those previews without duplicating the
     // image blocks supplied by providers that include both representations.
     for (index, attachment) in image_mentions.iter().enumerate().skip(image_index) {
-        blocks.push(with_menu(
+        images.push(with_menu(
             menu_owner(conversation, message.id, Some(ImageSlot::Mentioned(index))),
             Some(image_menu()),
             image_attachment(
                 SharedString::from(format!("attachment:{}:mentioned:{index}", message.id)),
                 ImageInput::Mentioned(attachment.path.clone()),
                 attachment.name.clone(),
-            ),
+            )
+            .thumbnail(),
             cx,
         ));
     }
@@ -2400,7 +2409,7 @@ fn message_row(message: &ConversationMessage, snapshot: &Snapshot, cx: &App) -> 
     // A message whose blocks all render to nothing still gets a row. A restored
     // transcript can carry one, and dropping it silently is indistinguishable
     // from losing it.
-    if blocks.is_empty() {
+    if blocks.is_empty() && images.is_empty() {
         blocks.push(
             div()
                 .fx_caption()
@@ -2418,28 +2427,45 @@ fn message_row(message: &ConversationMessage, snapshot: &Snapshot, cx: &App) -> 
             .py(px_len(Spacing::MD))
             .max_w(px(Layout::USER_MESSAGE_MAX_WIDTH))
             .rounded(px_len(Radii::XL))
-            .bg(Colors::accent_muted(&theme))
-            // The accent at low strength, which is a wash over the muted fill
-            // rather than a second surface colour.
-            .border(px_len(BorderWidth::HAIRLINE))
-            .border_color(Colors::accent(&theme).with_alpha(0.2));
+            // The composer's fill: a sent prompt reads as what was typed
+            // there, and the answer beside it carries no surface at all.
+            .bg(Colors::user_message_bg(&theme));
     } else {
         bubble = bubble
             .debug_selector(|| ASSISTANT_SELECTOR.to_string())
-            .w_full()
-            .py(px_len(Spacing::XS));
+            .w_full();
     }
+    let has_words = !blocks.is_empty();
     let bubble = bubble.children(blocks);
+    let images = (!images.is_empty()).then(|| {
+        div()
+            .debug_selector(|| USER_IMAGES_SELECTOR.to_string())
+            .max_w(px(Layout::USER_MESSAGE_MAX_WIDTH))
+            .flex()
+            .flex_row()
+            .flex_wrap()
+            .justify_end()
+            .gap(px_len(Spacing::SM))
+            .children(images)
+    });
 
     // The reader's prompt sits against the trailing edge and the model's answer
     // against the leading one, which is what makes a long exchange readable
     // without any role label on either side.
+    // A prompt is set apart from the turns either side of it; a reply's rows
+    // keep one rhythm with the work between them.
     let column = div()
         .w_full()
         .min_w_0()
         .flex()
         .flex_col()
-        .pb(px_len(Spacing::XXL))
+        .when(is_user, |column| {
+            column
+                .gap(px_len(Spacing::SM))
+                .pt(px(Layout::TRANSCRIPT_TURN_GAP - Layout::TRANSCRIPT_ROW_GAP))
+                .pb(px(Layout::TRANSCRIPT_TURN_GAP))
+        })
+        .when(!is_user, |column| column.pb(px(Layout::TRANSCRIPT_ROW_GAP)))
         .id(SharedString::from(format!("message:{}", message.id)));
     let row = if is_user {
         let message_id = message.id;
@@ -2464,9 +2490,12 @@ fn message_row(message: &ConversationMessage, snapshot: &Snapshot, cx: &App) -> 
             // sharing a row with it. A row would make the bubble a shrinkable
             // flex item, and a wrapped prompt would size itself to its longest
             // word.
-            .child(bubble.relative().children(
-                has_copyable_text(message).then(|| copy_message_button(snapshot, message)),
-            ))
+            .children(images)
+            .when(has_words, |column| {
+                column.child(bubble.relative().children(
+                    has_copyable_text(message).then(|| copy_message_button(snapshot, message)),
+                ))
+            })
     } else {
         column.items_start().child(bubble)
     };
@@ -2537,13 +2566,22 @@ fn content_block(
                 Some(ImageSlot::Content(place.index)),
             ),
             Some(image_menu()),
-            image_attachment(
-                SharedString::from(format!("attachment:{}:{}", place.message, place.index)),
-                input,
-                mention
-                    .map(|file| file.name.clone())
-                    .unwrap_or_else(|| "Image attachment".into()),
-            ),
+            {
+                let preview = image_attachment(
+                    SharedString::from(format!("attachment:{}:{}", place.message, place.index)),
+                    input,
+                    mention
+                        .map(|file| file.name.clone())
+                        .unwrap_or_else(|| "Image attachment".into()),
+                );
+                // A prompt's image is a thumbnail in the row above its words;
+                // anything else is shown at the size it was made to be read.
+                if markdown {
+                    preview
+                } else {
+                    preview.thumbnail()
+                }
+            },
             cx,
         )
     };
@@ -3620,8 +3658,7 @@ fn streaming_tail(snapshot: &Snapshot, has_active_group: bool) -> Option<AnyElem
                 .min_w_0()
                 .flex()
                 .flex_col()
-                .py(px_len(Spacing::XS))
-                .pb(px_len(Spacing::XXL))
+                .pb(px(Layout::TRANSCRIPT_ROW_GAP))
                 .child(
                     div()
                         .flex()
@@ -3684,7 +3721,11 @@ fn streaming_tail(snapshot: &Snapshot, has_active_group: bool) -> Option<AnyElem
                 ),
         );
     if !thinking {
-        return Some(indicator.pb(px_len(Spacing::XXL)).into_any_element());
+        return Some(
+            indicator
+                .pb(px(Layout::TRANSCRIPT_ROW_GAP))
+                .into_any_element(),
+        );
     }
     Some(
         div()
@@ -3693,7 +3734,7 @@ fn streaming_tail(snapshot: &Snapshot, has_active_group: bool) -> Option<AnyElem
             .flex()
             .flex_col()
             .gap(px_len(Spacing::XS))
-            .pb(px_len(Spacing::XXL))
+            .pb(px(Layout::TRANSCRIPT_ROW_GAP))
             .child(indicator)
             .child(live_thought(&snapshot.thinking, live_thought_id(snapshot)))
             .into_any_element(),
@@ -3759,7 +3800,7 @@ fn background_tasks(tasks: &[BackgroundTask], now: Instant) -> AnyElement {
         .debug_selector(|| TASKS_SELECTOR.to_string())
         .w_full()
         .min_w_0()
-        .pb(px_len(Spacing::XXL))
+        .pb(px(Layout::TRANSCRIPT_ROW_GAP))
         .child(card(
             div()
                 .w_full()
@@ -4152,8 +4193,11 @@ fn activity_group(group: &ActivityGroup<'_>, snapshot: &Snapshot) -> AnyElement 
         .flex_row()
         .items_center()
         .gap(px_len(Spacing::SM))
+        // Its words line up with the prose around it, and its hover fill
+        // reaches past them: the padding is given back on the leading side.
         .px(px_len(Spacing::SM))
-        .py(px_len(Spacing::SM))
+        .ml(px(-Spacing::SM))
+        .py(px_len(Spacing::XXS))
         .rounded(px_len(Radii::SM))
         .cursor(CursorStyle::PointingHand)
         .child(chevron)
@@ -4190,7 +4234,7 @@ fn activity_group(group: &ActivityGroup<'_>, snapshot: &Snapshot) -> AnyElement 
         .min_w_0()
         .flex()
         .flex_col()
-        .pb(px_len(Spacing::MD))
+        .pb(px(Layout::TRANSCRIPT_ROW_GAP))
         .child(header);
 
     // What the turn is doing this moment, open or closed: a closed group is
@@ -4984,7 +5028,7 @@ fn plan_card(message: &ConversationMessage, is_live: bool) -> AnyElement {
         .debug_selector(|| PLAN_SELECTOR.into())
         .w_full()
         .min_w_0()
-        .pb(px_len(Spacing::MD))
+        .pb(px(Layout::TRANSCRIPT_ROW_GAP))
         .child(checklist(header, rows))
         .into_any_element()
 }

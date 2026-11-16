@@ -16,7 +16,7 @@ use fx_design::icon::Icon;
 use fx_design::styled::{FxStyled, px_len};
 use fx_design::theme::{BorderWidth, Colors, Spacing, TextRole, global};
 use gpui::prelude::*;
-use gpui::{AnyElement, App, ClipboardItem, InteractiveText, SharedString, div};
+use gpui::{AnyElement, App, ClipboardItem, InteractiveText, SharedString, div, px};
 use pulldown_cmark::{CodeBlockKind, Event, Options, Parser, Tag, TagEnd};
 use url::Url;
 
@@ -521,7 +521,9 @@ pub(crate) fn render(source: &str, id: impl Into<SharedString>) -> AnyElement {
         .w_full()
         .flex()
         .flex_col()
-        .gap(px_len(Spacing::SM))
+        // The transcript's row gap, so a paragraph break inside a reply and
+        // the break between a reply and its work read as one rhythm.
+        .gap(px(fx_design::theme::Layout::TRANSCRIPT_ROW_GAP))
         .children(blocks.iter().enumerate().map(|(index, block)| {
             render_block(block, paragraph_key(&id, index), is_tight(&blocks, index))
         }))

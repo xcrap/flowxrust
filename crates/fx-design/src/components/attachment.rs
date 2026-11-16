@@ -41,6 +41,51 @@ pub fn image_preview(image: Arc<RenderImage>, width: u32, height: u32) -> AnyEle
         .into_any_element()
 }
 
+/// The size of a prompt's image in the transcript: one fixed box, so a row
+/// of them lines up whatever their proportions.
+pub fn image_thumbnail_size() -> (f32, f32) {
+    let width = crate::theme::Layout::USER_ATTACHMENT_THUMBNAIL_WIDTH;
+    (
+        width,
+        (width / crate::theme::Layout::USER_ATTACHMENT_ASPECT_RATIO).round(),
+    )
+}
+
+/// A prompt's image as a thumbnail: the fixed box of
+/// [`image_thumbnail_size`], filled and cropped, as Claude and the Swift
+/// original draw one. The full image opens on click.
+pub fn image_thumbnail(image: Option<Arc<RenderImage>>) -> AnyElement {
+    let theme = global::current();
+    let (width, height) = image_thumbnail_size();
+    let body = match image {
+        Some(image) => img(image)
+            .size_full()
+            .object_fit(ObjectFit::Cover)
+            .into_any_element(),
+        None => div()
+            .size_full()
+            .flex()
+            .items_center()
+            .justify_center()
+            .child(Icon::PHOTO.render(IconSize::Regular, Colors::fg_tertiary(&theme), &theme))
+            .into_any_element(),
+    };
+    div()
+        .debug_selector(|| "attachment.thumbnail".into())
+        .w(px(width))
+        .h(px(height))
+        .max_w_full()
+        .min_w_0()
+        .flex_shrink_0()
+        .overflow_hidden()
+        .rounded(px_len(Radii::LG))
+        .border(px_len(BorderWidth::HAIRLINE))
+        .border_color(Colors::border_subtle(&theme))
+        .bg(Colors::bg_surface(&theme))
+        .child(body)
+        .into_any_element()
+}
+
 /// Edge of a pending attachment's square thumbnail in the composer.
 pub const ATTACHMENT_CHIP_SIZE: f32 = Spacing::HUGE + Spacing::SM;
 

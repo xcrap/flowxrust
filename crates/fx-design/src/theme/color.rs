@@ -1094,6 +1094,11 @@ impl Colors {
     pub fn composer_bg(t: &Theme) -> Rgba {
         Self::bg_elevated(t)
     }
+    /// The reader's own prompt in the transcript: the composer's fill, so a
+    /// sent prompt reads as what was typed there.
+    pub fn user_message_bg(t: &Theme) -> Rgba {
+        Self::composer_bg(t)
+    }
     pub fn panel_bg(t: &Theme) -> Rgba {
         Self::bg_elevated(t)
     }

@@ -17,7 +17,8 @@ use fx_core::{
     Attachment, ConversationImageAssetReference, ConversationMessage, MessageContent, MessageRole,
 };
 use fx_design::components::attachment::{
-    IMAGE_PREVIEW_MAX_WIDTH, attachment_chip, attachment_fallback, image_preview,
+    IMAGE_PREVIEW_MAX_WIDTH, attachment_chip, attachment_fallback, image_preview, image_thumbnail,
+    image_thumbnail_size,
 };
 use fx_design::components::{IconButtonProps, icon_button};
 use fx_design::icon::Icon;
@@ -396,6 +397,17 @@ pub(crate) struct AttachmentPreview {
     id: ElementId,
     input: ImageInput,
     label: SharedString,
+    /// Drawn as a prompt's thumbnail: a fixed, cropped box with no caption,
+    /// for a row of them above the prompt's words.
+    thumbnail: bool,
+}
+
+impl AttachmentPreview {
+    /// Draw this image as a prompt's thumbnail rather than a preview.
+    pub(crate) fn thumbnail(mut self) -> Self {
+        self.thumbnail = true;
+        self
+    }
 }
 
 pub(crate) fn preview(
@@ -407,6 +419,7 @@ pub(crate) fn preview(
         id: id.into(),
         input,
         label: label.into(),
+        thumbnail: false,
     }
 }
 
@@ -414,6 +427,9 @@ impl RenderOnce for AttachmentPreview {
     fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
         let theme = global::current();
         let loaded = window.use_asset::<PreviewLoader>(&self.input, cx);
+        if self.thumbnail {
+            return thumbnail_preview(self.id, self.input, loaded, &theme).into_any_element();
+        }
         let (body, can_open): (AnyElement, _) = match loaded {
             Some(Ok(preview)) => (
                 image_preview(preview.image, preview.width, preview.height),
@@ -462,7 +478,48 @@ impl RenderOnce for AttachmentPreview {
                     .text_color(Colors::fg_tertiary(&theme))
                     .child(self.label),
             )
+            .into_any_element()
     }
+}
+
+/// A prompt's image as a thumbnail that opens the full image on click. A
+/// thumbnail that has not loaded, or cannot, keeps its box with the photo
+/// glyph in it, so the row never jumps; the full preview's caption is left
+/// out, because the bubble beside it already says what was sent.
+fn thumbnail_preview(
+    id: ElementId,
+    input: ImageInput,
+    loaded: Option<Result<DecodedPreview, &'static str>>,
+    theme: &fx_design::theme::Theme,
+) -> impl IntoElement {
+    let (image, can_open) = match loaded {
+        Some(Ok(preview)) => (Some(preview.image), true),
+        _ => (None, false),
+    };
+    let (width, _) = image_thumbnail_size();
+    let hover = Colors::bg_hover(theme);
+    div()
+        .id(id)
+        .w(px(width))
+        .max_w_full()
+        .min_w_0()
+        .rounded(px_len(Radii::LG))
+        .when(can_open, |this| {
+            this.cursor_pointer()
+                .hover(move |style| style.fx_opacity(0.9).fx_background(hover))
+                .on_click(move |_, window, cx| {
+                    let (file, _) = cx.fetch_asset::<OpenImageLoader>(&input);
+                    window
+                        .spawn(cx, async move |cx| {
+                            if let Ok(path) = file.await {
+                                let _ =
+                                    cx.update(|_, cx| cx.open_with_system(path.as_ref().as_ref()));
+                            }
+                        })
+                        .detach();
+                })
+        })
+        .child(image_thumbnail(image))
 }
 
 // ── Composer attachments ──────────────────────────────────────────────────

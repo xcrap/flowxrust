@@ -196,8 +196,16 @@ impl Layout {
     /// The comfortable measure for a transcript column.
     pub const READABLE_CONTENT_WIDTH: f32 = 760.0;
     pub const USER_MESSAGE_MAX_WIDTH: f32 = 600.0;
+    /// A prompt's image, as a thumbnail in a row above its words.
     pub const USER_ATTACHMENT_THUMBNAIL_WIDTH: f32 = 176.0;
     pub const USER_ATTACHMENT_ASPECT_RATIO: f32 = 1.6;
+    /// The gap between a turn's rows: prose, a group of calls, a plan, the
+    /// live tail. The same as a paragraph's inside one reply, so a turn reads
+    /// as one column of text with its work folded into it.
+    pub const TRANSCRIPT_ROW_GAP: f32 = Spacing::MD;
+    /// The wider gap that sets the reader's own prompt apart from the turns
+    /// either side of it.
+    pub const TRANSCRIPT_TURN_GAP: f32 = Spacing::XXL;
     pub const COLLAPSED_USER_MESSAGE_HEIGHT: f32 = 176.0;
     pub const IMAGE_PREVIEW_MINIMUM_WIDTH: f32 = 720.0;
     pub const IMAGE_PREVIEW_MINIMUM_HEIGHT: f32 = 520.0;
