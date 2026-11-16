@@ -1120,7 +1120,11 @@ impl Job {
                             }
                             if let ProviderEvent::Approval(ref request) = event {
                                 let auto = if self.approvals == ApprovalPolicy::Ask {
-                                    (self.access == AgentAccess::FullAccess).then_some(true)
+                                    // Full Access answers everything; FlowX's
+                                    // own reads are answered at any level.
+                                    (self.access == AgentAccess::FullAccess
+                                        || self.approvals.allows_claude_tool(&request.tool_name, &request.input))
+                                    .then_some(true)
                                 } else { Some(self.approvals.allows_claude_tool(&request.tool_name, &request.input)) };
                                 if let Some(approved) = auto {
                                     let answered = if approved {
@@ -2908,6 +2912,9 @@ for line in sys.stdin:
         if prompt=="read":
             send({"type":"control_request","request_id":"control-1","request":{"subtype":"can_use_tool","tool_name":"Read","tool_use_id":"tool-1","input":{"file_path":"Cargo.toml"}}})
             continue
+        if prompt=="flowx-wait":
+            send({"type":"control_request","request_id":"control-1","request":{"subtype":"can_use_tool","tool_name":"mcp__flowx__wait_for_threads","tool_use_id":"tool-1","input":{"thread_ids":["t1"]}}})
+            continue
         if prompt=="closed-input":
             # Stops reading its input after the first request, so the answer
             # to the second one cannot be delivered.
@@ -3555,6 +3562,43 @@ for worker in workers: worker.join()
                 "{prompt}"
             );
         }
+    }
+
+    #[test]
+    fn a_supervised_claude_turn_waits_on_flowx_without_a_card_and_asks_for_the_rest() {
+        // A lead waits on its workers dozens of times a turn; a card each
+        // time made Supervised unusable for one. Anything else still asks.
+        let Some(server) = ClaudeFixture::new() else {
+            return;
+        };
+        let conversation = conversation();
+        let (_runner, recorder) = server.start_with(
+            &conversation,
+            "flowx-wait",
+            AgentAccess::Supervised,
+            "fixture-model",
+            ApprovalPolicy::Ask,
+        );
+        let updates = recorder.wait_for_end(TURN_BUDGET);
+        assert!(
+            matches!(updates.last(), Some(SessionUpdate::Finished { outcome }) if outcome.is_completed()),
+            "{updates:?}"
+        );
+        assert!(
+            !updates.iter().any(|update| matches!(
+                update,
+                SessionUpdate::Interaction {
+                    event: ProviderEvent::Approval(_)
+                }
+            )),
+            "a FlowX read asked the reader: {updates:?}"
+        );
+        let response = server
+            .received()
+            .into_iter()
+            .find(|item| item["type"] == "control_response")
+            .unwrap();
+        assert_eq!(response["response"]["response"]["behavior"], "allow");
     }
 
     #[test]

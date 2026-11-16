@@ -99,7 +99,11 @@ impl ApprovalPolicy {
     pub fn allows(&self, tool_name: &str, input: &Value) -> bool {
         match self {
             Self::AllowAll => true,
-            Self::Ask | Self::DenyAll => false,
+            // FlowX's own reads are answered without a card, as a provider's
+            // own file reads are under an access level that asks: a lead
+            // waits on its workers dozens of times a turn.
+            Self::Ask => fx_core::policy::flowx_tools::is_read_only_call(tool_name),
+            Self::DenyAll => false,
             Self::DenyUnlessReadOnly => {
                 // `risk_for` is not the right question here. It rates even a
                 // read-only command Moderate, because a *user* should be asked;
@@ -130,7 +134,8 @@ impl ApprovalPolicy {
     pub fn allows_claude_tool(&self, tool_name: &str, input: &Value) -> bool {
         match self {
             Self::AllowAll => true,
-            Self::Ask | Self::DenyAll => false,
+            Self::Ask => fx_core::policy::flowx_tools::is_read_only_call(tool_name),
+            Self::DenyAll => false,
             Self::DenyUnlessReadOnly => crate::claude::stream::is_read_only_tool(tool_name, input),
         }
     }
@@ -481,9 +486,12 @@ impl CodexSession {
                     }
                     if let Some(request) = PendingRequest::parse(id.clone(), &method, &params) {
                         let event = request.event.clone();
+                        // An approval the policy grants by itself (FlowX's
+                        // own reads, under Ask) needs no card.
+                        let granted = matches!(&event, ProviderEvent::Approval(a) if self.approvals.allows(&a.tool_name, &a.input));
                         let ask = responses.is_some()
                             && (matches!(event, ProviderEvent::UserInput(_))
-                                || self.approvals == ApprovalPolicy::Ask);
+                                || self.approvals == ApprovalPolicy::Ask && !granted);
                         if ask {
                             pending.insert(request_key(&id), request);
                             sink(event);
@@ -2323,29 +2331,56 @@ mod tests {
         }
         // Refusing everything still refuses them.
         assert!(!ApprovalPolicy::DenyAll.allows("mcp__flowx__list_threads", &json!({})));
+        // A level that asks answers FlowX's reads itself, and only those.
+        for tool in [
+            "mcp__flowx__list_threads",
+            "mcp__flowx__read_thread",
+            "mcp__flowx__wait_for_threads",
+        ] {
+            assert!(ApprovalPolicy::Ask.allows(tool, &json!({})), "codex {tool}");
+            assert!(
+                ApprovalPolicy::Ask.allows_claude_tool(tool, &json!({})),
+                "claude {tool}"
+            );
+        }
+        assert!(!ApprovalPolicy::Ask.allows("commandExecution", &json!({"command": "ls"})));
+        assert!(!ApprovalPolicy::Ask.allows_claude_tool("Read", &json!({})));
     }
 
     #[tokio::test]
     async fn codex_s_approval_for_a_flowx_read_tool_is_answered_by_the_read_only_policy() {
         // Codex asks for an MCP tool call as an elicitation, and FlowX reads
         // the tool's name out of its message. Accepted unasked, so a Read
-        // Only thread can use FlowX's tools without a card.
-        let Some((seen, _)) = answer_first_request(
-            "flowx-tool-approval",
-            ApprovalPolicy::DenyUnlessReadOnly,
-            |_| None,
-        )
-        .await
-        else {
-            return;
-        };
-        assert!(
-            !seen
-                .iter()
-                .any(|event| matches!(event, ProviderEvent::Approval(_))),
-            "a card was shown: {seen:?}"
-        );
-        assert_eq!(echoed_response(&seen)["result"]["action"], "accept");
+        // Only thread can use FlowX's tools without a card, and so can one
+        // at a level that asks: a lead waits on its workers dozens of times
+        // a turn, and a card each time made Supervised unusable for one.
+        for policy in [ApprovalPolicy::DenyUnlessReadOnly, ApprovalPolicy::Ask] {
+            // A card would be declined here, so a regression fails the
+            // assertions below rather than leaving the turn waiting.
+            let Some((seen, _)) =
+                answer_first_request("flowx-tool-approval", policy, |event| match event {
+                    ProviderEvent::Approval(request) => Some(UserResponse::Approval {
+                        id: request.id.clone(),
+                        approved: false,
+                    }),
+                    _ => None,
+                })
+                .await
+            else {
+                return;
+            };
+            assert!(
+                !seen
+                    .iter()
+                    .any(|event| matches!(event, ProviderEvent::Approval(_))),
+                "{policy:?}: a card was shown: {seen:?}"
+            );
+            assert_eq!(
+                echoed_response(&seen)["result"]["action"],
+                "accept",
+                "{policy:?}"
+            );
+        }
     }
 
     #[test]
