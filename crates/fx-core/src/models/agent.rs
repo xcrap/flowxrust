@@ -32,6 +32,25 @@ pub struct Agent {
         deserialize_with = "uuid_or_none"
     )]
     pub space: Option<Uuid>,
+    /// The space this thread leads, if it is a space's orchestrator: the
+    /// thread its space's heading opens, which starts, steers and waits for
+    /// the space's other threads through FlowX's tools. A space has at most
+    /// one, made the first time it is opened. Read as `space` is: a value
+    /// this build cannot read is unset, and the thread is ordinary.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "uuid_or_none"
+    )]
+    pub lead_of: Option<Uuid>,
+    /// The orchestrator that started this thread, if one did. Only a link:
+    /// the thread is ordinary, and keeps its place if its lead goes.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "uuid_or_none"
+    )]
+    pub spawned_by: Option<Uuid>,
     #[serde(default)]
     pub configuration: AgentConfiguration,
     #[serde(default)]
@@ -47,6 +66,8 @@ impl Agent {
             workspace: None,
             review_of: None,
             space: None,
+            lead_of: None,
+            spawned_by: None,
             configuration: AgentConfiguration::default(),
             execution_state: AgentExecutionState::Idle,
             created_at: now(),
@@ -60,6 +81,8 @@ impl Agent {
             workspace: None,
             review_of: None,
             space: None,
+            lead_of: None,
+            spawned_by: None,
             configuration: AgentConfiguration::default(),
             execution_state: AgentExecutionState::Idle,
             created_at: now(),
@@ -374,6 +397,24 @@ mod tests {
             let read: Agent = serde_json::from_value(value).expect("the thread still reads");
             assert_eq!(read.title, "Grouped");
             assert_eq!(read.space, None);
+        }
+    }
+
+    #[test]
+    fn a_lead_and_its_workers_links_are_optional_and_a_bad_value_costs_only_the_link() {
+        let mut agent = Agent::new("Lead");
+        let value = serde_json::to_value(&agent).unwrap();
+        assert!(value.get("lead_of").is_none() && value.get("spawned_by").is_none());
+        let (space, lead) = (Uuid::new_v4(), Uuid::new_v4());
+        agent.lead_of = Some(space);
+        agent.spawned_by = Some(lead);
+        let back: Agent = serde_json::from_value(serde_json::to_value(&agent).unwrap()).unwrap();
+        assert_eq!((back.lead_of, back.spawned_by), (Some(space), Some(lead)));
+        for key in ["lead_of", "spawned_by"] {
+            let mut value = serde_json::to_value(&agent).unwrap();
+            value[key] = serde_json::json!("not-an-id");
+            let read: Agent = serde_json::from_value(value).expect("the thread still reads");
+            assert_eq!(read.title, "Lead");
         }
     }
 
