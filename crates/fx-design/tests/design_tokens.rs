@@ -699,18 +699,55 @@ fn banner_text_clears_aa_on_every_muted_fill() {
     }
 }
 
+/// The reader's own prompt as the transcript paints it: `user_message_bg`
+/// over the content column.
+///
+/// It was an `accent_muted` wash, and the tests measured that wash long after
+/// the bubble became the composer's fill, so they no longer measured the
+/// surface the prompt is drawn on.
+fn user_bubble(t: &Theme) -> Rgba {
+    composite(Colors::user_message_bg(t), Colors::content_bg(t))
+}
+
 #[test]
-fn selected_text_stays_legible_and_visible_on_every_transcript_surface() {
-    // Selection is painted under the glyphs, so the words on it must still
-    // clear AA. It is also painted over the reader's own prompt bubble, which is
-    // already an accent wash, so the highlight has to stay distinguishable there.
+fn everything_written_on_the_readers_prompt_clears_aa() {
+    // The prompt's words, its secondary and tertiary captions ("Show full
+    // message", "Empty message"), and a link, on the bubble they are drawn on.
     for (tone, mode) in all_theme_combinations() {
         for accent in AccentColor::ALL {
             let t = Theme {
                 accent_color: accent,
                 ..theme_for(tone, mode)
             };
-            let bubble = composite(Colors::accent_muted(&t), Colors::bg(&t));
+            let bubble = user_bubble(&t);
+            for (ink_name, ink) in [
+                ("fg", Colors::fg(&t)),
+                ("fgSecondary", Colors::fg_secondary(&t)),
+                ("fgTertiary", Colors::fg_tertiary(&t)),
+                ("accentSecondaryInk", Colors::accent_secondary_ink(&t)),
+            ] {
+                let ratio = contrast(ink, bubble);
+                assert!(
+                    ratio >= 4.5,
+                    "{tone:?} {mode:?} {accent:?}: {ink_name} on the reader's prompt is {ratio}:1"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn selected_text_stays_legible_and_visible_on_every_transcript_surface() {
+    // Selection is painted under the glyphs, so the words on it must still
+    // clear AA. It is also painted over the reader's own prompt bubble, so the
+    // highlight has to stay distinguishable there.
+    for (tone, mode) in all_theme_combinations() {
+        for accent in AccentColor::ALL {
+            let t = Theme {
+                accent_color: accent,
+                ..theme_for(tone, mode)
+            };
+            let bubble = user_bubble(&t);
             for (surface_name, surface) in [
                 ("bg", Colors::bg(&t)),
                 ("bgElevated", Colors::bg_elevated(&t)),

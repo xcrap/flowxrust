@@ -906,9 +906,10 @@ impl Colors {
     }
     /// The highlight behind selected read-only text.
     ///
-    /// Stronger than `accent_muted` because a selection is drawn over it too:
-    /// the reader's own prompts sit on an `accent_muted` bubble, and a highlight
-    /// of the same strength would vanish there.
+    /// Stronger than `accent_muted`, sized when the reader's own prompts sat
+    /// on an `accent_muted` bubble and a highlight of the same strength
+    /// vanished there. They now sit on `user_message_bg`, where the contrast
+    /// tests measure it.
     pub fn text_selection(t: &Theme) -> Rgba {
         Rgba {
             a: if t.is_dark() { 0.34 } else { 0.26 },
