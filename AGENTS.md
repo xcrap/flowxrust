@@ -485,7 +485,9 @@ and a thread names its own (`Agent::space`), so moving a thread is one field
 and deleting a space only clears that field on its threads. Spaces are
 grouping, not order: `RecordIndex::visible` stays one flat list in thread
 order, so ⌘1–9 and the palette number threads as before, and the sidebar
-groups them as it draws. The open thread always has a row: moving it into a
+groups them as it draws. A space's lead is its header, not a row, so
+`visible` leaves leads out and `RecordIndex::listed`, which search reads,
+keeps them. The open thread always has a row: moving it into a
 closed space opens that space, and so does opening it from elsewhere (⌘1–9,
 the palette, a restore), as its project already did. `Space::COLORS` is the
 accent names, because `fx-core` cannot see the design system; a sidebar test
@@ -506,6 +508,51 @@ read-only, as one space per section in each project that has threads in it
   removed by a pass.
 - **Nothing is written back to Codex.** Codex's sections are its own
   account's, and FlowX does not move or rename them.
+
+## Orchestrators
+
+Every space has a lead: a thread with `Agent::lead_of` naming the space,
+which its header opens and which runs the space's other threads through
+FlowX's tools. It is made the first time the header is opened
+(`AppState::ensure_space_lead`), so no empty thread is made up front, with
+`fx_core::policy::orchestrator::BRIEF` as its system prompt and FlowX's
+tools on.
+
+- **One lead per space, by one rule:** the first listed thread whose
+  `lead_of` names it, in `agents` order (`snapshot_index::space_leads`).
+  Renaming the space renames its lead. Deleting the space keeps the lead as
+  an ordinary thread, its brief dropped and its read tools kept. Archiving
+  it or Reset hands the role to the next. A Codex-mirrored space is kept
+  while it has a lead.
+- **Only the chevron folds a space.** The rest of the header opens the lead,
+  takes the selected fill while it is open, and shows its activity; opening
+  a lead never unfolds its space.
+- **A lead acts only inside a turn the reader started.** `start_thread`,
+  `send_to_thread`, `wait_for_threads` and `stop_thread` are offered to a
+  lead alone and checked as one on every call: the server's role hint
+  (`FLOWX_MCP_ROLE`) only decides what is listed, and proves nothing. FlowX
+  never prompts a lead by itself, and a lead's Stop stops only the lead.
+- **A worker is an ordinary thread in the lead's space** (`spawned_by`),
+  with the lead's access, none of FlowX's tools, its own title kept (never
+  auto-named), and not selected when it starts. `worktree: true` gives it a
+  linked checkout on a `flowx/` branch, as a worktree chat gets.
+- **Starts are bounded.** At most `MAX_RUNNING_WORKERS` (4) of a space's
+  threads run at once, sends included, checked again on the UI thread when
+  the thread is made, so two starts cannot race for the last slot. No new
+  work starts once the provider's usage passes `LIMIT_WARNING_AT`.
+- **A wait is bounded and watches.** At most 240 s, polled off the UI
+  thread; a worker blocked on the reader counts as settled, as "waiting",
+  so the lead can say where to answer. Listing, reading and waiting are
+  reads: answered without a card at any level that asks. Starting, sending
+  and stopping are each a card there, and Read Only refuses them.
+- **A tool timeout is set per server, never through the environment.**
+  Codex 0.167's default MCP tool timeout is 300 s (`tool_timeout_sec`,
+  float seconds) and Claude 2.1.325's is 1e8 ms (`MCP_TOOL_TIMEOUT`); a
+  lead's server entry states 600 s in each one's unit (`timeout` in ms for
+  Claude), so a user's own low setting cannot cut a wait short.
+- `orchestration.rs` is declared from `state.rs` with `#[path]` to read the
+  state's private fields; a `#[path]` module's own `mod x;` resolves beside
+  `src/`, so its tests stay inline.
 
 ## Native history
 
