@@ -961,18 +961,23 @@ impl AppState {
         true
     }
 
-    /// Open the space a thread is listed in, so the thread has a row.
+    /// Open the space a thread is listed in, so the thread has a row. A
+    /// space's lead has its header for one, drawn open or folded, so opening
+    /// the lead leaves the space as the reader left it.
     fn reveal_in_space(&mut self, agent_id: Uuid) {
-        let Some(space) = self
+        let Some((space, leads)) = self
             .snapshot
             .projects
             .iter()
             .flat_map(|record| &record.agents)
             .find(|agent| agent.id == agent_id)
-            .and_then(|agent| agent.space)
+            .and_then(|agent| Some((agent.space?, agent.lead_of)))
         else {
             return;
         };
+        if leads.is_some_and(|led| self.space_lead(led) == Some(agent_id)) {
+            return;
+        }
         if self.space(space).is_some_and(|(_, held)| !held.is_expanded) {
             self.toggle_space_expansion(space);
         }
@@ -1038,6 +1043,9 @@ impl AppState {
                 // Its replacement takes its place in the space too.
                 agent.space = space;
             }
+            // A lead's replacement leads the space, so its header opens the
+            // conversation that starts over.
+            self.hand_over_lead(agent_id, fresh);
             self.save();
             return Some(fresh);
         }
@@ -1105,7 +1113,7 @@ impl AppState {
 
     /// Commit metadata before changing the live view. If the backup write fails
     /// after the primary landed, try restoring the previous snapshot as well.
-    fn commit_thread_change(&mut self, mut next: PersistedApp, action: &str) -> bool {
+    pub(crate) fn commit_thread_change(&mut self, mut next: PersistedApp, action: &str) -> bool {
         next.sidebar_visible = self.sidebar_visible;
         next.normalize();
         if let Err(error) = self.store.save_app(&next) {
@@ -1310,7 +1318,7 @@ impl AppState {
     }
 
     /// Whether the workspace may be edited at all, saying why not.
-    fn spaces_can_change(&mut self) -> bool {
+    pub(crate) fn spaces_can_change(&mut self) -> bool {
         if !self.snapshot_writable {
             self.last_error = Some(
                 "The saved workspace could not be read. Restore its files before changing spaces."
@@ -1397,6 +1405,8 @@ impl AppState {
             return false;
         };
         self.change_space(space_id, "rename this space", |record, at| {
+            // Its lead is named after it, in the same write.
+            crate::space_lead::retitle_leads(record, space_id, &name);
             record.spaces[at].space.name = name;
         })
     }
@@ -1419,10 +1429,12 @@ impl AppState {
     }
 
     /// Remove a space. Its threads stay where they are in the project,
-    /// ungrouped; nothing else is deleted.
+    /// ungrouped, its lead among them as an ordinary thread; nothing else
+    /// is deleted.
     pub fn delete_space(&mut self, space_id: Uuid) -> bool {
         self.change_space(space_id, "delete this space", |record, at| {
             record.spaces.remove(at);
+            crate::space_lead::release_leads(record, space_id);
             for agent in &mut record.agents {
                 if agent.space == Some(space_id) {
                     agent.space = None;
@@ -1436,6 +1448,15 @@ impl AppState {
     /// anything its turn reads.
     pub fn move_thread_to_space(&mut self, agent_id: Uuid, space: Option<Uuid>) -> bool {
         if !self.spaces_can_change() {
+            return false;
+        }
+        // Its header is where it is drawn, so moved, it would be listed in
+        // neither space.
+        if let Some(led) = self.thread(agent_id).and_then(|agent| agent.lead_of)
+            && space != Some(led)
+            && self.space_lead(led) == Some(agent_id)
+        {
+            self.last_error = Some("A space's lead stays in the space it leads.".into());
             return false;
         }
         let mut next = self.snapshot.clone();
@@ -1768,10 +1789,11 @@ impl AppState {
             .get(&agent_id)
             .cloned()
             .unwrap_or_default();
+        let placeholder = self.composer_placeholder(agent_id);
         let field = cx.new(|cx| {
             let mut field = TextField::new(cx)
                 .bare()
-                .placeholder("Ask anything, or describe a task…")
+                .placeholder(placeholder)
                 .multiline(8.0)
                 .max_len(COMPOSER_MAX_CHARACTERS);
             field.restore_value(initial, cx);
@@ -3723,12 +3745,13 @@ impl AppState {
                     .splice(0..0, discovered);
                 // A mirrored space no thread is in goes: it was the
                 // provider's grouping, and it now groups nothing. A thread
-                // this build cannot read still counts.
+                // this build cannot read still counts, and so does the
+                // space's lead, whose conversation its header opens.
                 if !mirrored.is_empty() {
                     let named: HashSet<Uuid> = record
                         .agents
                         .iter()
-                        .filter_map(|agent| agent.space)
+                        .flat_map(|agent| agent.space.into_iter().chain(agent.lead_of))
                         .chain(
                             record
                                 .unreadable
@@ -4145,6 +4168,9 @@ impl AppState {
 pub const MAX_QUEUED_PROMPTS: usize = 20;
 pub const MAX_QUEUED_ATTACHMENT_BYTES: usize = 64 * 1024 * 1024;
 const COMPOSER_MAX_CHARACTERS: usize = 32_000;
+/// What an empty composer says, in every thread but a space's lead, whose
+/// own says what it is for (`AppState::composer_placeholder`).
+pub(crate) const COMPOSER_PLACEHOLDER: &str = "Ask anything, or describe a task…";
 
 /// What each thread's composer holds besides its text, and what is in flight
 /// on its behalf.
@@ -5029,7 +5055,7 @@ pub(crate) fn encode_partial_cache(
     Ok((record, bytes))
 }
 
-fn local_override(
+pub(crate) fn local_override(
     record: &mut fx_store::PersistedProject,
     agent_id: Uuid,
 ) -> &mut fx_store::format::PersistedThreadOverride {

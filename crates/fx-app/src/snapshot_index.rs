@@ -72,10 +72,21 @@ impl<T: std::fmt::Debug> std::fmt::Debug for Versioned<T> {
 /// snapshot.
 #[derive(Debug, Default)]
 pub struct RecordIndex {
-    /// The threads the sidebar lists, in its order, as positions in the
-    /// record's `agents`: the project's order, less archived and missing
-    /// threads and ids with no thread this build can read.
+    /// The threads the sidebar lists as rows, in its order, as positions in
+    /// the record's `agents`: the project's order, less archived and missing
+    /// threads, ids with no thread this build can read, and each space's
+    /// lead.
+    ///
+    /// A lead has no row: its space's header is what opens it. So it is not
+    /// numbered here, and ⌘1–9, the menu bar's thread list and the palette's
+    /// shortcuts, which all count this list, number the rows the reader can
+    /// count. Numbered by its place in thread order, ⌘N would land on a
+    /// heading somewhere above the rows it was counted among.
     pub visible: Rc<[usize]>,
+    /// Every thread the project lists, its spaces' leads included, in the
+    /// same order. A search looks through these: it lists its matches flat,
+    /// with no headers, so a lead is reachable there only as a row.
+    pub listed: Rc<[usize]>,
     /// Every id in the project's order, listed or not.
     pub ordered: HashSet<Uuid>,
     /// The archived threads, as positions in the record's `agents`, in that
@@ -99,6 +110,9 @@ pub struct SpaceIndex {
     /// Where the space is in the record's `spaces`.
     pub slot: usize,
     pub id: Uuid,
+    /// Its lead, the thread its header opens, as a position in the record's
+    /// `agents`; `None` until the header is first opened.
+    pub lead: Option<usize>,
     /// Its listed threads, as positions in the record's `agents`, in the
     /// sidebar's order: newest first, as everywhere.
     pub threads: Rc<[usize]>,
@@ -148,21 +162,18 @@ impl SnapshotIndex {
     }
 
     fn record(record: &PersistedProject) -> RecordIndex {
-        // The first thread with an id, as `iter().find` picked it.
-        let mut slots: HashMap<Uuid, usize> = HashMap::with_capacity(record.agents.len());
-        for (slot, agent) in record.agents.iter().enumerate() {
-            slots.entry(agent.id).or_insert(slot);
-        }
         let archived: HashSet<Uuid> = record.archived_agent_ids.iter().copied().collect();
-        let missing: HashSet<&Uuid> = record.missing_native_agent_ids.iter().collect();
         let order = record
             .project
             .as_ref()
             .map_or(&[][..], |project| project.agent_order.as_slice());
-        let visible: Rc<[usize]> = order
+        let listed: Rc<[usize]> = listed_slots(record).into();
+        let leads = space_leads(record, &listed);
+        let lead_slots: HashSet<usize> = leads.values().copied().collect();
+        let visible: Rc<[usize]> = listed
             .iter()
-            .filter(|id| !archived.contains(id) && !missing.contains(id))
-            .filter_map(|id| slots.get(id).copied())
+            .copied()
+            .filter(|slot| !lead_slots.contains(slot))
             .collect();
         // One pass over the listed threads, whatever the number of spaces.
         let mut space_slots: HashMap<Uuid, usize> = HashMap::with_capacity(record.spaces.len());
@@ -188,17 +199,23 @@ impl SnapshotIndex {
             .enumerate()
             .zip(grouped)
             .filter(|((slot, space), threads)| {
+                // A mirror with a lead keeps its header: the lead's
+                // conversation is under it.
                 space_slots.get(&space.space.id) == Some(slot)
-                    && (space.space.codex_section.is_none() || !threads.is_empty())
+                    && (space.space.codex_section.is_none()
+                        || !threads.is_empty()
+                        || leads.contains_key(&space.space.id))
             })
             .map(|((slot, space), threads)| SpaceIndex {
                 slot,
                 id: space.space.id,
+                lead: leads.get(&space.space.id).copied(),
                 threads: threads.into(),
             })
             .collect();
         RecordIndex {
             visible,
+            listed,
             spaces,
             ungrouped: ungrouped.into(),
             space_of,
@@ -212,6 +229,19 @@ impl SnapshotIndex {
                 .collect(),
             unseen: record.unseen_completion_ids.iter().copied().collect(),
         }
+    }
+
+    /// The space a thread leads, when it is the lead its space's header
+    /// opens. A thread whose `lead_of` names a space it does not lead (a
+    /// second lead, or a space that is gone) is ordinary.
+    pub fn space_led_by(&self, id: Uuid) -> Option<Uuid> {
+        let (record, slot) = *self.agents.get(&id)?;
+        self.records
+            .get(record)?
+            .spaces
+            .iter()
+            .find(|space| space.lead == Some(slot))
+            .map(|space| space.id)
     }
 
     /// Whether this index describes `snapshot` as it is now.
@@ -246,6 +276,53 @@ impl SnapshotIndex {
             .get(slot)
             .filter(|binding| binding.agent_id == id)
     }
+}
+
+/// The threads a record lists, as positions in its `agents`, in the
+/// project's order: less archived and missing threads and ids with no
+/// thread this build can read. The first thread with an id, as
+/// `iter().find` picks it.
+pub fn listed_slots(record: &PersistedProject) -> Vec<usize> {
+    let mut slots: HashMap<Uuid, usize> = HashMap::with_capacity(record.agents.len());
+    for (slot, agent) in record.agents.iter().enumerate() {
+        slots.entry(agent.id).or_insert(slot);
+    }
+    let archived: HashSet<&Uuid> = record.archived_agent_ids.iter().collect();
+    let missing: HashSet<&Uuid> = record.missing_native_agent_ids.iter().collect();
+    record
+        .project
+        .as_ref()
+        .map_or(&[][..], |project| project.agent_order.as_slice())
+        .iter()
+        .filter(|id| !archived.contains(id) && !missing.contains(id))
+        .filter_map(|id| slots.get(id).copied())
+        .collect()
+}
+
+/// Each of a record's spaces' lead, as a position in its `agents`: the first
+/// thread there whose `lead_of` names the space, among the `listed` ones.
+///
+/// The first in `agents`, as `iter().find` picks it, so the index and
+/// `AppState::space_lead` agree. Data holding two leads for one space keeps
+/// the second an ordinary thread, drawn as a row, so no conversation is
+/// hidden. A lead that is archived or missing leads nothing until it is
+/// back, and one whose space is not in its record is an ordinary thread.
+pub fn space_leads(record: &PersistedProject, listed: &[usize]) -> HashMap<Uuid, usize> {
+    let mut leads = HashMap::new();
+    if record.spaces.is_empty() {
+        return leads;
+    }
+    let spaces: HashSet<Uuid> = record.spaces.iter().map(|space| space.space.id).collect();
+    let mut listed = listed.to_vec();
+    listed.sort_unstable();
+    for slot in listed {
+        if let Some(space) = record.agents[slot].lead_of
+            && spaces.contains(&space)
+        {
+            leads.entry(space).or_insert(slot);
+        }
+    }
+    leads
 }
 
 #[cfg(test)]
@@ -406,5 +483,56 @@ mod tests {
             names(&record.visible),
             vec![ids[2], ids[5], ids[0], ids[1], ids[3]]
         );
+        assert_eq!(record.listed, record.visible, "no space has a lead");
+        assert!(record.spaces.iter().all(|space| space.lead.is_none()));
+    }
+
+    #[test]
+    fn a_spaces_lead_is_its_header_and_not_one_of_the_rows() {
+        use fx_store::PersistedSpace;
+        let mut agents: Vec<Agent> = (0..5).map(|i| Agent::new(format!("T{i}"))).collect();
+        let ids: Vec<Uuid> = agents.iter().map(|agent| agent.id).collect();
+        let work = fx_core::Space::new("Work");
+        for at in [0, 1, 2] {
+            agents[at].space = Some(work.id);
+        }
+        // The lead, and a second that data from another machine named too.
+        agents[1].lead_of = Some(work.id);
+        agents[2].lead_of = Some(work.id);
+        // Archived, it leads nothing.
+        agents[3].lead_of = Some(work.id);
+        // A space this record does not hold: an ordinary thread.
+        agents[4].lead_of = Some(Uuid::new_v4());
+        let mut project = Project::new("/tmp/leads");
+        // The second ahead of the first in thread order: the first in the
+        // record's threads still leads.
+        project.agent_order = vec![ids[2], ids[3], ids[1], ids[0], ids[4]];
+        let snapshot = Versioned::new(PersistedApp {
+            projects: vec![PersistedProject {
+                project: Some(project),
+                agents,
+                archived_agent_ids: vec![ids[3]],
+                spaces: vec![PersistedSpace::new(work.clone())],
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
+        let index = SnapshotIndex::build(&snapshot);
+        let record = &index.records[0];
+        let names = |slots: &[usize]| -> Vec<Uuid> {
+            slots
+                .iter()
+                .map(|&slot| snapshot.projects[0].agents[slot].id)
+                .collect()
+        };
+        assert_eq!(record.spaces[0].lead, Some(1));
+        assert_eq!(names(&record.spaces[0].threads), vec![ids[2], ids[0]]);
+        assert_eq!(names(&record.visible), vec![ids[2], ids[0], ids[4]]);
+        assert_eq!(names(&record.listed), vec![ids[2], ids[1], ids[0], ids[4]]);
+        assert!(!record.space_of.contains_key(&ids[1]));
+        assert_eq!(index.space_led_by(ids[1]), Some(work.id));
+        for ordinary in [ids[0], ids[2], ids[3], ids[4]] {
+            assert_eq!(index.space_led_by(ordinary), None);
+        }
     }
 }

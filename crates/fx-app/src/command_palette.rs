@@ -264,16 +264,40 @@ pub fn commands(state: &AppState) -> Vec<PaletteCommand> {
                     && !record.missing_native_agent_ids.contains(id)
             })
             .filter_map(|id| agents.get(id).map(|agent| (id, *agent)));
-        for (index, (id, agent)) in visible.enumerate() {
+        // A space's lead is listed, but numbered as ⌘1–⌘9 number threads:
+        // it has no row, so the keys skip it.
+        let lead_spaces: HashMap<Uuid, Uuid> = crate::snapshot_index::space_leads(
+            record,
+            &crate::snapshot_index::listed_slots(record),
+        )
+        .into_iter()
+        .filter_map(|(space, slot)| Some((record.agents.get(slot)?.id, space)))
+        .collect();
+        let mut index = 0;
+        for (id, agent) in visible {
             let title = if agent.title.is_empty() {
                 "Untitled thread"
             } else {
                 agent.title.as_str()
             };
+            let led = lead_spaces.get(id).and_then(|space| {
+                record
+                    .spaces
+                    .iter()
+                    .find(|held| held.space.id == *space)
+                    .map(|held| held.space.name.as_str())
+            });
+            let number = led.is_none().then(|| {
+                index += 1;
+                index - 1
+            });
             out.push(PaletteCommand {
                 id: format!("thread:{id}"),
                 title: format!("Open {title}"),
-                subtitle: format!("Thread in {}", project.name),
+                subtitle: match led {
+                    Some(space) => format!("Lead of {space} in {}", project.name),
+                    None => format!("Thread in {}", project.name),
+                },
                 icon: Icon::BUBBLE_LEFT_AND_BUBBLE_RIGHT,
                 keywords: vec![
                     "switch".into(),
@@ -281,9 +305,9 @@ pub fn commands(state: &AppState) -> Vec<PaletteCommand> {
                     title.to_lowercase(),
                     project.name.to_lowercase(),
                 ],
-                shortcut: (active && index < NUMBERED_THREADS)
-                    .then(|| commands::shortcut_for(&commands::OpenThread { index }))
-                    .flatten(),
+                shortcut: number
+                    .filter(|index| active && *index < NUMBERED_THREADS)
+                    .and_then(|index| commands::shortcut_for(&commands::OpenThread { index })),
                 target: PaletteTarget::Thread(*id),
             });
         }
@@ -1447,6 +1471,37 @@ mod tests {
             .find(|command| command.title == "Open Second")
             .unwrap();
         assert_eq!(second.shortcut.as_deref(), Some("⌘2"));
+    }
+
+    #[test]
+    fn a_spaces_lead_is_listed_but_the_number_keys_skip_it() {
+        let shell = shell();
+        shell.test.update(|cx| {
+            shell.state.update(cx, |state, _| {
+                let project = state.snapshot.active_project_id.unwrap();
+                let space = state.create_space(project, "Auth", None).unwrap();
+                // Made first in thread order, ahead of both threads.
+                state.ensure_space_lead(space).unwrap();
+            })
+        });
+        let commands = shell.test.read(|cx| commands(shell.state.read(cx)));
+        let find = |title: &str| commands.iter().find(|command| command.title == title);
+        let lead = find("Open Auth").expect("the lead is listed");
+        assert_eq!(lead.shortcut, None);
+        assert!(lead.subtitle.starts_with("Lead of Auth in "));
+        // Numbered as ⌘1–⌘9 number them, the sidebar's rows.
+        assert_eq!(find("Open First").unwrap().shortcut.as_deref(), Some("⌘1"));
+        assert_eq!(find("Open Second").unwrap().shortcut.as_deref(), Some("⌘2"));
+        let numbered: Vec<String> = shell.test.read(|cx| {
+            shell
+                .state
+                .read(cx)
+                .active_agents()
+                .into_iter()
+                .map(|agent| agent.title)
+                .collect()
+        });
+        assert_eq!(numbered, ["First", "Second"]);
     }
 
     fn row(title: &str) -> &'static str {

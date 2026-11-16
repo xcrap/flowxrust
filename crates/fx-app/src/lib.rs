@@ -41,6 +41,7 @@ pub mod session;
 pub mod settings;
 pub mod sidebar;
 pub mod snapshot_index;
+mod space_lead;
 pub mod state;
 pub mod text_field;
 mod thread_actions;
@@ -1410,6 +1411,10 @@ fn composer_row(
     };
 
     let field = state.update(cx, |state, cx| state.draft(agent.id, cx));
+    // A lead's says what it is for, after its space's name as it is now: a
+    // rename of the space renames it, and its field outlives that.
+    let placeholder = state.read(cx).composer_placeholder(agent.id);
+    field.update(cx, |field, _| field.set_placeholder(&placeholder));
 
     // Every queued prompt, not the engine's three previews, so the strip's
     // "+N more" can be truthful; and the position of the one being edited.

@@ -563,7 +563,14 @@ fn threads(
             ));
         }
     }
-    if listed.visible.is_empty() {
+    // Under the headers, a lead is not one of the rows; a search, which
+    // draws no headers, lists it as one.
+    let rows_listed = if grouped {
+        &listed.visible
+    } else {
+        &listed.listed
+    };
+    if rows_listed.is_empty() {
         // A project whose every thread is archived is not one with no
         // threads. Claude desktop's archive is mirrored here, so a project
         // worked on there for months opened as "No threads yet" with nothing
@@ -703,6 +710,7 @@ fn space_group(
             space.threads.len(),
             // Open, its threads say it themselves.
             activity.filter(|_| !expanded),
+            space.lead.and_then(|slot| rows.record.agents.get(slot)),
             interactive,
         ))
         .child(collapsible(
@@ -715,11 +723,17 @@ fn space_group(
 
 /// A space's header: its colour, name and thread count, and the disclosure.
 /// Laid out as a thread row is, so its name starts where their titles do.
+///
+/// The header is its lead's row: a click opens the lead (made then, the
+/// first time), it is filled while the lead is the open thread, and its
+/// colour mark reports the lead's turn as a thread's tile does, with the
+/// unseen dot beside the name. Only the chevron folds the space.
 fn space_row(
     rows: &Rows,
     space: &PersistedSpace,
     count: usize,
     activity: Option<ActivityState>,
+    lead: Option<&Agent>,
     interactive: bool,
 ) -> AnyElement {
     let theme = global::current();
@@ -737,8 +751,18 @@ fn space_row(
         "" => "Untitled space".to_string(),
         name => name.to_string(),
     };
+    let selected = lead.is_some_and(|lead| rows.app.snapshot.active_agent_id == Some(lead.id));
+    let lead_activity = lead.map(|lead| thread_activity(rows.app, lead).0);
+    let unseen = lead.is_some_and(|lead| {
+        crate::thread_presentation::shows_unseen_completion(
+            rows.listed.unseen.contains(&lead.id),
+            selected,
+            lead_activity.unwrap_or_default(),
+        )
+    });
+    let activity = header_activity(lead_activity, activity);
     let owner = format!("space:{id}");
-    let pinned = rows.open_menu == Some(owner.as_str());
+    let pinned = selected || rows.open_menu == Some(owner.as_str());
     let menu = space_menu();
     let context_menu = menu.clone();
     let registry = rows.app.context_registry.clone();
@@ -746,6 +770,7 @@ fn space_row(
     let expanded = space.is_expanded;
     let status = activity.map(|activity| match activity {
         ActivityState::Waiting => "waiting",
+        ActivityState::Error => "failed",
         _ => "running",
     });
     let row = div()
@@ -761,7 +786,8 @@ fn space_row(
         .pr(px_len(Spacing::XXS))
         .cursor_pointer()
         .rounded(px_len(Radii::SM))
-        .hover(|s| s.fx_background(Colors::bg_hover(&theme)))
+        .bg(thread_row_fill(selected, false, &theme))
+        .hover(|s| s.fx_background(thread_row_fill(selected, true, &theme)))
         .on_click({
             let state = state.clone();
             move |_, _, cx| {
@@ -769,7 +795,9 @@ fn space_row(
                     return;
                 }
                 state.update(cx, |state, cx| {
-                    state.toggle_space_expansion(id);
+                    if let Some(lead) = state.ensure_space_lead(id) {
+                        state.open_thread(lead, cx);
+                    }
                     cx.notify();
                 });
             }
@@ -786,9 +814,34 @@ fn space_row(
                 .child(activity_dot(mark, activity.unwrap_or_default())),
         )
         .child(
-            utility_label(name, Colors::fg_secondary(&theme))
-                .debug_selector(|| "sidebar-space-title".into()),
+            utility_label(
+                name,
+                if selected || unseen {
+                    Colors::fg(&theme)
+                } else {
+                    Colors::fg_secondary(&theme)
+                },
+            )
+            .debug_selector(move || {
+                if selected {
+                    format!("sidebar-space-selected:{id}")
+                } else {
+                    "sidebar-space-title".into()
+                }
+            }),
         )
+        // The lead finished a turn the reader has not opened yet, as a
+        // thread row says it.
+        .when(unseen, |row| {
+            row.child(
+                div()
+                    .debug_selector(move || format!("sidebar-space-unseen:{id}"))
+                    .size(px_len(Spacing::XS))
+                    .flex_shrink_0()
+                    .rounded_full()
+                    .bg(Colors::accent(&theme)),
+            )
+        })
         .child(
             div()
                 .debug_selector(move || format!("sidebar-space-count:{id}:{count}"))
@@ -799,11 +852,42 @@ fn space_row(
                 .child(SharedString::from(count.to_string())),
         )
         .child(
+            // A target of its own, the row's full height: the rest of the
+            // header opens the lead.
             div()
+                .id(SharedString::from(format!("space-disclosure:{id}")))
+                .debug_selector(move || format!("sidebar-space-disclosure:{id}"))
                 .w(px_len(Spacing::LG))
+                .h_full()
                 .flex_shrink_0()
                 .flex()
+                .items_center()
                 .justify_center()
+                .cursor_pointer()
+                .tooltip(move |window, cx| {
+                    fx_design::components::tooltip(
+                        if expanded {
+                            "Hide threads"
+                        } else {
+                            "Show threads"
+                        },
+                        window,
+                        cx,
+                    )
+                })
+                .on_click({
+                    let state = state.clone();
+                    move |_, _, cx| {
+                        cx.stop_propagation();
+                        if !interactive {
+                            return;
+                        }
+                        state.update(cx, |state, cx| {
+                            state.toggle_space_expansion(id);
+                            cx.notify();
+                        });
+                    }
+                })
                 .child(
                     if expanded {
                         Icon::CHEVRON_DOWN
@@ -844,6 +928,50 @@ fn space_row(
         return row.into_any_element();
     }
     context_region(&registry, owner, Some(context_menu), row).into_any_element()
+}
+
+/// What a space's colour mark reports: the most pressing of its lead's turn
+/// and, folded, its threads'. Waiting on the reader first, then work under
+/// way, then a lead's failed turn, which keeps its mark as a thread's tile
+/// does. A lead that finished says so with the unseen dot, not the mark: a
+/// ring on every header that ever completed a turn would say nothing.
+fn header_activity(
+    lead: Option<ActivityState>,
+    folded: Option<ActivityState>,
+) -> Option<ActivityState> {
+    let rank = |state: &ActivityState| match state {
+        ActivityState::Waiting => 3,
+        ActivityState::Running => 2,
+        ActivityState::Error => 1,
+        _ => 0,
+    };
+    [lead, folded]
+        .into_iter()
+        .flatten()
+        .filter(|state| rank(state) > 0)
+        .max_by_key(rank)
+}
+
+/// A thread's status as its row shows it, and the words for it.
+fn thread_activity(app: &AppState, agent: &Agent) -> (ActivityState, &'static str) {
+    let busy = app.is_thread_busy(agent.id);
+    // Read before the conversation is locked: it asks whether the thread is
+    // busy, which locks the same conversation, and the lock is not reentrant.
+    let elsewhere = app.waiting_elsewhere(agent.id).map(str::to_owned);
+    let conversation = app.conversation_by_agent(agent.id);
+    let conversation = conversation.as_ref().map(|conversation| {
+        conversation
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+    });
+    crate::thread_presentation::activity(
+        conversation
+            .as_ref()
+            .map(|conversation| conversation.phase()),
+        busy,
+        agent.execution_state,
+        elsewhere.as_deref(),
+    )
 }
 
 /// What each folded space's header says of its threads: waiting when one
@@ -982,7 +1110,9 @@ fn search_matches(app: &AppState, index: &SnapshotIndex, query: &ThreadQuery) ->
     let mut records = Vec::with_capacity(index.records.len());
     for (record, listed) in app.snapshot.projects.iter().zip(&index.records) {
         let mut hits = Vec::new();
-        for &slot in listed.visible.iter() {
+        // Leads included: with no headers drawn, a match is a lead's only
+        // way back into the sidebar.
+        for &slot in listed.listed.iter() {
             let Some(agent) = record.agents.get(slot) else {
                 continue;
             };
@@ -1234,26 +1364,9 @@ fn thread_row(
     let title = thread_title(agent);
     let busy = app.is_thread_busy(agent_id);
     let provider = crate::thread_presentation::provider(app, agent);
-    let conversation = app.conversation_by_agent(agent_id);
-    // Read before the conversation is locked: it asks whether the thread is
-    // busy, which locks the same conversation, and the lock is not reentrant.
-    let elsewhere = app.waiting_elsewhere(agent_id).map(str::to_owned);
-    let (activity, activity_label) = {
-        let conversation = conversation.as_ref().map(|conversation| {
-            conversation
-                .lock()
-                .unwrap_or_else(|error| error.into_inner())
-        });
-        crate::thread_presentation::activity(
-            conversation
-                .as_ref()
-                .map(|conversation| conversation.phase()),
-            busy,
-            agent.execution_state,
-            elsewhere.as_deref(),
-        )
-    };
+    let (activity, activity_label) = thread_activity(app, agent);
     let unseen = crate::thread_presentation::shows_unseen_completion(unseen, selected, activity);
+    let started_by = app.started_by(agent);
     let thread_id = crate::thread_presentation::provider_thread_id(app, agent_id);
     let menu = thread_menu(false, busy, thread_id.as_deref());
     let context_menu = menu.clone();
@@ -1323,6 +1436,26 @@ fn thread_row(
                 })
                 .child(SharedString::from(title)),
         )
+        // A space's lead started it: a quiet mark, and the tooltip says
+        // which lead.
+        .when_some(started_by, |row, detail| {
+            row.child(
+                div()
+                    .id(SharedString::from(format!("thread-worker:{agent_id}")))
+                    .debug_selector(move || format!("sidebar-worker:{agent_id}"))
+                    .flex_shrink_0()
+                    .flex()
+                    .items_center()
+                    .child(Icon::ARROW_TURN_DOWN_RIGHT.render(
+                        IconSize::Micro,
+                        Colors::fg_tertiary(&theme),
+                        &theme,
+                    ))
+                    .tooltip(move |window, cx| {
+                        fx_design::components::tooltip(detail.clone(), window, cx)
+                    }),
+            )
+        })
         // A finished turn the reader has not opened yet. Beside the title
         // rather than on the tile, which already says how the turn ended.
         .when(unseen, |row| {
@@ -2674,11 +2807,220 @@ mod tests {
         });
         assert_eq!(space_regions.len(), 2);
 
-        // Clicking the header unfolds it, and saves that it was.
-        visual.simulate_click(folded.center(), Default::default());
+        // Clicking the chevron unfolds it, and saves that it was; the rest
+        // of the header opens its lead.
+        let chevron = visual
+            .debug_bounds(selector(format!("sidebar-space-disclosure:{}", spaces[1])))
+            .unwrap();
+        assert!(folded.contains(&chevron.center()));
+        visual.simulate_click(chevron.center(), Default::default());
         settle_disclosure(&mut test);
         assert!(test.read(|cx| state.read(cx).space(spaces[1]).unwrap().1.is_expanded));
         assert!(thread_regions(&test, &state).contains(&format!("thread:{}", ids[3])));
+        assert_eq!(
+            test.read(|cx| state.read(cx).space_lead(spaces[1])),
+            None,
+            "folding is not opening"
+        );
+    }
+
+    #[test]
+    fn a_spaces_header_opens_its_lead_and_is_its_row() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut test = TestAppContext::single();
+        let (state, ids) = seeded(&mut test, AppPaths::at(temp.path()), 3, false);
+        let spaces = with_spaces(
+            &mut test,
+            &state,
+            &["Auth", "Folded"],
+            &[(0, 1)],
+            &[1],
+            &ids,
+        );
+        let (_window, mut visual) = tall_sidebar(&mut test, &state);
+        let header = |visual: &mut VisualTestContext, space: Uuid| {
+            visual
+                .debug_bounds(selector(format!("sidebar-space:{space}")))
+                .unwrap()
+        };
+        assert!(
+            visual
+                .debug_bounds(selector(format!("sidebar-space-selected:{}", spaces[0])))
+                .is_none()
+        );
+
+        // No lead until the header is opened.
+        assert_eq!(test.read(|cx| state.read(cx).space_lead(spaces[0])), None);
+        let auth = header(&mut visual, spaces[0]);
+        visual.simulate_click(auth.center(), Default::default());
+        test.refresh().unwrap();
+        let lead = test
+            .read(|cx| state.read(cx).space_lead(spaces[0]))
+            .expect("the click made the lead");
+        test.read(|cx| {
+            let state = state.read(cx);
+            assert_eq!(state.snapshot.active_agent_id, Some(lead));
+            // Listed, but as the header: no row, no ⌘ number.
+            assert!(!state.active_agents().iter().any(|agent| agent.id == lead));
+            assert_eq!(state.active_agents().len(), 3);
+        });
+        assert!(!thread_regions(&test, &state).contains(&format!("thread:{lead}")));
+        assert!(
+            visual
+                .debug_bounds(selector(format!("sidebar-space-selected:{}", spaces[0])))
+                .is_some(),
+            "the header takes the open thread's fill"
+        );
+        // Its count is the rows under it.
+        assert!(
+            visual
+                .debug_bounds(selector(format!("sidebar-space-count:{}:1", spaces[0])))
+                .is_some()
+        );
+
+        // A folded space's lead opens without unfolding it, and a second
+        // click opens the same lead.
+        let folded = header(&mut visual, spaces[1]);
+        visual.simulate_click(folded.center(), Default::default());
+        test.refresh().unwrap();
+        let second = test
+            .read(|cx| state.read(cx).space_lead(spaces[1]))
+            .unwrap();
+        assert_ne!(second, lead);
+        assert!(!test.read(|cx| state.read(cx).space(spaces[1]).unwrap().1.is_expanded));
+        visual.simulate_click(auth.center(), Default::default());
+        test.refresh().unwrap();
+        test.read(|cx| {
+            let state = state.read(cx);
+            assert_eq!(state.space_lead(spaces[0]), Some(lead));
+            assert_eq!(state.snapshot.active_agent_id, Some(lead));
+            assert_eq!(state.snapshot.projects[0].agents.len(), 5, "one lead each");
+        });
+
+        // A search draws no headers, so it lists a matching lead as a row.
+        let field = test.read(|cx| state.read(cx).sidebar.search().read(cx).field().clone());
+        test.update(|cx| field.update(cx, |field, cx| field.set_value("auth", cx)));
+        let (_window, _fresh) = tall_sidebar(&mut test, &state);
+        assert_eq!(
+            thread_regions(&test, &state),
+            vec![format!("thread:{lead}")]
+        );
+    }
+
+    #[test]
+    fn a_spaces_header_shows_its_leads_turn_open_or_folded() {
+        use fx_agent::conversation::Phase;
+        let temp = tempfile::tempdir().unwrap();
+        let mut test = TestAppContext::single();
+        let (state, ids) = seeded(&mut test, AppPaths::at(temp.path()), 2, false);
+        let spaces = with_spaces(&mut test, &state, &["Auth"], &[], &[], &ids);
+        let (project, lead) = test.update(|cx| {
+            state.update(cx, |state, _| {
+                let lead = state.ensure_space_lead(spaces[0]).unwrap();
+                (state.snapshot.active_project_id.unwrap(), lead)
+            })
+        });
+        let status =
+            |status: &str| selector(format!("sidebar-space-status:{}:{status}", spaces[0]));
+        let set_phase = |test: &mut TestAppContext, phase| {
+            test.update(|cx| {
+                state.update(cx, |state, _| {
+                    state
+                        .conversation(project, lead)
+                        .lock()
+                        .unwrap()
+                        .set_phase(phase)
+                })
+            })
+        };
+        // Open, as a thread row would say it of itself.
+        set_phase(&mut test, Phase::Running);
+        let (_window, mut visual) = tall_sidebar(&mut test, &state);
+        assert!(visual.debug_bounds(status("running")).is_some());
+        set_phase(&mut test, Phase::WaitingForApproval);
+        let (_window, mut visual) = tall_sidebar(&mut test, &state);
+        assert!(visual.debug_bounds(status("waiting")).is_some());
+        assert!(visual.debug_bounds(status("running")).is_none());
+
+        // A turn it finished out of view marks the header until opened.
+        set_phase(&mut test, Phase::Idle);
+        finish(&state, &mut test, lead);
+        let unseen = selector(format!("sidebar-space-unseen:{}", spaces[0]));
+        let (_window, mut visual) = tall_sidebar(&mut test, &state);
+        assert!(visual.debug_bounds(unseen).is_some());
+        assert!(visual.debug_bounds(status("running")).is_none());
+        test.update(|cx| {
+            state.update(cx, |state, cx| {
+                state.open_thread(lead, cx);
+            })
+        });
+        assert!(!test.read(|cx| state.read(cx).has_unseen_completion(lead)));
+
+        assert_eq!(
+            header_activity(Some(ActivityState::Completed), None),
+            None,
+            "a finished lead says so with the dot, not the mark"
+        );
+        assert_eq!(
+            header_activity(Some(ActivityState::Error), Some(ActivityState::Running)),
+            Some(ActivityState::Running)
+        );
+        assert_eq!(
+            header_activity(Some(ActivityState::Running), Some(ActivityState::Waiting)),
+            Some(ActivityState::Waiting)
+        );
+    }
+
+    #[test]
+    fn a_thread_a_lead_started_carries_a_quiet_mark_naming_the_lead() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut test = TestAppContext::single();
+        let (state, ids) = seeded(&mut test, AppPaths::at(temp.path()), 3, false);
+        let spaces = with_spaces(&mut test, &state, &["Auth"], &[(0, 1)], &[], &ids);
+        test.update(|cx| {
+            state.update(cx, |state, _| {
+                let lead = state.ensure_space_lead(spaces[0]).unwrap();
+                let record = &mut state.snapshot.projects[0];
+                record.agents[1].spawned_by = Some(lead);
+                // A lead that is gone still says a lead started it.
+                record.agents[2].spawned_by = Some(Uuid::new_v4());
+                state.save();
+            })
+        });
+        let (_window, mut visual) = tall_sidebar(&mut test, &state);
+        let mark = |id: Uuid| selector(format!("sidebar-worker:{id}"));
+        assert!(visual.debug_bounds(mark(ids[1])).is_some());
+        assert!(visual.debug_bounds(mark(ids[2])).is_some());
+        assert!(visual.debug_bounds(mark(ids[0])).is_none());
+        // In the row, after the title, at the size of the row's other marks.
+        let row = thread_bounds(&test, &state, ids[1]);
+        let at = visual.debug_bounds(mark(ids[1])).unwrap();
+        assert!(row.contains(&at.center()));
+        assert!(at.size.height < row.size.height);
+        test.read(|cx| {
+            let state = state.read(cx);
+            let agents = &state.snapshot.projects[0].agents;
+            assert_eq!(
+                state.started_by(&agents[1]).as_deref(),
+                Some("Started by the Auth lead")
+            );
+            assert_eq!(
+                state.started_by(&agents[2]).as_deref(),
+                Some("Started by a space's lead")
+            );
+            assert_eq!(state.started_by(&agents[0]), None);
+        });
+        // A lead whose space is deleted is named by its own title.
+        test.update(|cx| state.update(cx, |state, _| assert!(state.delete_space(spaces[0]))));
+        test.read(|cx| {
+            let state = state.read(cx);
+            assert_eq!(
+                state
+                    .started_by(&state.snapshot.projects[0].agents[1])
+                    .as_deref(),
+                Some("Started by Auth")
+            );
+        });
     }
 
     #[test]

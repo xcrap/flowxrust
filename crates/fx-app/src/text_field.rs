@@ -440,6 +440,18 @@ impl TextField {
         self
     }
 
+    /// Change the placeholder of a field already made. It is shaped as the
+    /// field paints, so the next frame shows it.
+    pub fn set_placeholder(&mut self, text: &str) {
+        if self.placeholder != text {
+            self.placeholder = text.to_string();
+        }
+    }
+
+    pub fn placeholder_text(&self) -> &str {
+        &self.placeholder
+    }
+
     /// Called when the user presses Return (single-line) or Cmd/Ctrl+Return
     /// (multi-line).
     pub fn on_submit(mut self, submit: impl Fn(String, &mut Context<Self>) + 'static) -> Self {
