@@ -1671,7 +1671,8 @@ pub use crate::shell::is_read_only_command;
 /// Whether a Claude tool call only reads, judged by Claude's own tool names.
 ///
 /// The searches and reads are read-only by name; `Bash` is as read-only as its
-/// command; everything else, edits included, is not.
+/// command; FlowX's own read tools are, by their exact names; everything else,
+/// edits and every other MCP tool included, is not.
 pub fn is_read_only_tool(tool_name: &str, input: &Value) -> bool {
     match tool_name {
         "Read" | "Grep" | "Glob" | "LS" | "NotebookRead" => true,
@@ -1679,7 +1680,7 @@ pub fn is_read_only_tool(tool_name: &str, input: &Value) -> bool {
             .get("command")
             .and_then(Value::as_str)
             .is_some_and(is_read_only_command),
-        _ => false,
+        name => fx_core::policy::flowx_tools::is_read_only_call(name),
     }
 }
 

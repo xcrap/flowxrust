@@ -10,6 +10,7 @@ pub mod diff_disclosure;
 pub mod diff_row_layout;
 pub mod edit_preview;
 pub mod file_index;
+pub mod flowx_tools;
 pub mod image_correlation;
 pub mod mention;
 pub mod message_search;

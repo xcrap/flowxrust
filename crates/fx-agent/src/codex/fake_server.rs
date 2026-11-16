@@ -94,6 +94,9 @@ for line in sys.stdin:
         send({"jsonrpc": "2.0", "id": mid,
               "error": {"code": -32601, "message": "Method not found"}})
     elif method in ("thread/start", "thread/resume"):
+        # Recorded, so a test can assert what the thread was opened with.
+        with open("HANDSHAKE_LOG", "a") as log:
+            log.write(json.dumps({"method": method, "params": msg.get("params")}) + "\n")
         requested = (msg.get("params") or {}).get("threadId")
         send({"jsonrpc": "2.0", "id": mid, "result": {"thread": {
             "id": requested or "thread-new"}}})
@@ -142,7 +145,8 @@ for line in sys.stdin:
             send({"jsonrpc": "2.0", "method": "turn/completed",
                   "params": {"turn": {"id": "turn-1", "status": "interrupted"}}})
         elif prompt in ("interactive-approval", "interactive-question", "foreign-request",
-                        "subagent-request", "mcp-tool-approval", "mcp-form", "mcp-link"):
+                        "subagent-request", "mcp-tool-approval", "flowx-tool-approval",
+                        "mcp-form", "mcp-link"):
             send({"jsonrpc": "2.0", "method": "turn/started",
                   "params": {"threadId": thread, "turn": {"id": "turn-1"}}})
             if prompt == "subagent-request":
@@ -162,6 +166,15 @@ for line in sys.stdin:
                           "tool_description": "Asks the user for their name.",
                           "tool_params": {}, "tool_params_display": []},
                           "message": "Allow the probe MCP server to run tool \"ask_name\"?",
+                          "requestedSchema": {"type": "object", "properties": {}}}
+            elif prompt == "flowx-tool-approval":
+                # The same approval, for FlowX's own read tool.
+                method = "mcpServer/elicitation/request"
+                params = {"threadId": thread, "turnId": "turn-1", "serverName": "flowx",
+                          "mode": "form", "_meta": {"codex_approval_kind": "mcp_tool_call",
+                          "persist": ["session", "always"], "tool_params": {},
+                          "tool_params_display": []},
+                          "message": "Allow the flowx MCP server to run tool \"list_threads\"?",
                           "requestedSchema": {"type": "object", "properties": {}}}
             elif prompt == "mcp-form":
                 # The probe server's own form, as Codex 0.164 relayed it. The

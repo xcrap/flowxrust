@@ -230,9 +230,19 @@ pub struct AgentConfiguration {
     pub agent_access: Option<AgentAccess>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_window_size: Option<u64>,
+    /// Whether the thread's provider is given FlowX's own tools, the
+    /// `flowx` MCP server. Off unless a thread opts in, so a thread saved
+    /// before the bridge existed launches exactly as it did.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub flowx_tools: Option<bool>,
 }
 
 impl AgentConfiguration {
+    /// Whether the thread opted in to FlowX's own tools.
+    pub fn uses_flowx_tools(&self) -> bool {
+        self.flowx_tools == Some(true)
+    }
+
     /// The effective access level, inheriting the app default when unset.
     pub fn resolved_access(&self, app_default: AgentAccess) -> AgentAccess {
         self.agent_access.unwrap_or(app_default)
@@ -422,6 +432,31 @@ mod tests {
     }
 
     #[test]
+    fn flowx_tools_are_off_unless_a_thread_opts_in_and_the_choice_is_saved() {
+        // A thread saved before the field existed reads as off, and writing it
+        // back adds nothing to its file.
+        let old: AgentConfiguration = serde_json::from_str(r#"{"model_id":"m"}"#).unwrap();
+        assert!(!old.uses_flowx_tools());
+        let json = serde_json::to_string(&old).unwrap();
+        assert!(!json.contains("flowx_tools"), "{json}");
+
+        let opted = AgentConfiguration {
+            flowx_tools: Some(true),
+            ..Default::default()
+        };
+        assert!(opted.uses_flowx_tools());
+        let back: AgentConfiguration =
+            serde_json::from_str(&serde_json::to_string(&opted).unwrap()).unwrap();
+        assert!(back.uses_flowx_tools());
+
+        let declined = AgentConfiguration {
+            flowx_tools: Some(false),
+            ..Default::default()
+        };
+        assert!(!declined.uses_flowx_tools());
+    }
+
+    #[test]
     fn a_partial_override_stays_partial() {
         // Only the model is pinned. Access must still inherit.
         let c = AgentConfiguration {
@@ -523,6 +558,7 @@ mod tests {
             system_prompt: Some("Keep the saved instructions".into()),
             agent_access: Some(AgentAccess::Supervised),
             context_window_size: Some(200_000),
+            flowx_tools: Some(true),
         };
         for key in ["agent_mode", "agentMode"] {
             for value in [

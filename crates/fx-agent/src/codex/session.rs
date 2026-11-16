@@ -133,6 +133,20 @@ pub fn thread_params(
     system_prompt: Option<&str>,
     working_directory: &str,
 ) -> Value {
+    thread_params_with_servers(thread_id, access, system_prompt, working_directory, &[])
+}
+
+/// [`thread_params`], with MCP servers added to the user's own.
+///
+/// Resuming carries them as well as starting: FlowX opens a fresh app-server
+/// for every turn, and the thread is loaded with the config its resume names.
+pub fn thread_params_with_servers(
+    thread_id: Option<&str>,
+    access: AgentAccess,
+    system_prompt: Option<&str>,
+    working_directory: &str,
+    mcp_servers: &[crate::mcp::McpServer],
+) -> Value {
     let (approval, sandbox) = access_params(access);
     let mut params = json!({
         "approvalPolicy": approval,
@@ -144,6 +158,10 @@ pub fn thread_params(
     }
     if let Some(prompt) = system_prompt.filter(|p| !p.is_empty()) {
         params["developerInstructions"] = json!(prompt);
+    }
+    let config = crate::mcp::codex_config(mcp_servers);
+    if !config.is_empty() {
+        params["config"] = Value::Object(config);
     }
     params
 }
@@ -1617,6 +1635,28 @@ mod tests {
         // An empty prompt must not send an empty instruction.
         let blank = thread_params(None, AgentAccess::FullAccess, Some(""), "/w");
         assert!(blank.get("developerInstructions").is_none());
+    }
+
+    #[test]
+    fn mcp_servers_ride_in_the_config_of_a_start_and_a_resume_alike() {
+        // FlowX opens a fresh app-server per turn, so a resume loads the
+        // thread and needs the server named again.
+        for thread in [None, Some("t1")] {
+            let params = thread_params_with_servers(
+                thread,
+                AgentAccess::ReadOnly,
+                None,
+                "/w",
+                &[crate::mcp::fixture()],
+            );
+            let config = params["config"].as_object().expect("a config");
+            assert_eq!(config.keys().collect::<Vec<_>>(), ["mcp_servers.flowx"]);
+            assert_eq!(config["mcp_servers.flowx"]["args"][0], "--mcp-server");
+            // The access pairing is untouched by it.
+            assert_eq!(params["sandbox"], "read-only");
+        }
+        let plain = thread_params(None, AgentAccess::FullAccess, None, "/w");
+        assert!(plain.get("config").is_none(), "{plain}");
     }
 
     #[test]

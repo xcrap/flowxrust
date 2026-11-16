@@ -251,6 +251,9 @@ pub struct TurnRequest {
     pub resume_session_id: Option<String>,
     /// The prepared attachment directory, when there are attachments.
     pub attachment_directory: Option<String>,
+    /// MCP servers this turn adds to the user's own, FlowX's among them for
+    /// a thread that opted in.
+    pub mcp_servers: Vec<crate::mcp::McpServer>,
 }
 
 impl TurnRequest {
@@ -333,6 +336,15 @@ impl TurnRequest {
         if let Some(directory) = non_empty(self.attachment_directory.as_deref()) {
             arguments.push("--add-dir".into());
             arguments.push(directory);
+        }
+        // With `=`, like the tool lists: the flag takes a list, and would read
+        // the argument after it as one more config. Never with
+        // `--strict-mcp-config`, which would drop the user's own servers.
+        if !self.mcp_servers.is_empty() {
+            arguments.push(format!(
+                "--mcp-config={}",
+                crate::mcp::claude_config(&self.mcp_servers)
+            ));
         }
         arguments
     }
@@ -1401,6 +1413,7 @@ mod tests {
             access: Some(AgentAccess::Supervised),
             resume_session_id: Some("session-9".into()),
             attachment_directory: Some("/tmp/attachments".into()),
+            mcp_servers: vec![crate::mcp::fixture()],
         }
         .arguments();
         assert_eq!(&full[..bare.len()], &bare[..], "a default flag moved");
@@ -1512,6 +1525,43 @@ mod tests {
             assert!(
                 !READ_ONLY_TOOLS.split(',').any(|tool| tool == writer),
                 "{writer}"
+            );
+        }
+    }
+
+    #[test]
+    fn mcp_servers_are_one_inline_config_with_an_equals_sign_and_only_when_given() {
+        // The flag takes a list: written apart from its value, it would read
+        // whatever follows as a second config.
+        assert!(
+            !request()
+                .arguments()
+                .iter()
+                .any(|argument| argument.contains("mcp")),
+            "a turn without servers named one"
+        );
+        for access in AgentAccess::ALL {
+            let arguments = TurnRequest {
+                access: Some(access),
+                mcp_servers: vec![crate::mcp::fixture()],
+                ..request()
+            }
+            .arguments();
+            let configs: Vec<&String> = arguments
+                .iter()
+                .filter(|argument| argument.starts_with("--mcp-config"))
+                .collect();
+            assert_eq!(configs.len(), 1, "{access:?}: {arguments:?}");
+            let json = configs[0]
+                .strip_prefix("--mcp-config=")
+                .expect("written with `=`");
+            let config: serde_json::Value = serde_json::from_str(json).unwrap();
+            assert_eq!(config["mcpServers"]["flowx"]["args"][0], "--mcp-server");
+            // Read Only keeps the server: `--restricted` loads `--mcp-config`,
+            // and only `--strict-mcp-config` would drop the user's own.
+            assert!(
+                !arguments.iter().any(|a| a.contains("strict-mcp-config")),
+                "{access:?}: {arguments:?}"
             );
         }
     }

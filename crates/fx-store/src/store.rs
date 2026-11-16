@@ -466,6 +466,7 @@ mod tests {
             system_prompt: Some("Saved instructions".into()),
             agent_access: Some(fx_core::AgentAccess::Supervised),
             context_window_size: Some(200_000),
+            flowx_tools: Some(true),
         };
         let agent_id = agent.id;
         app.projects[0].agents.push(agent.clone());

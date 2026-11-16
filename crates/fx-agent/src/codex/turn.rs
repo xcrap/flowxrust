@@ -37,7 +37,7 @@ use serde_json::{Value, json};
 
 use crate::codex::session::{
     CodexWriterConflict, INTERRUPTED, TurnNotifications, TurnRequest, is_read_only_command_value,
-    thread_id_from_result, thread_params, turn_params,
+    thread_id_from_result, thread_params_with_servers, turn_params,
 };
 use crate::codex::session::{goal_set_params, steer_params};
 use crate::codex::transport::Requester;
@@ -114,7 +114,9 @@ impl ApprovalPolicy {
                     "commandExecution" => arguments
                         .get("command")
                         .is_some_and(is_read_only_command_value),
-                    _ => false,
+                    // An MCP tool approval is named `mcp__<server>__<tool>`;
+                    // only FlowX's own read tools are reads.
+                    name => fx_core::policy::flowx_tools::is_read_only_call(name),
                 }
             }
         }
@@ -200,12 +202,35 @@ impl CodexSession {
     }
 
     pub async fn open_with_instructions(
+        transport: Transport,
+        resume_thread_id: Option<&str>,
+        access: AgentAccess,
+        working_directory: &str,
+        approvals: ApprovalPolicy,
+        system_prompt: Option<&str>,
+    ) -> Result<Self, ProviderError> {
+        Self::open_with_servers(
+            transport,
+            resume_thread_id,
+            access,
+            working_directory,
+            approvals,
+            system_prompt,
+            &[],
+        )
+        .await
+    }
+
+    /// [`Self::open_with_instructions`], with MCP servers added to the
+    /// user's own for this thread.
+    pub async fn open_with_servers(
         mut transport: Transport,
         resume_thread_id: Option<&str>,
         access: AgentAccess,
         working_directory: &str,
         approvals: ApprovalPolicy,
         system_prompt: Option<&str>,
+        mcp_servers: &[crate::mcp::McpServer],
     ) -> Result<Self, ProviderError> {
         let thread_id = resolve_thread_id(
             &mut transport,
@@ -213,6 +238,7 @@ impl CodexSession {
             access,
             working_directory,
             system_prompt,
+            mcp_servers,
         )
         .await?;
 
@@ -1115,16 +1141,18 @@ async fn resolve_thread_id(
     access: AgentAccess,
     working_directory: &str,
     system_prompt: Option<&str>,
+    mcp_servers: &[crate::mcp::McpServer],
 ) -> Result<String, ProviderError> {
     let (method, id) = match resume_thread_id {
         Some(id) if !id.is_empty() => ("thread/resume", id),
         _ => ("thread/start", ""),
     };
-    let params = thread_params(
+    let params = thread_params_with_servers(
         Some(id).filter(|id| !id.is_empty()),
         access,
         system_prompt,
         working_directory,
+        mcp_servers,
     );
     let result = transport
         .request(method, Some(params))
@@ -1182,6 +1210,57 @@ mod tests {
 
     fn request<'a>(thread_id: &'a str, prompt: &'a str, directory: &'a str) -> TurnRequest<'a> {
         TurnRequest::new(thread_id, prompt, directory)
+    }
+
+    #[tokio::test]
+    async fn a_thread_opened_with_servers_names_them_to_codex_and_one_without_does_not() {
+        for (servers, resume) in [
+            (vec![crate::mcp::fixture()], None),
+            (vec![crate::mcp::fixture()], Some("thread-9")),
+            (Vec::new(), None),
+        ] {
+            let Some(server) = FakeServer::new() else {
+                return;
+            };
+            CodexSession::open_with_servers(
+                Transport::start(server.launch(), "FlowX", "test")
+                    .await
+                    .expect("started"),
+                resume,
+                AgentAccess::ReadOnly,
+                "/tmp/project",
+                ApprovalPolicy::DenyUnlessReadOnly,
+                None,
+                &servers,
+            )
+            .await
+            .expect("a session")
+            .close()
+            .await;
+            let opened = server
+                .handshake()
+                .into_iter()
+                .find(|entry| {
+                    entry["method"] == "thread/start" || entry["method"] == "thread/resume"
+                })
+                .expect("the thread was opened");
+            let config = &opened["params"]["config"];
+            if servers.is_empty() {
+                assert!(config.is_null(), "{opened}");
+            } else {
+                assert_eq!(
+                    opened["method"],
+                    if resume.is_some() {
+                        "thread/resume"
+                    } else {
+                        "thread/start"
+                    }
+                );
+                let entry = &config["mcp_servers.flowx"];
+                assert_eq!(entry["args"], json!(["--mcp-server"]), "{opened}");
+                assert_eq!(entry["env"]["FLOWX_MCP_THREAD"], "thread-1");
+            }
+        }
     }
 
     #[tokio::test]
@@ -2193,6 +2272,54 @@ mod tests {
         }
         assert!(ApprovalPolicy::AllowAll.allows_claude_tool("Write", &json!({})));
         assert!(!ApprovalPolicy::DenyAll.allows_claude_tool("Read", &json!({})));
+    }
+
+    #[test]
+    fn flowx_s_own_read_tools_need_no_approval_under_read_only_and_nothing_else_does() {
+        // Both providers name an MCP call `mcp__<server>__<tool>`: Claude in
+        // `can_use_tool`, and FlowX for Codex's approval elicitation.
+        let policy = ApprovalPolicy::DenyUnlessReadOnly;
+        for tool in ["mcp__flowx__list_threads", "mcp__flowx__read_thread"] {
+            assert!(policy.allows(tool, &json!({})), "codex {tool}");
+            assert!(policy.allows_claude_tool(tool, &json!({})), "claude {tool}");
+        }
+        for tool in [
+            "mcp__probe__ask_name",
+            "mcp__flowx__spawn_thread",
+            "mcp__flowx",
+            "mcp__github__list_threads",
+        ] {
+            assert!(!policy.allows(tool, &json!({})), "codex {tool}");
+            assert!(
+                !policy.allows_claude_tool(tool, &json!({})),
+                "claude {tool}"
+            );
+        }
+        // Refusing everything still refuses them.
+        assert!(!ApprovalPolicy::DenyAll.allows("mcp__flowx__list_threads", &json!({})));
+    }
+
+    #[tokio::test]
+    async fn codex_s_approval_for_a_flowx_read_tool_is_answered_by_the_read_only_policy() {
+        // Codex asks for an MCP tool call as an elicitation, and FlowX reads
+        // the tool's name out of its message. Accepted unasked, so a Read
+        // Only thread can use FlowX's tools without a card.
+        let Some((seen, _)) = answer_first_request(
+            "flowx-tool-approval",
+            ApprovalPolicy::DenyUnlessReadOnly,
+            |_| None,
+        )
+        .await
+        else {
+            return;
+        };
+        assert!(
+            !seen
+                .iter()
+                .any(|event| matches!(event, ProviderEvent::Approval(_))),
+            "a card was shown: {seen:?}"
+        );
+        assert_eq!(echoed_response(&seen)["result"]["action"], "accept");
     }
 
     #[test]
