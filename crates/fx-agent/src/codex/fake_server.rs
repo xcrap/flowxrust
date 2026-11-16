@@ -58,6 +58,16 @@ for line in sys.stdin:
     elif method is None and mid == "interactive-1":
         send({"jsonrpc": "2.0", "method": "item/agentMessage/delta", "params": {"delta": json.dumps(msg)}})
         send({"jsonrpc": "2.0", "method": "turn/completed", "params": {"turn": {"id": "turn-1", "status": "completed"}}})
+    elif method is None and mid == "declined-1":
+        # Once the command is refused, codex-cli 0.167 still completes its
+        # item, as declined and with nothing to show.
+        decision = (msg.get("result") or {}).get("decision")
+        send({"jsonrpc": "2.0", "method": "item/completed", "params": {
+            "threadId": thread, "turnId": "turn-1", "item": {
+                "type": "commandExecution", "id": "command-1", "command": "touch x",
+                "cwd": "/tmp", "status": "declined" if decision == "decline" else "completed",
+                "aggregatedOutput": None, "exitCode": None}}})
+        send({"jsonrpc": "2.0", "method": "turn/completed", "params": {"turn": {"id": "turn-1", "status": "completed"}}})
     elif method == "model/list":
         flood()
         if (msg.get("params") or {}).get("cursor"):
@@ -206,6 +216,19 @@ for line in sys.stdin:
                 params = {"threadId": origin[0], "turnId": origin[1], "itemId": "command-1",
                           "command": "cargo test", "cwd": "/tmp"}
             send({"jsonrpc": "2.0", "id": "interactive-1", "method": method, "params": params})
+        elif prompt == "declined-command":
+            # A command that writes, started and then asked about, as Codex
+            # asks under an access level that asks.
+            send({"jsonrpc": "2.0", "method": "turn/started",
+                  "params": {"threadId": thread, "turn": {"id": "turn-1"}}})
+            send({"jsonrpc": "2.0", "method": "item/started", "params": {
+                "threadId": thread, "turnId": "turn-1", "item": {
+                    "type": "commandExecution", "id": "command-1", "command": "touch x",
+                    "cwd": "/tmp", "status": "inProgress"}}})
+            send({"jsonrpc": "2.0", "id": "declined-1",
+                  "method": "item/commandExecution/requestApproval",
+                  "params": {"threadId": thread, "turnId": "turn-1", "itemId": "command-1",
+                             "command": "touch x", "cwd": "/tmp"}})
         elif prompt == "use-a-tool":
             send({"jsonrpc": "2.0", "method": "turn/started",
                   "params": {"turn": {"id": "turn-1"}}})

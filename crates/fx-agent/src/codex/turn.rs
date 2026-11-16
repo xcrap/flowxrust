@@ -374,6 +374,8 @@ impl CodexSession {
         let mut pending: HashMap<String, PendingRequest> = HashMap::new();
         let mut items: HashMap<String, Value> = HashMap::new();
         let mut spawned = SpawnedThreads::default();
+        // This turn's calls whose result FlowX recorded itself, as a refusal.
+        let mut refused: HashSet<String> = HashSet::new();
 
         loop {
             let next = tokio::select! {
@@ -444,6 +446,14 @@ impl CodexSession {
                         continue;
                     }
                     for event in notifications.parse(&method, &params) {
+                        // Codex still completes a refused call's item, as
+                        // declined, and that read as a second result, "Tool
+                        // failed", under the refusal that already was one.
+                        if let ProviderEvent::ToolResult { id, .. } = &event
+                            && refused.remove(id)
+                        {
+                            continue;
+                        }
                         let outcome = finish(&event, &thread_id);
                         sink(event);
                         if let Some(outcome) = outcome {
@@ -533,6 +543,8 @@ impl CodexSession {
                                 // thread, not here, so the refusal brings it.
                                 if !ours {
                                     sink(request.call_row());
+                                } else {
+                                    refused.insert(request.call_id());
                                 }
                                 sink(ProviderEvent::ToolResult {
                                     id: request.call_id(),
@@ -1572,6 +1584,67 @@ mod tests {
             })
             .expect("a refusal was reported");
         assert!(refusal.contains("refused"), "{refusal}");
+    }
+
+    /// The results a turn recorded for the call `command-1`.
+    fn results_for_command(events: &[ProviderEvent]) -> Vec<String> {
+        events
+            .iter()
+            .filter_map(|event| match event {
+                ProviderEvent::ToolResult { id, content, .. } if id == "command-1" => {
+                    Some(content.clone())
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn a_refused_command_has_one_result_though_codex_completes_it_as_declined() {
+        // Live against codex-cli 0.167 under Read Only: FlowX recorded its
+        // refusal as the call's result, then Codex completed the item as
+        // declined, which read as a second result, "Tool failed".
+        for policy in [ApprovalPolicy::DenyUnlessReadOnly, ApprovalPolicy::DenyAll] {
+            let Some(server) = FakeServer::new() else {
+                return;
+            };
+            let mut session = CodexSession::open(
+                Transport::start(server.launch(), "FlowX", "test")
+                    .await
+                    .expect("started"),
+                None,
+                AgentAccess::ReadOnly,
+                "/tmp",
+                policy,
+            )
+            .await
+            .expect("a session");
+            let thread_id = session.thread_id().to_string();
+            let mut events = Vec::new();
+            let outcome = session
+                .run_turn(
+                    &TurnRequest::new(&thread_id, "declined-command", "/tmp"),
+                    |event| events.push(event),
+                )
+                .await
+                .expect("the turn ran");
+            assert!(outcome.is_completed(), "{outcome:?}");
+            let results = results_for_command(&events);
+            assert_eq!(results.len(), 1, "{policy:?}: {events:?}");
+            assert!(results[0].contains("FlowX"), "{policy:?}: {results:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_command_the_reader_declined_keeps_codex_s_result() {
+        // FlowX records nothing for a card the reader answered, so Codex's
+        // own completion is the call's one result and must stay.
+        let Some((seen, _)) =
+            answer_first_request("declined-command", ApprovalPolicy::Ask, decline_any_card).await
+        else {
+            return;
+        };
+        assert_eq!(results_for_command(&seen).len(), 1, "{seen:?}");
     }
 
     #[tokio::test]
