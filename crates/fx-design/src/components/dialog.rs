@@ -335,7 +335,7 @@ pub fn dialog_button(action: DialogAction) -> gpui::Stateful<gpui::Div> {
 
 /// Track `focus` on a control, so its focus ring shows, and press it with
 /// Space while it holds the focus.
-fn focusable(
+pub(crate) fn focusable(
     control: gpui::Stateful<gpui::Div>,
     focus: Option<FocusHandle>,
     on_activate: DialogHandler,

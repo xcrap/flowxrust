@@ -403,6 +403,8 @@ pub struct RequestPanel {
     agent: Uuid,
     request: UserInputRequest,
     fields: Vec<Entity<TextField>>,
+    /// One per option of each question, so Tab reaches every choice row.
+    choice_focus: Vec<Vec<gpui::FocusHandle>>,
     _observations: Vec<Subscription>,
     sent: bool,
     focus: gpui::FocusHandle,
@@ -435,11 +437,17 @@ impl RequestPanel {
                 .iter()
                 .map(|field| cx.observe(field, |_, _, cx| cx.notify()))
                 .collect();
+            let choice_focus = request
+                .questions
+                .iter()
+                .map(|question| question.options.iter().map(|_| cx.focus_handle()).collect())
+                .collect();
             Self {
                 state,
                 agent,
                 request,
                 fields,
+                choice_focus,
                 _observations: observations,
                 sent: false,
                 focus: cx.focus_handle(),
@@ -605,7 +613,7 @@ impl Render for RequestPanel {
                         .child(SharedString::from(question.question.clone())),
                 );
             }
-            for option in &question.options {
+            for (option, focus) in question.options.iter().zip(&self.choice_focus[index]) {
                 let field = self.fields[index].clone();
                 let value = option.label.clone();
                 let selected = field.read(cx).value() == option.label;
@@ -616,6 +624,7 @@ impl Render for RequestPanel {
                         SharedString::from(option.description.clone()),
                         selected,
                         !self.sent,
+                        (!self.sent).then_some(focus),
                         move |_, _, cx| {
                             field.update(cx, |field, cx| field.set_value(value.clone(), cx))
                         },
@@ -685,15 +694,22 @@ impl Render for RequestPanel {
                 .selector("request-accept"),
             ],
         );
-        // The keyboard's way through: each field that is typed into, then the
-        // two answers.
-        let mut order: Vec<_> = request
+        // The keyboard's way through, in reading order: each question's
+        // choices and the field it is typed into, then the two answers.
+        let mut order = Vec::new();
+        for ((question, field), choices) in request
             .questions
             .iter()
             .zip(&self.fields)
-            .filter(|(question, _)| takes_typed_answer(question))
-            .map(|(_, field)| field.read(cx).focus_handle())
-            .collect();
+            .zip(&self.choice_focus)
+        {
+            if !self.sent {
+                order.extend(choices.iter().cloned());
+            }
+            if takes_typed_answer(question) {
+                order.push(field.read(cx).focus_handle());
+            }
+        }
         if !self.sent {
             order.push(self.refuse_focus.clone());
         }
@@ -1091,6 +1107,46 @@ mod tests {
         );
         let response = received.try_recv().unwrap();
         assert_eq!(elicitation.reply(&response).unwrap().action, "accept");
+    }
+
+    #[test]
+    fn a_question_of_choices_alone_is_answered_from_the_keyboard() {
+        // A yes-or-no has no field to type into, and its rows were not in the
+        // Tab order: Tab went from Cancel to a disabled Send and back, and the
+        // question could only be answered with the pointer.
+        let elicitation = fx_agent::elicitation::Elicitation::from_claude(&serde_json::json!({
+            "mcp_server_name": "probe", "message": "Ship it?", "mode": "form",
+            "requested_schema": {"type": "object", "properties": {
+                "agree": {"type": "boolean", "title": "Agree"}}, "required": ["agree"]}
+        }));
+        let temp = tempfile::tempdir().unwrap();
+        let mut test = gpui::TestAppContext::single();
+        let (window, state, ui, agent, mut received) = mounted_with_runner(&mut test, temp.path());
+        ask(
+            &mut test,
+            window,
+            &state,
+            agent,
+            elicitation.event("claude-elicitation-keys".into()),
+        );
+        let panel = test.update(|cx| ui.read(cx).request.clone().expect("the dialog opened"));
+        let keys = |test: &mut gpui::TestAppContext, keys: &str| {
+            test.simulate_keystrokes(window.into(), keys);
+            test.refresh().unwrap();
+        };
+        // The first Tab reaches the first choice, and Space chooses it.
+        keys(&mut test, "tab space");
+        test.read(|cx| {
+            assert_eq!(panel.read(cx).fields[0].read(cx).value(), "Yes");
+            assert!(panel.read(cx).answers(cx).is_some());
+        });
+        // On through the other choice and Cancel to Send.
+        keys(&mut test, "tab tab tab space");
+        let response = received.try_recv().expect("Send was reached and pressed");
+        assert_eq!(
+            elicitation.reply(&response).unwrap().to_claude(),
+            serde_json::json!({"action": "accept", "content": {"agree": true}})
+        );
     }
 
     #[test]

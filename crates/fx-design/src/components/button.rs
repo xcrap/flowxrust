@@ -1,7 +1,9 @@
+use std::rc::Rc;
+
 use gpui::prelude::*;
 use gpui::{
-    App, ClickEvent, CursorStyle, IntoElement, ParentElement, SharedString, StyleRefinement,
-    Window, div,
+    App, ClickEvent, CursorStyle, FocusHandle, IntoElement, ParentElement, SharedString,
+    StyleRefinement, Window, div,
 };
 
 use crate::icon::Icon;
@@ -801,13 +803,24 @@ pub fn choice_row_fill(selected: bool, theme: &crate::theme::Theme) -> gpui::Rgb
 /// label each need an id of their own around their rows. Without one, both
 /// rows share one interaction state: a press on either shows on both, and a
 /// click on the second never arrives.
+///
+/// With `focus`, the keyboard reaches the row as it reaches a dialog's
+/// buttons: the dialog lists the handle in its Tab order, the row shows its
+/// focus ring, and Space chooses it. A dialog whose answers are choices
+/// alone had no other way to be answered from the keyboard.
 pub fn choice_row(
     label: impl Into<SharedString>,
     description: impl Into<SharedString>,
     selected: bool,
     enabled: bool,
+    focus: Option<&FocusHandle>,
     on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
 ) -> gpui::Stateful<gpui::Div> {
+    let on_click = Rc::new(on_click);
+    let on_key: super::dialog::DialogHandler = {
+        let on_click = on_click.clone();
+        Rc::new(move |window, cx| on_click(&ClickEvent::default(), window, cx))
+    };
     let theme = global::current();
     let label = label.into();
     let description = description.into();
@@ -831,7 +844,7 @@ pub fn choice_row(
                 .child(description),
         );
     }
-    div()
+    let row = div()
         .id(SharedString::from(format!("choice:{label}")))
         .w_full()
         .min_w_0()
@@ -899,7 +912,8 @@ pub fn choice_row(
                         .into_any_element()
                 }),
         )
-        .child(labels)
+        .child(labels);
+    super::dialog::focusable(row, focus.cloned(), on_key, enabled)
 }
 
 /// A row's trailing control that shows only while the row is hovered, or

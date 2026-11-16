@@ -23,6 +23,8 @@ pub(crate) struct NewChat {
     worktree: bool,
     branch: Entity<TextField>,
     focus: FocusHandle,
+    folder_focus: FocusHandle,
+    worktree_focus: FocusHandle,
     cancel_focus: FocusHandle,
     confirm_focus: FocusHandle,
     close_focus: FocusHandle,
@@ -72,6 +74,8 @@ pub(crate) fn open(
             worktree: false,
             branch,
             focus: cx.focus_handle(),
+            folder_focus: cx.focus_handle(),
+            worktree_focus: cx.focus_handle(),
             cancel_focus: cx.focus_handle(),
             confirm_focus: cx.focus_handle(),
             close_focus: cx.focus_handle(),
@@ -200,12 +204,14 @@ impl Render for NewChat {
                 "Current folder",
                 "Use the project's existing checkout and changes.",
                 !self.worktree, editable,
+                editable.then_some(&self.folder_focus),
                 cx.listener(|this, _, window, cx| this.choose(false, window, cx)),
             ))
             .child(choice_row(
                 "New worktree",
                 "Create a separate branch from the latest commit. Uncommitted changes stay in the original folder.",
                 self.worktree, editable,
+                editable.then_some(&self.worktree_focus),
                 cx.listener(|this, _, window, cx| this.choose(true, window, cx)),
             ))
             .children(self.worktree.then(|| {
@@ -261,6 +267,10 @@ impl Render for NewChat {
             ],
         );
         let mut order = Vec::new();
+        if editable {
+            order.push(self.folder_focus.clone());
+            order.push(self.worktree_focus.clone());
+        }
         if self.worktree && editable {
             order.push(self.branch.read(cx).focus_handle());
         }
@@ -323,6 +333,52 @@ mod tests {
             output.status.success(),
             "{}",
             String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    fn the_keyboard_reaches_both_places_a_chat_can_start() {
+        // Neither choice was in the Tab order, so a new worktree could be
+        // chosen only with the pointer.
+        let temp = tempfile::tempdir().unwrap();
+        let paths = AppPaths::at(temp.path().join("state"));
+        let mut test = gpui::TestAppContext::single();
+        let state = test.update(|cx| cx.new(|cx| AppState::restore(paths, cx)));
+        state.update(&mut test, |state, _| {
+            state.add_project(temp.path().to_str().unwrap());
+            state.create_thread().unwrap();
+        });
+        let window = test.add_window({
+            let state = state.clone();
+            move |_, _| FlowX::new(state)
+        });
+        window
+            .update(&mut test, |_, window, cx| {
+                open(state.clone(), None, window, cx)
+            })
+            .unwrap();
+        test.refresh().unwrap();
+        let dialog = test.update(|cx| workspace_ui::handle(cx).read(cx).new_chat.clone().unwrap());
+        let mut keys = |keys: &str| {
+            test.simulate_keystrokes(window.into(), keys);
+            test.refresh().unwrap();
+            window
+                .update(&mut test, |_, window, cx| {
+                    let dialog = dialog.read(cx);
+                    let branch = dialog.branch.read(cx).focus_handle().is_focused(window);
+                    (dialog.worktree, branch)
+                })
+                .unwrap()
+        };
+        assert_eq!(
+            keys("tab tab space"),
+            (true, true),
+            "Space on the second choice takes it, and the branch name is next"
+        );
+        assert_eq!(
+            keys("shift-tab shift-tab space"),
+            (false, false),
+            "and back to the first"
         );
     }
 
