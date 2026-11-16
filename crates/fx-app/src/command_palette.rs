@@ -1582,4 +1582,63 @@ mod tests {
         let landed = visual.debug_bounds(row(&highlighted)).unwrap();
         assert_eq!(landed.bottom(), list.bottom() - px(Spacing::XXS));
     }
+
+    #[test]
+    fn a_question_waits_for_the_palette_and_the_palette_for_the_question() {
+        // A question that opened over the palette took the focus, and closing
+        // it blurred the window: the palette's keys come only through its own
+        // capture, so Escape and typing did nothing while it refused every
+        // command behind it.
+        let mut shell = shell();
+        shell.keys("cmd-k");
+        assert!(shell.palette().is_some());
+        let agent = shell.threads[0];
+        shell.test.update(|cx| {
+            shell.state.read(cx).update_sender_for(agent)(
+                crate::session::SessionUpdate::Interaction {
+                    event: fx_agent::ProviderEvent::UserInput(
+                        fx_agent::provider::UserInputRequest {
+                            id: "asked-under-the-palette".into(),
+                            questions: vec![fx_agent::provider::Question {
+                                id: "name".into(),
+                                header: "Name".into(),
+                                question: "Who is asking?".into(),
+                                options: vec![],
+                                is_other: true,
+                                is_secret: false,
+                                optional: false,
+                            }],
+                            ..Default::default()
+                        },
+                    ),
+                },
+            )
+        });
+        shell.test.run_until_parked();
+        shell.test.refresh().unwrap();
+        let request = |shell: &Shell| {
+            shell
+                .test
+                .update(|cx| workspace_ui::handle(cx).read(cx).request.is_some())
+        };
+        assert!(!request(&shell), "the question opened over the palette");
+        assert!(
+            shell
+                .test
+                .read(|cx| shell.state.read(cx).next_question().is_some()),
+            "the question was dropped rather than deferred"
+        );
+
+        // The palette still has the keyboard.
+        shell.type_text("sidebar");
+        assert_eq!(shell.titles()[0], "Hide sidebar");
+        shell.keys("escape");
+        assert!(shell.palette().is_none());
+        assert!(request(&shell), "the question waited past the palette");
+
+        // And ⌘K does not open the palette over the question.
+        shell.keys("cmd-k");
+        assert!(shell.palette().is_none());
+        assert!(request(&shell));
+    }
 }

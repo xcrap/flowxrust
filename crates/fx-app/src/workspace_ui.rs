@@ -361,11 +361,15 @@ impl WorkspaceUi {
         cx: &mut Context<Self>,
     ) {
         // A provider may ask while another thread's dialog owns focus. Defer
-        // that request until the reader closes the current dialog.
+        // that request until the reader closes the current dialog. The palette
+        // counts: its keys come only through its own capture, so a question
+        // that took the focus and then closed left it deaf to Escape and to
+        // typing, with every command refused behind it.
         if self.settings.is_some()
             || self.thread_dialog.is_some()
             || self.new_chat.is_some()
             || state.read(cx).picker.is_some()
+            || state.read(cx).palette.is_some()
         {
             return;
         }
