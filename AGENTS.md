@@ -1283,6 +1283,10 @@ conversation rather than kept by the view:
   from the last list (`advance`, `done`/`start`, 1-based); the history
   reader folds those into the whole list each left
   (`TurnPlan::apply_desktop_update`), so a thread run there shows its plan.
+  A turn there ends with `mcp__ccd_turn__wrap_up`, which checks the list
+  off, so the last call before it records the list done
+  (`TurnPlan::wrapped_up`): read without it, every finished turn's card
+  stayed a step short, its last step still spinning.
 
 ## Two queues, and why they are bounded
 

@@ -1139,20 +1139,40 @@ fn parse_file(
 /// `done`/`start`), which say nothing read alone; folded in order, every call
 /// is a plan the transcript's plan card can draw, as the app drew it. A step
 /// on with no list before it is left as it was, an ordinary call.
+///
+/// A turn there ends with the app's wrap-up, which checks off the task list:
+/// the last call recorded before it records the list done. Read without it,
+/// every finished turn's card stayed a step short, its last step spinning.
 fn fold_desktop_plans(messages: &mut [ConversationMessage]) {
-    use fx_core::policy::{TurnPlan, turn_plan::DESKTOP_PLAN_TOOL_NAME};
+    use fx_core::policy::{
+        TurnPlan,
+        turn_plan::{DESKTOP_PLAN_TOOL_NAME, DESKTOP_WRAP_UP_TOOL_NAME},
+    };
     let mut plan: Option<TurnPlan> = None;
-    for content in messages
-        .iter_mut()
-        .flat_map(|message| message.content.iter_mut())
-    {
-        if let MessageContent::ToolUse { name, input, .. } = content
-            && name == DESKTOP_PLAN_TOOL_NAME
-            && let Ok(value) = serde_json::from_str::<Value>(input)
-            && let Some(next) = TurnPlan::apply_desktop_update(plan.as_ref(), &value)
-        {
-            *input = next.to_tool_input();
-            plan = Some(next);
+    // Where the list was last recorded: message, then block.
+    let mut recorded: Option<(usize, usize)> = None;
+    for at in 0..messages.len() {
+        for block in 0..messages[at].content.len() {
+            let MessageContent::ToolUse { name, input, .. } = &mut messages[at].content[block]
+            else {
+                continue;
+            };
+            if name == DESKTOP_PLAN_TOOL_NAME {
+                if let Ok(value) = serde_json::from_str::<Value>(input)
+                    && let Some(next) = TurnPlan::apply_desktop_update(plan.as_ref(), &value)
+                {
+                    *input = next.to_tool_input();
+                    plan = Some(next);
+                    recorded = Some((at, block));
+                }
+            } else if name == DESKTOP_WRAP_UP_TOOL_NAME
+                && let Some(done) = plan.as_ref().and_then(TurnPlan::wrapped_up)
+                && let Some((message, index)) = recorded
+                && let MessageContent::ToolUse { input, .. } = &mut messages[message].content[index]
+            {
+                *input = done.to_tool_input();
+                plan = Some(done);
+            }
         }
     }
 }
@@ -1910,6 +1930,39 @@ mod tests {
         assert_eq!(statuses(&plans[0]), [InProgress, Pending]);
         assert_eq!(statuses(&plans[1]), [Completed, InProgress]);
         assert_eq!(plans[1].steps[1].text, "Test");
+
+        // The turn ends with the app's wrap-up, which checks off the list:
+        // the card reads done, as the app's does, and the wrap-up is still
+        // the call it was.
+        let mut wrap_up = fixture.record("assistant", "", Uuid::new_v4());
+        wrap_up["message"]["id"] = json!("message-3");
+        wrap_up["message"]["content"] = json!([{
+            "type": "tool_use", "id": "wrap-1", "name": "mcp__ccd_turn__wrap_up",
+            "input": {"recap": "Shipped."}
+        }]);
+        fixture.append(&wrap_up);
+        let thread = fixture.store().read(fixture.root(), SESSION).unwrap();
+        let calls: Vec<_> = thread
+            .messages
+            .iter()
+            .flat_map(|message| &message.content)
+            .filter_map(|content| match content {
+                MessageContent::ToolUse { name, input, .. } => Some((name.as_str(), input)),
+                _ => None,
+            })
+            .collect();
+        let last = calls
+            .iter()
+            .rev()
+            .find_map(|(name, input)| fx_core::policy::TurnPlan::from_tool_call(name, input))
+            .unwrap();
+        assert_eq!(statuses(&last), [Completed, Completed]);
+        let (name, input) = calls.last().unwrap();
+        assert_eq!(*name, "mcp__ccd_turn__wrap_up");
+        assert_eq!(
+            serde_json::from_str::<Value>(input).unwrap(),
+            json!({"recap": "Shipped."})
+        );
     }
 
     #[test]

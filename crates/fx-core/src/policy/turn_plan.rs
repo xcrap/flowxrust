@@ -13,7 +13,10 @@
 //!   "status"}]}`) or a step on from the last one (`{"advance":true}`,
 //!   `{"done":[2],"start":4}`, 1-based). A history reader folds those into
 //!   the whole list ([`TurnPlan::apply_desktop_update`]) and records each call
-//!   as the list it left, so a thread run there shows the plan it showed.
+//!   as the list it left, so a thread run there shows the plan it showed. A
+//!   turn there ends with `mcp__ccd_turn__wrap_up`, which ticks off whatever
+//!   the list still had open ([`TurnPlan::wrapped_up`]), and the app's card
+//!   reads as done from then on.
 //!
 //! Reading both into one model here means the view draws one checklist and
 //! never learns which provider wrote it. Statuses are read leniently: Codex
@@ -29,6 +32,9 @@ pub const PLAN_TOOL_NAME: &str = "update_plan";
 /// The plan tool the Claude desktop app gives its sessions, as Claude names
 /// an MCP tool.
 pub const DESKTOP_PLAN_TOOL_NAME: &str = "mcp__ccd_turn__update_plan";
+/// The call that ends a Claude desktop turn, which also checks off the task
+/// list.
+pub const DESKTOP_WRAP_UP_TOOL_NAME: &str = "mcp__ccd_turn__wrap_up";
 
 /// Where one step of a plan is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -159,6 +165,23 @@ impl TurnPlan {
             moved = true;
         }
         moved.then_some(plan)
+    }
+
+    /// The plan once a Claude desktop turn has wrapped up: every step done.
+    /// `None` when every step already was, so nothing moves.
+    pub fn wrapped_up(&self) -> Option<Self> {
+        if self
+            .steps
+            .iter()
+            .all(|step| step.status == PlanStatus::Completed)
+        {
+            return None;
+        }
+        let mut plan = self.clone();
+        for step in &mut plan.steps {
+            step.status = PlanStatus::Completed;
+        }
+        Some(plan)
     }
 
     /// The plan a tool call wrote, or `None` when it is not a plan call or its
@@ -387,7 +410,13 @@ mod tests {
         let recorded = advanced.to_tool_input();
         assert_eq!(
             TurnPlan::from_tool_call(DESKTOP_PLAN_TOOL_NAME, &recorded),
-            Some(advanced)
+            Some(advanced.clone())
         );
+        // The turn's wrap-up ticks off what was still open; a list already
+        // done has nothing to tick.
+        let wrapped = advanced.wrapped_up().unwrap();
+        assert_eq!(status(&wrapped), [C, C, C, C]);
+        assert_eq!(wrapped.steps[1].text, "Fix it");
+        assert_eq!(finished.wrapped_up(), None);
     }
 }
