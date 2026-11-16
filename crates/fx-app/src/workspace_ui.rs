@@ -729,11 +729,30 @@ impl Render for RequestPanel {
         dialog_scrim("provider-request-overlay")
             .track_focus(&self.focus)
             .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| cx.stop_propagation())
-            .capture_key_down(move |event, window, cx| {
-                if cycle_focus(&order, event, window) {
-                    cx.stop_propagation();
-                }
-            })
+            .capture_key_down(
+                cx.listener(move |this, event: &gpui::KeyDownEvent, window, cx| {
+                    if cycle_focus(&order, event, window) {
+                        cx.stop_propagation();
+                        return;
+                    }
+                    // Return is the dialog's default action, wherever the focus
+                    // is: it sends the answers once they are complete, as Send
+                    // does, but only answers the reader gave. The dialog
+                    // arrives unasked and focused, so a Return typed for the
+                    // composer as it opened would otherwise have accepted a
+                    // consent, or a form whose every field may be left blank.
+                    let fields = this.fields.iter().map(|field| field.read(cx));
+                    let answered = fields.clone().any(|field| !field.value().trim().is_empty());
+                    if submits(event)
+                        && answered
+                        && !fields.clone().any(TextField::is_composing)
+                        && let Some(answer) = this.answers(cx)
+                    {
+                        cx.stop_propagation();
+                        this.respond(answer, cx);
+                    }
+                }),
+            )
             // A question the turn stopped on arrives unasked, as an approval
             // card does, so it enters as one: a `BASE` fade, rising into place.
             .child(crate::approvals::arriving_card(
@@ -741,6 +760,12 @@ impl Render for RequestPanel {
                 dialog(DialogWidth::Regular, header, scrolled, footer),
             ))
     }
+}
+
+/// Whether a key sends a dialog's answers: Return, or ⌘↩ as in the composer.
+fn submits(event: &gpui::KeyDownEvent) -> bool {
+    let modifiers = &event.keystroke.modifiers;
+    event.keystroke.key == "enter" && !modifiers.shift && !modifiers.alt && !modifiers.function
 }
 
 /// Whether a question is answered by typing. One that offers options and does
@@ -1234,6 +1259,79 @@ mod tests {
         assert_eq!(presses.get(), 1);
         press_and_release(&mut test, window.into(), "enter");
         assert_eq!(presses.get(), 1, "Return pressed the focused button");
+    }
+
+    #[test]
+    fn return_sends_the_answers_once_they_are_complete() {
+        // The answer fields had no submit and the dialog caught only Tab, so
+        // Return and ⌘↩ did nothing: the pointer was the only way to Send.
+        let temp = tempfile::tempdir().unwrap();
+        let mut test = gpui::TestAppContext::single();
+        let (window, state, _, agent, mut received) = mounted_with_runner(&mut test, temp.path());
+        for (id, keys) in [("by-return", "enter"), ("by-command-return", "cmd-enter")] {
+            ask(
+                &mut test,
+                window,
+                &state,
+                agent,
+                ProviderEvent::UserInput(UserInputRequest {
+                    id: id.into(),
+                    questions: vec![question("name", false)],
+                    ..Default::default()
+                }),
+            );
+            press_and_release(&mut test, window.into(), keys);
+            assert!(received.try_recv().is_err(), "{keys} sent an empty answer");
+            test.simulate_input(window.into(), "Ada");
+            press_and_release(&mut test, window.into(), keys);
+            match received.try_recv() {
+                Ok(UserResponse::Questions {
+                    id: answered,
+                    answers,
+                }) => {
+                    assert_eq!(answered, id);
+                    assert_eq!(answers, [("name".to_string(), "Ada".to_string())]);
+                }
+                other => panic!("{keys} sent {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn return_sends_nothing_the_reader_did_not_answer() {
+        // A consent arrives unasked, focused, and complete at once, and so
+        // does a form whose every field may be left blank. A Return typed for
+        // the composer as either opened would have accepted it.
+        let consent = fx_agent::elicitation::Elicitation::from_claude(&serde_json::json!({
+            "mcp_server_name": "db", "message": "Drop the staging tables?", "mode": "form",
+            "requested_schema": {"type": "object", "properties": {}}
+        }))
+        .event("claude-elicitation-consent".into());
+        let blank = ProviderEvent::UserInput(UserInputRequest {
+            id: "all-optional".into(),
+            questions: vec![Question {
+                optional: true,
+                ..question("reason", false)
+            }],
+            ..Default::default()
+        });
+        for event in [consent, blank] {
+            let temp = tempfile::tempdir().unwrap();
+            let mut test = gpui::TestAppContext::single();
+            let (window, state, ui, agent, mut received) =
+                mounted_with_runner(&mut test, temp.path());
+            ask(&mut test, window, &state, agent, event);
+            test.read(|cx| {
+                let panel = ui.read(cx).request.clone().unwrap();
+                assert!(panel.read(cx).answers(cx).is_some(), "Send is enabled");
+            });
+            press_and_release(&mut test, window.into(), "enter");
+            assert!(
+                received.try_recv().is_err(),
+                "Return answered for the reader"
+            );
+            test.read(|cx| assert!(ui.read(cx).request.is_some()));
+        }
     }
 
     #[test]
