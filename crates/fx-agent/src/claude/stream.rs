@@ -1675,7 +1675,9 @@ pub use crate::shell::is_read_only_command;
 /// edits and every other MCP tool included, is not.
 pub fn is_read_only_tool(tool_name: &str, input: &Value) -> bool {
     match tool_name {
-        "Read" | "Grep" | "Glob" | "LS" | "NotebookRead" => true,
+        // `TodoWrite` writes only Claude's own task list, which FlowX draws as
+        // the turn's plan: Read Only keeps it.
+        "Read" | "Grep" | "Glob" | "LS" | "NotebookRead" | "TodoWrite" => true,
         "Bash" => input
             .get("command")
             .and_then(Value::as_str)

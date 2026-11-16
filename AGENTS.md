@@ -1203,7 +1203,12 @@ conversation rather than kept by the view:
   either): the first offers the list, the second makes it `TodoWrite`, the
   whole list per call, rather than the `Task*` tools, which change one task
   by an id only their results carry. Checked live: with them `TodoWrite` is
-  offered, deferred; without them it is not. The Claude desktop app keeps a
+  offered, deferred; without them it is not. Offered is not used: deferred,
+  it was never loaded for a five-step task, so every Claude turn's appended
+  system prompt ends with `PLAN_INSTRUCTION`, after the thread's own
+  instructions, in one `--append-system-prompt`. With it, the same task kept
+  a list updated after each step. Read Only keeps `TodoWrite`: it writes
+  only Claude's own list. The Claude desktop app keeps a
   session's plan with its own `mcp__ccd_turn__update_plan`, mostly steps on
   from the last list (`advance`, `done`/`start`, 1-based); the history
   reader folds those into the whole list each left

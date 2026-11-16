@@ -3218,7 +3218,13 @@ for worker in workers: worker.join()
         for pair in [
             ("--model", "fixture-model"),
             ("--effort", "high"),
-            ("--append-system-prompt", "fixture instructions"),
+            (
+                "--append-system-prompt",
+                &format!(
+                    "fixture instructions\n\n{}",
+                    fx_agent::claude::transport::PLAN_INSTRUCTION
+                ),
+            ),
             ("--permission-mode", "manual"),
         ] {
             assert!(

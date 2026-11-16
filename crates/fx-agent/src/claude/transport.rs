@@ -284,6 +284,11 @@ impl TurnRequest {
             "--include-partial-messages".to_string(),
             "--thinking-display".to_string(),
             THINKING_DISPLAY.to_string(),
+            // The thread's own instructions, then the plan FlowX asks for,
+            // which every turn carries: one flag, because a second
+            // `--append-system-prompt` is not a second instruction.
+            "--append-system-prompt".to_string(),
+            system_prompt_with_plan(self.system_prompt.as_deref()),
         ];
         if let Some(model) = non_empty(self.model.as_deref()) {
             arguments.push("--model".into());
@@ -294,10 +299,6 @@ impl TurnRequest {
             // Claude's flag is lower-case; the settings file that carries the
             // user's choice is not.
             arguments.push(effort.to_lowercase());
-        }
-        if let Some(system_prompt) = non_empty(self.system_prompt.as_deref()) {
-            arguments.push("--append-system-prompt".into());
-            arguments.push(system_prompt);
         }
         match self.access {
             Some(AgentAccess::AcceptEdits) => push_permission_mode(&mut arguments, "acceptEdits"),
@@ -358,7 +359,29 @@ pub const THINKING_DISPLAY: &str = "summarized";
 
 /// The built-in tools a Read Only turn has: reading, searching, running
 /// commands for FlowX to judge, sub-agents, and questions to the reader.
-pub const READ_ONLY_TOOLS: &str = "Bash,Read,Grep,Glob,Agent,ToolSearch,WebSearch,AskUserQuestion";
+pub const READ_ONLY_TOOLS: &str =
+    "Bash,Read,Grep,Glob,Agent,ToolSearch,WebSearch,AskUserQuestion,TodoWrite";
+
+/// What every Claude turn is asked beyond the thread's own instructions: to
+/// keep its plan where FlowX draws it.
+///
+/// With `TodoWrite` offered ([`PLAN_TOOL_ENVIRONMENT`]) but deferred, Claude
+/// Code 2.1.325 never loaded it for a five-step task, and the turn showed no
+/// plan; with this line it loaded it at once and updated the list after each
+/// step, four times in five steps. Codex plans by itself. The Claude desktop
+/// app's sessions keep one because its own instructions require it.
+pub const PLAN_INSTRUCTION: &str = "When a request takes several steps, keep a task list \
+with the TodoWrite tool from the start (load it with ToolSearch if it is deferred), and \
+update it as each step finishes, so the person can follow the work.";
+
+/// The appended system prompt: the thread's own instructions, when it has
+/// any, then [`PLAN_INSTRUCTION`].
+fn system_prompt_with_plan(thread: Option<&str>) -> String {
+    match non_empty(thread) {
+        Some(thread) => format!("{thread}\n\n{PLAN_INSTRUCTION}"),
+        None => PLAN_INSTRUCTION.to_string(),
+    }
+}
 
 /// Claude's tools that only write, denied in a Read Only turn. 2.1.325 has no
 /// `MultiEdit`, and warns about a rule that names it.
@@ -1401,6 +1424,8 @@ mod tests {
             "--include-partial-messages",
             "--thinking-display",
             "summarized",
+            "--append-system-prompt",
+            PLAN_INSTRUCTION,
         ]
         .into_iter()
         .map(String::from)
@@ -1440,14 +1465,24 @@ mod tests {
             mcp_servers: vec![crate::mcp::fixture()],
         }
         .arguments();
-        assert_eq!(&full[..bare.len()], &bare[..], "a default flag moved");
+        // Every flag but the appended prompt, whose text grows by the
+        // thread's own instructions.
+        assert_eq!(
+            &full[..bare.len() - 1],
+            &bare[..bare.len() - 1],
+            "a default flag moved"
+        );
         assert!(
             contains_pair(&full, "--model", "claude-opus-4-8"),
             "{full:?}"
         );
         assert!(contains_pair(&full, "--effort", "high"), "{full:?}");
         assert!(
-            contains_pair(&full, "--append-system-prompt", "be terse"),
+            contains_pair(
+                &full,
+                "--append-system-prompt",
+                &format!("be terse\n\n{PLAN_INSTRUCTION}")
+            ),
             "{full:?}"
         );
         assert!(
@@ -1515,11 +1550,20 @@ mod tests {
                 "{arguments:?}"
             );
             assert!(!arguments.iter().any(|argument| argument == "plan"));
-            assert!(
-                !arguments
+            // No access level adds instructions of its own: the appended
+            // prompt is the plan line alone, once.
+            assert_eq!(
+                arguments
                     .iter()
-                    .any(|argument| argument == "--append-system-prompt")
+                    .filter(|argument| *argument == "--append-system-prompt")
+                    .count(),
+                1
             );
+            assert!(contains_pair(
+                &arguments,
+                "--append-system-prompt",
+                PLAN_INSTRUCTION
+            ));
         }
     }
 
