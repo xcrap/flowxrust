@@ -739,13 +739,16 @@ pub(super) fn tool_outcome(item: &Value) -> (Option<String>, bool) {
     (output, is_error)
 }
 
-/// The text inside a tool result's envelope, for the three Codex wraps.
+/// The text inside a tool result's envelope, for the four Codex wraps.
 ///
 /// An MCP call's `result` is the MCP result itself (`{content: [blocks],
-/// structuredContent, _meta}`), its `error` is `{message}`, and a dynamic
+/// structuredContent, _meta}`), its `error` is `{message}`, a dynamic
 /// call's `contentItems` are blocks of their own (`inputText`, `inputImage`,
-/// `inputAudio`). Shown as JSON, every MCP row was the envelope around its
-/// answer. `None` is anything else, which is shown as JSON as before.
+/// `inputAudio`), and a function call's `output` is a string or, in codex-cli
+/// 0.167's schema, a list of the Responses API's items (`input_text`,
+/// `input_image`, `input_audio`, `encrypted_content`). Shown as JSON, every
+/// MCP row was the envelope around its answer, and a listed output was its
+/// items. `None` is anything else, which is shown as JSON as before.
 fn envelope_text(key: &str, value: &Value) -> Option<String> {
     match key {
         "result" => {
@@ -767,21 +770,29 @@ fn envelope_text(key: &str, value: &Value) -> Option<String> {
             .get("message")
             .and_then(Value::as_str)
             .map(str::to_owned),
-        "contentItems" => Some(content_blocks_text(value.as_array()?)),
+        "contentItems" | "output" => Some(content_blocks_text(value.as_array()?)),
         _ => None,
     }
 }
 
-/// Content blocks as the model read them: text whole, media named.
+/// What an encrypted block is shown as. Its text is for the model alone.
+const ENCRYPTED_BLOCK: &str = "[encrypted content]";
+
+/// Content blocks as the model read them: text whole, media named, and
+/// encrypted content named rather than shown.
 fn content_blocks_text(blocks: &[Value]) -> String {
     blocks
         .iter()
         .map(|block| {
             let field = |key: &str| block.get(key).and_then(Value::as_str);
             match field("type").unwrap_or_default() {
-                "text" | "inputText" => field("text").unwrap_or_default().to_owned(),
-                "image" | "inputImage" => "[image]".into(),
-                "audio" | "inputAudio" => "[audio]".into(),
+                "text" | "inputText" | "input_text" => field("text").unwrap_or_default().to_owned(),
+                "image" | "inputImage" | "input_image" => "[image]".into(),
+                "audio" | "inputAudio" | "input_audio" => "[audio]".into(),
+                "encrypted_content" => ENCRYPTED_BLOCK.into(),
+                // Whatever a block of another type carries encrypted is no
+                // more the reader's than a typed one's.
+                _ if block.get("encrypted_content").is_some() => ENCRYPTED_BLOCK.into(),
                 "resource_link" => field("uri").unwrap_or("[resource]").to_owned(),
                 "resource" => block["resource"]
                     .get("text")
@@ -2324,6 +2335,50 @@ mod tests {
         }));
         assert!(!is_error);
         assert_eq!(content, TRIVIAL_TOOL_RESULT);
+    }
+
+    #[test]
+    fn a_function_call_s_listed_output_is_read_as_the_model_read_it() {
+        // codex-cli 0.167's `FunctionCallOutputBody` is a string or a list of
+        // the Responses API's items, which were shown as their JSON, an
+        // encrypted item's ciphertext included.
+        let output = |output: Value| {
+            match parse_notification(
+            "item/completed",
+            &json!({ "item": {"type": "functionCallOutput", "id": "f1", "name": "f", "output": output} }),
+        )
+        .remove(0)
+        {
+            ProviderEvent::ToolResult { content, .. } => content,
+            other => panic!("{other:?}"),
+        }
+        };
+        assert_eq!(
+            output(json!([
+                {"type": "input_text", "text": "first"},
+                {"type": "input_image", "image_url": "data:image/png;base64,AAAA", "detail": null},
+                {"type": "input_audio", "audio_url": "data:audio/wav;base64,AAAA"},
+                {"type": "encrypted_content", "encrypted_content": "gAAAAABsecret"},
+                {"type": "input_text", "text": "last"}
+            ])),
+            "first\n\n[image]\n\n[audio]\n\n[encrypted content]\n\nlast"
+        );
+        // An image named by a file is an image too, and a string is as it was.
+        assert_eq!(
+            output(json!([{"type": "input_image", "file_id": "file-1"}])),
+            "[image]"
+        );
+        assert_eq!(output(json!("plain result")), "plain result");
+        // Nothing encrypted is ever shown, whatever its block is called.
+        let shown = output(json!([{"type": "reasoning", "encrypted_content": "gAAAAABsecret"}]));
+        assert!(!shown.contains("gAAAAABsecret"), "{shown}");
+        // The order the fields are read in is the server's: `aggregatedOutput`
+        // still comes first.
+        let (first, _) = tool_outcome(&json!({
+            "aggregatedOutput": "aggregated",
+            "output": [{"type": "input_text", "text": "listed"}]
+        }));
+        assert_eq!(first.as_deref(), Some("aggregated"));
     }
 
     #[test]
