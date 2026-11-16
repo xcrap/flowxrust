@@ -55,7 +55,7 @@ use gpui::{
     DispatchPhase, Element, ElementId, ElementInputHandler, Entity, EntityInputHandler,
     EventEmitter, FocusHandle, Font, FontFeatures, FontStyle, GlobalElementId, InspectorElementId,
     IntoElement, KeyDownEvent, LayoutId, LineLayout, Modifiers, MouseButton, MouseMoveEvent,
-    MouseUpEvent, Pixels, Point, Render, ShapedLine, SharedString, Task, TextAlign, TextRun, Timer,
+    MouseUpEvent, Pixels, Point, Render, ShapedLine, SharedString, Task, TextAlign, TextRun,
     UTF16Selection, Window, WrappedLine, div, fill, point, px, size,
 };
 use unicode_segmentation::{GraphemeCursor, UnicodeSegmentation};
@@ -1003,7 +1003,9 @@ impl TextField {
         let this = cx.weak_entity();
         self.blink = Some(cx.spawn(async move |_this, cx| {
             loop {
-                Timer::after(CARET_BLINK_INTERVAL).await;
+                // The executor's timer rather than a wall-clock one, so a
+                // test clock can drive the blink.
+                cx.background_executor().timer(CARET_BLINK_INTERVAL).await;
                 let keep_going = this
                     .update(cx, |field, cx| {
                         if !field.focused || !field.enabled || !field.window_active {
@@ -1094,7 +1096,13 @@ impl TextField {
     /// blur was where the next character went after focus came back, over the
     /// old composed text. Leaving the app is the input context's to settle,
     /// since the IME may still commit or continue its composition there.
+    ///
+    /// It is also where the blink learns the focus has gone. A render sets
+    /// `focused` again, but a field taken off screen with the focus, as a
+    /// dialog's is when it closes, is never rendered again, and its caret
+    /// went on waking the app twice a second for as long as it lived.
     fn focus_left(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.focused = false;
         if window.is_window_active() && self.marked.take().is_some() {
             self.history.break_group();
             cx.notify();
@@ -4691,6 +4699,51 @@ mod tests {
         window
             .update(&mut test, |_window, _entity, _cx| {})
             .expect("the window is still alive");
+    }
+
+    #[test]
+    fn the_caret_stops_blinking_once_its_field_is_taken_off_screen() {
+        // The blink stopped on `focused`, which only a render set, so a field
+        // taken off screen with the focus, as a dialog's is when it closes,
+        // went on waking the app twice a second for as long as it lived.
+        struct Host {
+            field: Entity<TextField>,
+            shown: bool,
+        }
+        impl Render for Host {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                div().children(self.shown.then(|| self.field.clone()))
+            }
+        }
+        let mut test = gpui::TestAppContext::single();
+        let field = test.update(|cx| cx.new(TextField::new));
+        let window = test.add_window({
+            let field = field.clone();
+            move |_, _| Host { field, shown: true }
+        });
+        // A caret blinks, and a blur is reported, only in a key window.
+        window
+            .update(&mut test, |_, window, cx| {
+                window.activate_window();
+                field.read(cx).focus_handle().focus(window);
+            })
+            .unwrap();
+        test.refresh().unwrap();
+        let blinking = |test: &mut gpui::TestAppContext| {
+            test.executor().advance_clock(CARET_BLINK_INTERVAL * 3);
+            test.run_until_parked();
+            test.read(|cx| field.read(cx).blinking)
+        };
+        assert!(blinking(&mut test), "a focused field's caret blinks");
+
+        window
+            .update(&mut test, |host, _, cx| {
+                host.shown = false;
+                cx.notify();
+            })
+            .unwrap();
+        test.refresh().unwrap();
+        assert!(!blinking(&mut test), "the caret outlived its field");
     }
 
     #[test]
