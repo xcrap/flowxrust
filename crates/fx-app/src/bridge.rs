@@ -269,6 +269,12 @@ pub(crate) fn answer(state: &AppState, call: &Call) -> Answer {
             }
             Answer::Ready(Reply::ok(answers::thread_excerpt(&entry, &[], 0, None)))
         }
+        ToolCall::StartThread { .. }
+        | ToolCall::SendToThread { .. }
+        | ToolCall::WaitForThreads { .. }
+        | ToolCall::StopThread { .. } => Answer::Ready(Reply::refused(
+            "FlowX does not run a space's threads from its orchestrator yet.",
+        )),
     }
 }
 
@@ -322,6 +328,8 @@ fn entry(
         },
         archived: record.archived_agent_ids.contains(&agent.id),
         current: agent.id == asking,
+        in_space: None,
+        spawned_by_you: None,
     }
 }
 

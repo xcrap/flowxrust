@@ -48,6 +48,13 @@ pub struct ThreadEntry {
     pub archived: bool,
     /// Whether this is the thread that asked.
     pub current: bool,
+    /// For a space's orchestrator only: whether the thread is in its space,
+    /// so it can send to, wait for and stop it. Absent for anyone else.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub in_space: Option<bool>,
+    /// For a space's orchestrator only: whether it started the thread.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub spawned_by_you: Option<bool>,
 }
 
 /// `list_threads`' answer: open threads first, then archived ones, each in
@@ -200,6 +207,147 @@ pub fn thread_header(thread: &ThreadEntry) -> String {
     )
 }
 
+/// What a worker is doing, in the words the orchestration tools use.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum WorkerStatus {
+    /// A turn is in progress.
+    Running,
+    /// Blocked on the user: an approval or a question. Settled, for a wait:
+    /// only the user can move it on.
+    Waiting,
+    /// Its last turn answered.
+    Completed,
+    /// Its last turn failed.
+    Failed,
+    /// Its last turn was stopped before it answered.
+    Stopped,
+    /// It has never had a turn.
+    Idle,
+}
+
+impl WorkerStatus {
+    /// Whether a wait stops waiting for it.
+    pub fn is_settled(self) -> bool {
+        self != Self::Running
+    }
+}
+
+/// One thread, as a wait or a stop reports it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct WorkerReport {
+    pub thread_id: String,
+    pub title: String,
+    pub status: WorkerStatus,
+    /// What the user has to do, while the thread is waiting.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub waiting_for: Option<String>,
+    /// The last reply to its latest prompt, shortened past
+    /// [`MAX_MESSAGE_CHARS`]. `None` while that prompt has none.
+    pub last_reply: Option<String>,
+}
+
+impl WorkerReport {
+    /// A report with its reply shortened to what an answer carries.
+    pub fn new(
+        thread_id: String,
+        title: String,
+        status: WorkerStatus,
+        waiting_for: Option<String>,
+        last_reply: Option<&str>,
+    ) -> Self {
+        Self {
+            thread_id,
+            title,
+            status,
+            waiting_for,
+            last_reply: last_reply
+                .map(str::trim)
+                .filter(|reply| !reply.is_empty())
+                .map(|reply| shorten(reply, MAX_MESSAGE_CHARS)),
+        }
+    }
+}
+
+/// `start_thread`'s answer.
+pub fn thread_started(
+    thread_id: &str,
+    title: &str,
+    provider: &str,
+    worktree: Option<(&str, &str)>,
+) -> String {
+    let answer = json!({
+        "thread_id": thread_id,
+        "title": title,
+        "provider": provider,
+        "worktree": worktree.map(|(path, branch)| json!({ "path": path, "branch": branch })),
+        "status": "running",
+    });
+    serde_json::to_string_pretty(&answer).unwrap_or_default()
+}
+
+/// `send_to_thread`'s answer.
+pub fn prompt_sent(thread_id: &str) -> String {
+    serde_json::to_string_pretty(&json!({ "thread_id": thread_id, "status": "running" }))
+        .unwrap_or_default()
+}
+
+/// `wait_for_threads`' answer: whether the condition held, and every
+/// thread's state, in the order asked.
+pub fn wait_result(
+    until: crate::tools::Until,
+    settled: bool,
+    waited_seconds: u64,
+    threads: &[WorkerReport],
+) -> String {
+    let mut answer = json!({
+        "settled": settled,
+        "until": until.word(),
+        "waited_seconds": waited_seconds,
+        "threads": threads,
+    });
+    let waiting: Vec<&str> = threads
+        .iter()
+        .filter(|thread| thread.status == WorkerStatus::Waiting)
+        .map(|thread| thread.title.as_str())
+        .collect();
+    let note = if !waiting.is_empty() {
+        Some(format!(
+            "Waiting on the user: {}. Only the user can unblock {}; tell them what {} for.",
+            waiting.join(", "),
+            if waiting.len() == 1 { "it" } else { "them" },
+            if waiting.len() == 1 {
+                "it waits"
+            } else {
+                "each waits"
+            },
+        ))
+    } else if !settled {
+        Some(format!(
+            "Still running after {waited_seconds} s. Call wait_for_threads again to keep waiting."
+        ))
+    } else {
+        None
+    };
+    if let Some(note) = note {
+        answer["note"] = json!(note);
+    }
+    serde_json::to_string_pretty(&answer).unwrap_or_default()
+}
+
+/// `stop_thread`'s answer: the thread as it is once the stop has settled, or
+/// as it was when it was not running.
+pub fn stop_result(report: &WorkerReport, was_running: bool) -> String {
+    let mut answer = serde_json::to_value(report).unwrap_or_default();
+    answer["was_running"] = json!(was_running);
+    if !was_running {
+        answer["note"] = json!("It was not running, so nothing was stopped.");
+    } else if report.status == WorkerStatus::Running {
+        answer["note"] = json!("It is still stopping. Call wait_for_threads to see it settle.");
+    }
+    serde_json::to_string_pretty(&answer).unwrap_or_default()
+}
+
 /// At most `max` characters of `text`, saying how much was cut.
 fn shorten(text: &str, max: usize) -> String {
     let length = text.chars().count();
@@ -223,6 +371,8 @@ mod tests {
             status: Status::Idle,
             archived,
             current: false,
+            in_space: None,
+            spawned_by_you: None,
         }
     }
 
@@ -411,5 +561,114 @@ mod tests {
         let starting = thread_excerpt(&entry("new", false), &[], 0, Some("Hel"));
         assert!(starting.contains("No finished messages yet."), "{starting}");
         assert!(starting.ends_with("[assistant, still writing]\nHel"));
+    }
+
+    #[test]
+    fn only_a_lead_s_listing_says_which_threads_are_in_its_space() {
+        let plain: serde_json::Value =
+            serde_json::from_str(&thread_list("p", "/p", &[entry("a", false)])).unwrap();
+        let thread = &plain["threads"][0];
+        assert!(thread.get("in_space").is_none() && thread.get("spawned_by_you").is_none());
+        let lead = ThreadEntry {
+            in_space: Some(true),
+            spawned_by_you: Some(false),
+            ..entry("a", false)
+        };
+        let listed: serde_json::Value =
+            serde_json::from_str(&thread_list("p", "/p", &[lead])).unwrap();
+        assert_eq!(listed["threads"][0]["in_space"], true);
+        assert_eq!(listed["threads"][0]["spawned_by_you"], false);
+    }
+
+    fn report(status: WorkerStatus, reply: Option<&str>) -> WorkerReport {
+        WorkerReport::new("id".into(), "Parser".into(), status, None, reply)
+    }
+
+    #[test]
+    fn a_wait_reports_each_thread_and_caps_its_reply_with_a_note() {
+        // The model's context is the scarce thing: four workers' essays
+        // would crowd out the plan they report to.
+        let long = "x".repeat(MAX_MESSAGE_CHARS + 25);
+        let answer: serde_json::Value = serde_json::from_str(&wait_result(
+            crate::tools::Until::All,
+            true,
+            12,
+            &[
+                report(WorkerStatus::Completed, Some(&long)),
+                report(WorkerStatus::Failed, None),
+            ],
+        ))
+        .unwrap();
+        assert_eq!(answer["settled"], true);
+        assert_eq!(answer["until"], "all");
+        assert_eq!(answer["waited_seconds"], 12);
+        let first = &answer["threads"][0];
+        assert_eq!(first["status"], "completed");
+        let reply = first["last_reply"].as_str().unwrap();
+        assert!(
+            reply.ends_with("… [shortened: 25 more characters]"),
+            "{reply}"
+        );
+        assert!(first.get("waiting_for").is_none());
+        assert_eq!(answer["threads"][1]["status"], "failed");
+        assert_eq!(answer["threads"][1]["last_reply"], serde_json::Value::Null);
+        assert!(answer.get("note").is_none());
+    }
+
+    #[test]
+    fn a_wait_says_who_waits_on_the_user_and_when_it_ran_out_of_time() {
+        let waiting = WorkerReport::new(
+            "id".into(),
+            "Migrations".into(),
+            WorkerStatus::Waiting,
+            Some("approval to run Bash".into()),
+            None,
+        );
+        assert!(WorkerStatus::Waiting.is_settled());
+        assert!(!WorkerStatus::Running.is_settled());
+        let answer: serde_json::Value = serde_json::from_str(&wait_result(
+            crate::tools::Until::Any,
+            true,
+            0,
+            &[waiting, report(WorkerStatus::Running, None)],
+        ))
+        .unwrap();
+        assert_eq!(answer["threads"][0]["waiting_for"], "approval to run Bash");
+        let note = answer["note"].as_str().unwrap();
+        assert!(
+            note.contains("Migrations") && note.contains("tell them"),
+            "{note}"
+        );
+        let timed_out: serde_json::Value = serde_json::from_str(&wait_result(
+            crate::tools::Until::All,
+            false,
+            240,
+            &[report(WorkerStatus::Running, Some("Half way."))],
+        ))
+        .unwrap();
+        assert_eq!(timed_out["settled"], false);
+        assert!(
+            timed_out["note"]
+                .as_str()
+                .unwrap()
+                .contains("Call wait_for_threads again")
+        );
+    }
+
+    #[test]
+    fn a_start_names_its_worktree_or_null() {
+        let started: serde_json::Value = serde_json::from_str(&thread_started(
+            "id",
+            "Parser",
+            "claude",
+            Some(("/w/x", "flowx/abc")),
+        ))
+        .unwrap();
+        assert_eq!(started["status"], "running");
+        assert_eq!(started["worktree"]["branch"], "flowx/abc");
+        let plain: serde_json::Value =
+            serde_json::from_str(&thread_started("id", "Parser", "codex", None)).unwrap();
+        assert_eq!(plain["worktree"], serde_json::Value::Null);
+        assert_eq!(plain["provider"], "codex");
     }
 }

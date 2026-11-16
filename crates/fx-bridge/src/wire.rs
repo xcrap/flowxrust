@@ -7,8 +7,10 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-/// The most a request may be. A call is a name and a couple of arguments.
-pub const MAX_REQUEST_BYTES: usize = 16 * 1024;
+/// The most a request may be: a name and a few arguments, the longest a
+/// prompt for another thread (`tools::MAX_PROMPT_CHARS`, up to four bytes a
+/// character, and room for JSON's escapes).
+pub const MAX_REQUEST_BYTES: usize = 256 * 1024;
 
 /// The most a reply may be. The answers are bounded well below this
 /// (`answers::MAX_ANSWER_CHARS`); the cap is for a peer that is not the app.

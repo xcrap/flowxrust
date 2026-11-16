@@ -39,8 +39,9 @@ pub const MAX_SOCKET_PATH: usize = 103;
 pub const MAX_CONNECTIONS: usize = 16;
 /// How long a caller has to send its request.
 pub const READ_TIMEOUT: Duration = Duration::from_secs(5);
-/// How long the app has to answer one.
-pub const ANSWER_TIMEOUT: Duration = Duration::from_secs(20);
+/// How long the app has to answer an ordinary call; a wait or a start is
+/// given more ([`ToolCall::answer_timeout`]).
+pub const ANSWER_TIMEOUT: Duration = crate::tools::DEFAULT_ANSWER_TIMEOUT;
 
 /// The socket's name inside its directory.
 const SOCKET_NAME: &str = "flowx.sock";
@@ -287,15 +288,37 @@ async fn respond(
         }
         Err(CallError::InvalidArguments(why)) => return Some(Reply::refused(why)),
     };
-    Some(
-        tokio::time::timeout(ANSWER_TIMEOUT, handler(Call { thread, call }))
-            .await
-            .unwrap_or_else(|_| {
-                Reply::refused(
-                    "FlowX did not answer in time. It may be busy; try again in a moment.",
-                )
-            }),
-    )
+    let timeout = call.answer_timeout();
+    // A wait only watches, so one whose caller has gone is dropped rather
+    // than polled to its end: a lead stopped mid-wait otherwise held a
+    // connection, of the few there are, for minutes. Anything that acts is
+    // finished, so a thread is never half made.
+    let watches = matches!(call, ToolCall::WaitForThreads { .. });
+    let answer = tokio::time::timeout(timeout, handler(Call { thread, call }));
+    let answered = if watches {
+        tokio::select! {
+            answer = answer => answer,
+            () = closed(&mut reader) => return None,
+        }
+    } else {
+        answer.await
+    };
+    Some(answered.unwrap_or_else(|_| {
+        Reply::refused("FlowX did not answer in time. It may be busy; try again in a moment.")
+    }))
+}
+
+/// Resolves once the caller has closed its end. It sends one line and then
+/// only reads, so anything more it sends is read past.
+async fn closed(reader: &mut BufReader<tokio::net::unix::OwnedReadHalf>) {
+    use tokio::io::AsyncReadExt;
+    let mut scratch = [0u8; 256];
+    loop {
+        match reader.read(&mut scratch).await {
+            Ok(0) | Err(_) => return,
+            Ok(_) => {}
+        }
+    }
 }
 
 #[cfg(test)]
@@ -441,6 +464,71 @@ mod tests {
         // Again, and on drop: nothing left to remove is not an error.
         bridge.shutdown();
         drop(bridge);
+    }
+
+    #[tokio::test]
+    async fn a_wait_whose_caller_hung_up_is_dropped_and_a_start_is_not() {
+        // A lead stopped mid-wait closes its server's connection. Polled to
+        // its end, its wait held one of the few connections for minutes; a
+        // start, which acts, is finished regardless, so no thread is half
+        // made.
+        struct Dropped(Arc<AtomicUsize>);
+        impl Drop for Dropped {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        let parent = tempfile::tempdir().unwrap();
+        let dropped = Arc::new(AtomicUsize::new(0));
+        let finished = Arc::new(AtomicUsize::new(0));
+        let (seen_drop, seen_finish) = (dropped.clone(), finished.clone());
+        let bridge = Bridge::start(
+            parent.path(),
+            handler(move |call: Call| {
+                let guard = Dropped(seen_drop.clone());
+                let finished = seen_finish.clone();
+                async move {
+                    let _guard = guard;
+                    tokio::time::sleep(Duration::from_millis(300)).await;
+                    finished.fetch_add(1, Ordering::SeqCst);
+                    Reply::ok(call.call.name())
+                }
+            }),
+        )
+        .unwrap();
+        let thread = uuid::Uuid::new_v4().to_string();
+        for (tool, arguments) in [
+            (
+                "wait_for_threads",
+                serde_json::json!({"thread_ids": [uuid::Uuid::new_v4().to_string()]}),
+            ),
+            (
+                "start_thread",
+                serde_json::json!({"title": "t", "prompt": "p"}),
+            ),
+        ] {
+            let mut stream = UnixStream::connect(bridge.socket()).await.unwrap();
+            let line = Request {
+                thread: thread.clone(),
+                token: bridge.token_for(&thread),
+                tool: tool.into(),
+                arguments,
+            }
+            .to_line();
+            stream.write_all(&line).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            drop(stream);
+        }
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while dropped.load(Ordering::SeqCst) < 2 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "a call was never dropped"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        // The wait went at once; the start ran to its end.
+        assert_eq!(finished.load(Ordering::SeqCst), 1);
     }
 
     #[test]

@@ -27,7 +27,7 @@ use tokio::net::UnixStream;
 
 use crate::lines::{Line, read_line};
 use crate::mcp::{self, Action};
-use crate::tools::ToolCall;
+use crate::tools::{DEFAULT_ANSWER_TIMEOUT, Role, ToolCall};
 use crate::wire::{MAX_REPLY_BYTES, Reply, Request};
 
 /// The most one message from the client may be.
@@ -67,14 +67,18 @@ pub enum Ended {
     SocketGone,
 }
 
-/// The server's timings and the version it reports.
+/// The server's timings, the version it reports and who it speaks for.
 #[derive(Debug, Clone)]
 pub struct Options {
     pub version: String,
+    /// Which tools it lists: a lead's server lists the orchestration tools.
+    pub role: Role,
     /// How often the socket is looked for.
     pub watch_interval: Duration,
     pub connect_timeout: Duration,
-    /// How long a call may take, end to end.
+    /// How long an ordinary call may take, end to end. A call the app needs
+    /// longer for (a wait, a start) is given what it needs beyond an
+    /// ordinary one on top ([`call_budget`]).
     pub call_timeout: Duration,
     /// How long calls already asked may take to be answered once the input
     /// has closed.
@@ -85,6 +89,7 @@ impl Default for Options {
     fn default() -> Self {
         Self {
             version: env!("CARGO_PKG_VERSION").into(),
+            role: Role::Thread,
             watch_interval: Duration::from_secs(1),
             connect_timeout: Duration::from_secs(3),
             call_timeout: Duration::from_secs(30),
@@ -142,7 +147,7 @@ where
                     let too_long = mcp::error(&Value::Null, mcp::INVALID_REQUEST, "Message too large");
                     write(&mut output, &too_long).await?;
                 }
-                Some(Ok(Line::Data(bytes))) => match mcp::handle(&bytes, &options.version) {
+                Some(Ok(Line::Data(bytes))) => match mcp::handle(&bytes, &options.version, options.role) {
                     Action::Reply(reply) => write(&mut output, &reply).await?,
                     Action::Ignore => {}
                     Action::Forward { id, call } => {
@@ -206,6 +211,12 @@ async fn forward(endpoint: Option<&Endpoint>, call: &ToolCall, options: &Options
     }
 }
 
+/// How long one call may take end to end: the server's own allowance, and
+/// whatever more the app is given to answer this call than an ordinary one.
+pub fn call_budget(call: &ToolCall, options: &Options) -> Duration {
+    options.call_timeout + call.answer_timeout().saturating_sub(DEFAULT_ANSWER_TIMEOUT)
+}
+
 async fn ask(endpoint: &Endpoint, call: &ToolCall, options: &Options) -> Result<Reply, String> {
     let stream = tokio::time::timeout(
         options.connect_timeout,
@@ -231,7 +242,7 @@ async fn ask(endpoint: &Endpoint, call: &ToolCall, options: &Options) -> Result<
             .await
             .map_err(|error| format!("FlowX's answer could not be read: {error}"))
     };
-    let line = tokio::time::timeout(options.call_timeout, exchange)
+    let line = tokio::time::timeout(call_budget(call, options), exchange)
         .await
         .map_err(|_| "FlowX did not answer in time. It may be busy; try again.".to_string())??;
     match line {
@@ -267,11 +278,15 @@ pub fn run_from_env() -> std::process::ExitCode {
             return std::process::ExitCode::FAILURE;
         }
     };
+    let options = Options {
+        role: Role::from_value(std::env::var(crate::ENV_ROLE).ok().as_deref()),
+        ..Options::default()
+    };
     let ended = runtime.block_on(serve(
         tokio::io::stdin(),
         tokio::io::stdout(),
         Endpoint::from_env(),
-        Options::default(),
+        options,
     ));
     // A read of stdin blocked in the runtime's pool cannot be cancelled, and
     // waiting for it would keep the process after the socket went.
@@ -295,6 +310,7 @@ mod tests {
     fn fast() -> Options {
         Options {
             version: "test".into(),
+            role: Role::Thread,
             watch_interval: Duration::from_millis(20),
             connect_timeout: Duration::from_secs(2),
             call_timeout: Duration::from_secs(5),

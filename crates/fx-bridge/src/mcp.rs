@@ -20,7 +20,7 @@
 
 use serde_json::{Value, json};
 
-use crate::tools::{self, CallError, ToolCall};
+use crate::tools::{self, CallError, Role, ToolCall};
 
 /// The protocol versions this server can speak, newest first. The tools
 /// methods it uses are the same in each.
@@ -36,6 +36,13 @@ pub const INSTRUCTIONS: &str = "Tools for the FlowX project you are working in: 
     list_threads lists its threads (separate agent conversations in FlowX), and \
     read_thread reads a thread's latest messages. Both only read.";
 
+/// What it tells a space's orchestrator besides.
+pub const LEAD_INSTRUCTIONS: &str = " You lead a FlowX space: start_thread starts a \
+    thread in it with a prompt (each in its own worktree when it edits files), \
+    wait_for_threads waits for threads to finish and returns their replies, \
+    send_to_thread sends a finished thread its next prompt, and stop_thread stops one. \
+    Threads the user must unblock come back as waiting; tell the user what they wait for.";
+
 /// What to do with one line from the client.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Action {
@@ -47,8 +54,12 @@ pub enum Action {
     Ignore,
 }
 
-/// Decide what one line asks for.
-pub fn handle(line: &[u8], server_version: &str) -> Action {
+/// Decide what one line asks for, for a server speaking as `role`.
+///
+/// The role decides only what is listed. A call to a tool the role does not
+/// list is still forwarded: the app refuses it in words the model can act
+/// on, which an unknown-tool error would not be.
+pub fn handle(line: &[u8], server_version: &str, role: Role) -> Action {
     let message: Value = match serde_json::from_slice(line) {
         Ok(message) => message,
         Err(_) if line.iter().all(u8::is_ascii_whitespace) => return Action::Ignore,
@@ -82,9 +93,9 @@ pub fn handle(line: &[u8], server_version: &str) -> Action {
     };
     let params = object.get("params").cloned().unwrap_or(Value::Null);
     match method {
-        "initialize" => Action::Reply(result(&id, initialize(&params, server_version))),
+        "initialize" => Action::Reply(result(&id, initialize(&params, server_version, role))),
         "ping" => Action::Reply(result(&id, json!({}))),
-        "tools/list" => Action::Reply(result(&id, tools::catalog())),
+        "tools/list" => Action::Reply(result(&id, tools::catalog(role))),
         "tools/call" => {
             let name = params.get("name").and_then(Value::as_str).unwrap_or("");
             let arguments = params.get("arguments").cloned().unwrap_or(Value::Null);
@@ -106,7 +117,7 @@ pub fn handle(line: &[u8], server_version: &str) -> Action {
     }
 }
 
-fn initialize(params: &Value, server_version: &str) -> Value {
+fn initialize(params: &Value, server_version: &str, role: Role) -> Value {
     let asked = params.get("protocolVersion").and_then(Value::as_str);
     let version = asked
         .filter(|asked| PROTOCOL_VERSIONS.contains(asked))
@@ -119,7 +130,10 @@ fn initialize(params: &Value, server_version: &str) -> Value {
             "title": "FlowX",
             "version": server_version,
         },
-        "instructions": INSTRUCTIONS,
+        "instructions": match role {
+            Role::Thread => INSTRUCTIONS.to_owned(),
+            Role::Lead => format!("{INSTRUCTIONS}{LEAD_INSTRUCTIONS}"),
+        },
     })
 }
 
@@ -146,7 +160,7 @@ mod tests {
     use super::*;
 
     fn reply(line: &str) -> Value {
-        match handle(line.as_bytes(), "9.9.9") {
+        match handle(line.as_bytes(), "9.9.9", Role::Thread) {
             Action::Reply(reply) => reply,
             other => panic!("{line}: {other:?}"),
         }
@@ -190,7 +204,38 @@ mod tests {
             json!({"jsonrpc":"2.0","id":4,"result":{}})
         );
         let listed = reply(r#"{"jsonrpc":"2.0","id":5,"method":"tools/list","params":{}}"#);
-        assert_eq!(listed["result"], tools::catalog());
+        assert_eq!(listed["result"], tools::catalog(Role::Thread));
+    }
+
+    #[test]
+    fn a_lead_s_server_lists_and_explains_the_orchestration_tools() {
+        let lead = |line: &str| match handle(line.as_bytes(), "1", Role::Lead) {
+            Action::Reply(reply) => reply,
+            other => panic!("{line}: {other:?}"),
+        };
+        let listed = lead(r#"{"jsonrpc":"2.0","id":5,"method":"tools/list"}"#);
+        assert_eq!(listed["result"], tools::catalog(Role::Lead));
+        assert_eq!(listed["result"]["tools"].as_array().unwrap().len(), 6);
+        let initialized = lead(r#"{"jsonrpc":"2.0","id":0,"method":"initialize","params":{}}"#);
+        let instructions = initialized["result"]["instructions"].as_str().unwrap();
+        assert!(instructions.contains("wait_for_threads"), "{instructions}");
+        // An ordinary thread's server is not told about them, and a call it
+        // makes anyway still reaches the app, which refuses it in words.
+        let ordinary = reply(r#"{"jsonrpc":"2.0","id":0,"method":"initialize","params":{}}"#);
+        assert!(
+            !ordinary["result"]["instructions"]
+                .as_str()
+                .unwrap()
+                .contains("start_thread")
+        );
+        assert!(matches!(
+            handle(
+                br#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"stop_thread","arguments":{"thread_id":"6f0c1f2e-3a4b-4c5d-8e6f-708192a3b4c5"}}}"#,
+                "1",
+                Role::Thread
+            ),
+            Action::Forward { .. }
+        ));
     }
 
     #[test]
@@ -198,7 +243,8 @@ mod tests {
         assert_eq!(
             handle(
                 br#"{"jsonrpc":"2.0","id":"call-1","method":"tools/call","params":{"name":"list_threads","arguments":{}}}"#,
-                "1"
+                "1",
+                Role::Thread
             ),
             Action::Forward {
                 id: json!("call-1"),
@@ -247,7 +293,11 @@ mod tests {
             "",
             "   ",
         ] {
-            assert_eq!(handle(line.as_bytes(), "1"), Action::Ignore, "{line}");
+            assert_eq!(
+                handle(line.as_bytes(), "1", Role::Thread),
+                Action::Ignore,
+                "{line}"
+            );
         }
     }
 
